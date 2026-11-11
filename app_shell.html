@@ -37,30 +37,104 @@ body {
   flex-direction: column;
   justify-content: space-between;
   padding: 20px 14px;
+  position: relative;
+  transition: width 0.25s cubic-bezier(0.4, 0, 0.2, 1), min-width 0.25s cubic-bezier(0.4, 0, 0.2, 1), padding 0.25s ease;
+  user-select: none;
+}
+
+#sidebar.collapsed {
+  width: 72px;
+  min-width: 72px;
+  padding: 20px 8px;
+}
+
+#sidebar.collapsed .brand-text,
+#sidebar.collapsed .nav-text,
+#sidebar.collapsed .clock-text,
+#sidebar.collapsed .status-text {
+  display: none !important;
+}
+
+#sidebar.collapsed .brand-row {
+  justify-content: center !important;
+  margin-bottom: 16px;
+  padding-bottom: 12px;
+}
+
+#sidebar.collapsed #sidebarToggle {
+  display: none;
+}
+
+#sidebar.collapsed .brand-img-wrap {
+  cursor: pointer;
+}
+
+#sidebar.collapsed .nav-item {
+  justify-content: center;
+  padding: 12px 0;
+  gap: 0;
+}
+
+#sidebar.collapsed .sidebar-footer {
+  align-items: center;
+  padding: 12px 0 0 0;
+}
+
+#sidebar.collapsed .status-pill {
+  padding: 4px 6px;
+  justify-content: center;
+  font-size: 13px;
+}
+
+.brand-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  border-bottom: 1px solid var(--sidebar-border);
+  padding-bottom: 16px;
+  margin-bottom: 18px;
 }
 
 .brand {
   display: flex;
-  flex-direction: column;
-  gap: 4px;
-  padding: 0 8px 18px 8px;
-  border-bottom: 1px solid var(--sidebar-border);
-  margin-bottom: 16px;
+  align-items: center;
+  gap: 10px;
 }
 .brand-title {
-  font-size: 19px;
+  font-size: 17.5px;
   font-weight: 800;
   color: var(--accent);
   display: flex;
   align-items: center;
-  gap: 8px;
+  gap: 6px;
 }
 .brand-sub {
-  font-size: 11px;
+  font-size: 10.5px;
   color: var(--text-muted);
   font-weight: 600;
   letter-spacing: 0.05em;
   text-transform: uppercase;
+}
+
+.toggle-btn {
+  background: #1e293b;
+  border: 1px solid var(--sidebar-border);
+  color: var(--text-muted);
+  width: 28px;
+  height: 28px;
+  border-radius: 6px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  font-size: 12px;
+  transition: all 0.2s ease;
+  flex-shrink: 0;
+}
+.toggle-btn:hover {
+  background: #0284c7;
+  color: #ffffff;
+  border-color: #0284c7;
 }
 
 .nav-menu {
@@ -94,6 +168,10 @@ body {
 }
 .nav-icon {
   font-size: 16px;
+  flex-shrink: 0;
+}
+.nav-text {
+  white-space: nowrap;
 }
 
 .sidebar-footer {
@@ -141,33 +219,41 @@ body {
 <!-- SIDEBAR -->
 <aside id="sidebar">
   <div>
-    <div class="brand" style="display:flex; align-items:center; gap:12px; margin-bottom: 24px;">
-      <img src="rocket-icon.png" alt="Rocket Hunter" style="width:36px; height:36px; border-radius:50%; box-shadow:0 0 12px rgba(2,132,199,0.5);">
-      <div>
-        <div class="brand-title">Rocket Hunter</div>
-        <div class="brand-sub" id="versionLabel">v4.26.6 · Autonomous</div>
+    <div class="brand-row">
+      <div class="brand" onclick="toggleSidebar()" title="Click to Collapse / Expand Sidebar">
+        <div class="brand-img-wrap" style="position:relative;">
+          <img src="rocket-icon.png" alt="Rocket Hunter" style="width:36px; height:36px; border-radius:50%; box-shadow:0 0 12px rgba(2,132,199,0.5); display:block;">
+        </div>
+        <div class="brand-text">
+          <div class="brand-title">Rocket Hunter</div>
+          <div class="brand-sub" id="versionLabel">v4.26.6 · Autonomous</div>
+        </div>
       </div>
+      <button id="sidebarToggle" class="toggle-btn" onclick="toggleSidebar()" title="Toggle Sidebar">◀</button>
     </div>
 
     <!-- Navigation Menu (Accessible from any page) -->
     <nav class="nav-menu">
-      <div class="nav-item active" onclick="navigate('home', this)">
+      <div class="nav-item active" onclick="navigate('home', this)" title="Control & Live Monitor">
         <span class="nav-icon">🎛️</span>
-        <span>Control & Live Monitor</span>
+        <span class="nav-text">Control & Live Monitor</span>
       </div>
-      <div class="nav-item" onclick="navigate('rocket', this)">
+      <div class="nav-item" onclick="navigate('rocket', this)" title="Forward 24h Rocket">
         <span class="nav-icon">🚀</span>
-        <span>Forward 24h Rocket</span>
+        <span class="nav-text">Forward 24h Rocket</span>
       </div>
-      <div class="nav-item" onclick="navigate('status', this)">
+      <div class="nav-item" onclick="navigate('status', this)" title="Status Dashboard">
         <span class="nav-icon">📊</span>
-        <span>Status Dashboard</span>
+        <span class="nav-text">Status Dashboard</span>
       </div>
     </nav>
   </div>
 
   <div class="sidebar-footer">
-    <div class="status-pill" id="sidebarStatus">✔ READY</div>
+    <div class="status-pill" id="sidebarStatus" title="System Status">
+      <span class="status-icon">✔</span>
+      <span class="status-text">READY</span>
+    </div>
     <div class="clock-text" id="sidebarClock">Israel: --:--:-- IST</div>
   </div>
 </aside>
@@ -213,17 +299,22 @@ function updateSidebarStatus() {
 
   fetch('/api/status').then(res => res.json()).then(data => {
     const pill = document.getElementById('sidebarStatus');
+    const sIcon = pill.querySelector('.status-icon') || pill;
+    const sText = pill.querySelector('.status-text');
     if (data.is_paused) {
-      pill.innerText = '⏸️ PAUSED';
+      if (sText) { sIcon.innerText = '⏸️'; sText.innerText = 'PAUSED'; }
+      else { pill.innerText = '⏸️ PAUSED'; }
       pill.style.color = '#fbbf24';
       pill.style.background = 'rgba(245, 158, 11, 0.2)';
     } else if (data.is_completed) {
-      pill.innerText = '✔ READY';
+      if (sText) { sIcon.innerText = '✔'; sText.innerText = 'READY'; }
+      else { pill.innerText = '✔ READY'; }
       pill.style.color = '#10b981';
       pill.style.background = 'rgba(16, 185, 129, 0.15)';
     } else {
       const pctStr = (data.progress_pct !== undefined && data.progress_pct > 0) ? ` (${data.progress_pct}%)` : '';
-      pill.innerText = '● SCANNING' + pctStr;
+      if (sText) { sIcon.innerText = '●'; sText.innerText = 'SCANNING' + pctStr; }
+      else { pill.innerText = '● SCANNING' + pctStr; }
       pill.style.color = '#38bdf8';
       pill.style.background = 'rgba(56, 189, 248, 0.15)';
     }
@@ -231,6 +322,27 @@ function updateSidebarStatus() {
 }
 setInterval(updateSidebarStatus, 2000);
 updateSidebarStatus();
+
+// Toggle Sidebar open/close
+function toggleSidebar() {
+  const sidebar = document.getElementById('sidebar');
+  const btn = document.getElementById('sidebarToggle');
+  const isCollapsed = sidebar.classList.toggle('collapsed');
+  if (btn) {
+    btn.innerHTML = isCollapsed ? '▶' : '◀';
+    btn.title = isCollapsed ? 'Expand Side Menu' : 'Collapse Side Menu';
+  }
+  try {
+    localStorage.setItem('rh_sidebar_collapsed', isCollapsed ? 'true' : 'false');
+  } catch (e) {}
+}
+
+// Restore saved collapsed state
+try {
+  if (localStorage.getItem('rh_sidebar_collapsed') === 'true') {
+    toggleSidebar();
+  }
+} catch (e) {}
 
 // Listen to child iframe navigation requests
 window.addEventListener('message', function(event) {
