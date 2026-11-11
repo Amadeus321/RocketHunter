@@ -502,12 +502,8 @@ def main(argv: list[str] | None = None) -> int:
         pass
     # Immediately render status-dashboard.html so Scan History shows this scan as IN_PROGRESS
     try:
-        subprocess.run(
-            [sys.executable, "scripts/status_dashboard.py", "--output", str(repo_root / "status-dashboard.html")],
-            cwd=str(repo_root),
-            capture_output=True,
-            timeout=15,
-        )
+        from scripts import status_dashboard
+        status_dashboard.main(["--output", str(repo_root / "status-dashboard.html")])
     except Exception:
         pass
     try:
@@ -696,12 +692,8 @@ def main(argv: list[str] | None = None) -> int:
 
         # Always re-render status-dashboard.html to ensure scan history is never stale
         try:
-            subprocess.run(
-                [sys.executable, "scripts/status_dashboard.py", "--output", str(repo_root / "status-dashboard.html")],
-                cwd=str(repo_root),
-                capture_output=True,
-                timeout=15,
-            )
+            from scripts import status_dashboard
+            status_dashboard.main(["--output", str(repo_root / "status-dashboard.html")])
         except Exception:
             pass
 

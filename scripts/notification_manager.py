@@ -290,7 +290,7 @@ body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helv
             toast_title = f"Rocket Hunter — Scan {status}!"
             toast_msg = f"{actionable_count} Actionable Pick(s). Top: {top_candidate}"
             subprocess.Popen(
-                ["powershell", "-ExecutionPolicy", "Bypass", "-File", str(ps_script), "-Title", toast_title, "-Message", toast_msg],
+                ["powershell", "-WindowStyle", "Hidden", "-ExecutionPolicy", "Bypass", "-File", str(ps_script), "-Title", toast_title, "-Message", toast_msg],
                 creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0)
             )
             results["toast"] = {"success": True}

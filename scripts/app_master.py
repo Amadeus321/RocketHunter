@@ -206,6 +206,7 @@ def get_latest_run_dir() -> Path | None:
             pass
         return (finished, started, p.name)
 
+    now_utc = dt.datetime.now(dt.timezone.utc)
     # 1. Prioritize any actively running scan (IN_PROGRESS) whose process is genuinely still alive
     for p in sorted(candidates, key=_run_sort_key, reverse=True):
         try:
@@ -214,13 +215,27 @@ def get_latest_run_dir() -> Path | None:
                 pid = find_scan_pid(p)
                 if pid and is_pid_running(pid):
                     return p
-                else:
-                    # Stale or dead process: fail closed and mark INTERRUPTED
-                    now_str = dt.datetime.now(dt.timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
-                    data["status"] = "INTERRUPTED"
-                    data["failure_reason"] = "Process terminated unexpectedly or computer rebooted; fail closed."
-                    data["scan_finished_utc"] = now_str
-                    (p / "scan-status.json").write_text(json.dumps(data, indent=2), encoding="utf-8")
+
+                # Check age of scan
+                start_iso = data.get("scan_started_utc") or data.get("started_utc") or ""
+                age_sec = 999.0
+                if start_iso:
+                    try:
+                        s_dt = dt.datetime.fromisoformat(start_iso.replace("Z", "+00:00"))
+                        age_sec = (now_utc - s_dt).total_seconds()
+                    except Exception:
+                        pass
+
+                # If the scan was just launched less than 45 seconds ago, it is starting up!
+                if age_sec < 45.0:
+                    return p
+
+                # Stale or dead process older than 45 seconds: fail closed and mark INTERRUPTED
+                now_str = now_utc.replace(microsecond=0).isoformat().replace("+00:00", "Z")
+                data["status"] = "INTERRUPTED"
+                data["failure_reason"] = "Process terminated unexpectedly or computer rebooted; fail closed."
+                data["scan_finished_utc"] = now_str
+                (p / "scan-status.json").write_text(json.dumps(data, indent=2), encoding="utf-8")
         except Exception:
             pass
 
@@ -562,18 +577,13 @@ def get_live_status_payload() -> dict:
 def launch_new_scan() -> str:
     ts = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     outdir = RUNS_DIR / f"local-run-{ts}"
-    outdir.parent.mkdir(parents=True, exist_ok=True)
+    outdir.mkdir(parents=True, exist_ok=True)
 
     py_exe = get_python_exe()
     scan_script = SCRIPTS_DIR / "run_local_scan.py"
-    monitor_script = SCRIPTS_DIR / "monitor_scan.py"
 
-    # Detach process and give it its own process group so closing GUI window (X) does NOT kill the scan
-    flags = 0
-    if os.name == "nt":
-        DETACHED_PROCESS = 0x00000008
-        CREATE_NEW_PROCESS_GROUP = 0x00000200
-        flags = getattr(subprocess, "CREATE_NO_WINDOW", 0) | CREATE_NEW_PROCESS_GROUP | DETACHED_PROCESS
+    # Strictly CREATE_NO_WINDOW so no black console/PowerShell window opens
+    flags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
 
     proc = subprocess.Popen(
         [py_exe, str(scan_script), "--outdir", str(outdir), "--max-runtime-minutes", "170"],
@@ -585,11 +595,20 @@ def launch_new_scan() -> str:
     except Exception:
         pass
 
-    subprocess.Popen(
-        [py_exe, str(monitor_script)],
-        cwd=str(ROOT),
-        creationflags=flags,
-    )
+    # Immediately write scan-status.json with PID so Scan History and Control Center show it instantly
+    started_utc = dt.datetime.now(dt.timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+    status_file = outdir / "scan-status.json"
+    status_file.write_text(json.dumps({
+        "status": "IN_PROGRESS",
+        "run_id": outdir.name,
+        "scan_started_utc": started_utc,
+        "process_id": proc.pid,
+        "scanner_version": get_version(),
+    }, indent=2) + "\n", encoding="utf-8")
+
+    # Refresh dashboard in-process in a daemon thread (zero console windows)
+    trigger_dashboard_refresh()
+
     return f"Scan {outdir.name} successfully launched in background (PID {proc.pid})!"
 
 
@@ -597,7 +616,7 @@ def trigger_dashboard_refresh():
     def _run():
         try:
             from scripts import status_dashboard
-            status_dashboard.main([])
+            status_dashboard.main(["--output", str(ROOT / "status-dashboard.html")])
         except Exception:
             pass
     threading.Thread(target=_run, daemon=True).start()
