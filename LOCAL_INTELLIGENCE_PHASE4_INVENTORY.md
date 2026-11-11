@@ -1,0 +1,50 @@
+# Phase 4 research signal inventory
+
+This is a code-path inventory based on `LOCAL_INTELLIGENCE_ARCHITECTURE.md`, the Phase 4 readiness notes, and the current source tree. “Used in production” means wired into the local/hosted scan path; it does not mean every signal is present for every candidate or that outcomes validate the signal.
+
+## Existing signal producers
+
+| Area | Inputs and signal/evidence | Provenance and identity | Production use |
+|---|---|---|---|
+| Discovery and ecosystem context | Core `rocket_hunt.py` DEX Screener/GeckoTerminal and market feeds; v4.23 adds DefiLlama chain/DEX-volume context and optional DEXTools hot pairs; v4.24 adds one rotating Birdeye trending/new-listing/token-list family; v4.25 adds six DexPaprika pool search families for 5m/1h/6h/24h movers, 24h volume, and new pools. These are ranked provider samples, not a census. | Candidate rows retain provider/source labels, source URL where available, retrieval time, and request/coverage status. Pool rows carry chain, token address, and pool address when supplied; DEXTools/Birdeye token discovery may lack a complete pool identity. Symbols are not identity. Provider registries and discovery coverage are separately attributed. | Yes. Hooks are installed and run by the local/hosted pipeline; post-scan overlays merge provider coverage. Discovery-only rows can remain unqualified. |
+| Momentum and flow | Core `rocket_hunt.score_candidate` uses 1h/6h/24h changes, volume, liquidity, activity, source corroboration, and promotion/risk flags. `v425_early_breakout.score_candidate` adds 5m/1h/6h/24h changes, acceleration, turnover, liquidity, transactions, buy/sell flow, volume acceleration, and pool age. | Source values originate in provider rows and are compacted into forecast-time fields when present. The shared `v418_pipeline.make_forecast_record` captures a versioned `v425_early_breakout` object with the already-computed score and components only when tagged by the v4.25 producer; absent or malformed numbers remain null. Available source URL/label, retrieval/provider timestamps, run ID, and scanner/configuration fingerprint are retained. Local scans and hosted scan workflows use the same checked-in forecast writer. The capture is prospective; prior forecasts are not reconstructed or rewritten. | Yes. Scores are used to order candidate/research lanes and watchlists; they are heuristic ranks, not probabilities. They do not bypass final gates. |
+| On-chain evidence | `dex_onchain_evidence.py` checks Solana mint/creator/holder evidence via RugCheck and Solana RPC, exact pool metadata via Raydium/RugCheck, and EVM token/pool/LP/holder histories via RPC and Blockscout. | Evidence is source- and timestamp-attributed; exact chain, token/mint, pool, quote token, LP position, and holder records are required where applicable. Partial history, incomplete graph coverage, and unsupported LP models remain unverified. | Yes, as a post-scan evidence lane feeding the DEX guard; incomplete evidence blocks qualification. |
+| Security | `post_scan_audit.audit_goplus` obtains GoPlus checks on supported EVM chains; Solana security is derived from RugCheck. `dex_loss_guard._security_checks` validates structured fields and freshness. | Exact chain and token contract/mint, source, timestamp, and required security fields; missing/unsupported results remain unavailable, never PASS. | Yes. Security evidence is evaluated by the DEX loss-pattern gate and later qualification. |
+| Liquidity | Provider discovery contributes reported pool liquidity and volume. `forward_24h_report` validates the exact pool/price/candle orientation and applies the existing $100,000 research floor for technical target validation. CEX snapshots also report book depth. | Pool liquidity belongs to a chain + pool + token identity; symbols alone do not qualify. Final candle/price validation requires exact chain, token, pool, orientation, and aligned timestamps. Provider-reported liquidity remains distinct from executable depth. | Yes. It is an eligibility/research screen and part of the existing final technical gate; no thresholds were changed. |
+| Execution | `post_scan_audit` requests fresh CEX order books, 0x EVM quotes, and Jupiter Solana quotes. `execution_simulator.py` walks a supplied book to estimate VWAP, depth, and a hypothetical immediate round trip; it does not submit orders. | CEX venue/pair and snapshot timestamp; DEX chain/token, router quote timestamp, buy/sell direction, and notional. Quotes must be fresh and size-bound for the loss guard. The simulator takes a saved snapshot but does not independently verify its provider or asset identity. | Yes, through post-scan audits and the existing final two-way quote gate. `tests/test_execution_simulator.py` now covers depth-available and insufficient-depth estimates, fee effects, invalid inputs, and the explicit execution-disabled result. Estimates remain snapshot-only, not future fills. |
+
+## Isolated shadow comparison
+
+The historical ledgers used by this artifact predate prospective capture and do **not** freeze the v4.25 composite score/components in their forecast snapshots. Therefore this comparison uses only the independently recorded `change_1h_pct` input, restricted to `source=dexscreener_search` and `model_id=v4.19.0-eb-beta-binomial`. It requires a source URL and retrieval timestamp no more than 30 minutes before the forecast snapshot, exact DEX chain + token + pool identity, and a unique outcome joined by exact `forecast_id`, `market_key`, and `forecast_utc`.
+
+The artifact is `rocket-hunter-data/research-analysis/phase4-shadow-v1-e122da8ab57d71e52bdb5671/report.md` (machine-readable `report.json`; source hashes and output checksums in `manifest.json`). It splits forecast timestamps at `2026-11-06T00:00:00Z`, derives the `0.36%` signal median from training features only, and reports scheduled 24-hour endpoint marks observed from the horizon through six hours afterward:
+
+| Split | Forecasts | Signal present | Missing/unusable signal | Eligible bounded endpoint marks | Endpoint marks with signal |
+|---|---:|---:|---:|---:|---:|
+| Training | 493 | 227 | 266 | 326 | 205 |
+| Holdout | 4,428 | 2,030 | 2,398 | 1,058 | 654 |
+
+Holdout signal-at-or-below-median marks (n=352) had min/P25/median/P75/max **-27.18/-5.18/-1.52/0.17/186.30%**; above-median marks (n=302) had **-99.99/-5.59/-2.19/0.55/191.78%**. The report retains the larger denominators and missing/unavailable outcome states; the two group counts are smaller because only exact, bounded endpoint marks with the signal present enter distributions.
+
+These are **exploratory endpoint-mark associations only**—not target-touch rates, backtest performance, profitability, or evidence of effectiveness. The holdout is a short historical interval, forecasts overlap by market, and the provider-selected source is not full-universe coverage. The analysis is read-only and writes only a new versioned research artifact. It does not update production rankings, gates, or scanner memory.
+
+## Prospective v4.25 composite shadow path
+
+`scripts/analyze_v425_shadow.py` now provides a separate read-only analysis path for future `feature_snapshot.v425_early_breakout` captures. It requires an explicit timezone-qualified training/holdout cutoff, accepts only the versioned v4.25 score from exact-identity DEX forecasts with a source URL and retrieval timestamp no more than 30 minutes old, and joins only a unique 24-hour outcome with exact forecast ID, market key, and forecast time plus a valid endpoint mark observed from the scheduled horizon through six hours afterward. The score-group boundary is derived from training scores alone. A content-addressed report records source snapshot hashes, split cutoff, coverage/exclusion counts, and exploratory endpoint-return distributions; scanner memory is not modified.
+
+The analyzer has only been exercised against synthetic unit-test ledgers. **It has not been run against the production scanner-memory ledger** because that ledger currently has no prospective v4.25 score captures. Once prospective forecasts and mature matched outcomes exist, choose and record a justified UTC split cutoff before running:
+
+```powershell
+python scripts/analyze_v425_shadow.py --split-cutoff-utc <UTC-ISO-8601-CUTOFF>
+```
+
+The report remains exploratory and cannot establish target touches, executable returns, or effectiveness. Its existence does not satisfy the evidence prerequisites for Phase 4 validation or Phase 6 promotion.
+
+The current shadow-analysis code reports missing scanner/configuration provenance explicitly and excludes prospective v4.25 score records without a source label. Regression coverage is offline/synthetic; no production scanner-memory ledger was read for this work.
+
+## Phase 4 still outstanding
+
+- The last verified scanner-memory snapshot (`eab891847b33ea4b832beb8470c18530780b093443feb5bb4b56c9fd775831db`; 245,424 forecasts) contained **zero** `feature_snapshot.v425_early_breakout` captures. The new analyzer is test-verified on synthetic data only and has not read/evaluated the production ledger. Accumulate new forecast snapshots with prospective score/components and usable, uniquely matched endpoint-mark outcomes before evaluating the composite. Historical scores are not reconstructed; missing/incomplete hourly observation coverage remains a separate NOT READY blocker.
+- Expand source-attributed independent evidence and document per-engine identity/coverage boundaries; existing implementations do not make all provider evidence available for all markets.
+- Accumulate more complete, time-separated outcomes and evaluate on a sufficiently mature holdout without treating sampled marks as target touches or executable results.
+- Operational dashboard/readiness work may improve offline visibility without making strategy claims. Do not start effectiveness claims or missed-opportunity reporting, or consider production promotion, until the architecture’s coverage and evaluation requirements are satisfied.

@@ -1,0 +1,5 @@
+Rocket Hunter v4.26.6 qualification overlay
+
+Close Rocket Hunter before installing. Extract all ZIP contents directly into C:\Users\user\RocketHunter and allow replacement of the included files. Then start a new scan; an already-running process does not load updated scripts.
+
+This overlay includes no scanner-memory directory or historical learning data. Your existing rocket-hunter-data\scanner-memory is not replaced.

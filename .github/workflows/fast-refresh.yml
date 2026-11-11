@@ -1,0 +1,60 @@
+name: Free-data fast market refresh
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: crypto-prebreakout-scanner-memory
+  cancel-in-progress: false
+
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.11"
+      - name: Restore base runtime and v4.15.3 overlay
+        run: |
+          tar -xzf source/rocket-hunt-core-v4.15.2.tar.gz -C .
+          tar -xzf source/rocket-hunt-v4.15.3-overlay.tar.gz -C .
+          gzip -dc source/patch_forward_report.py.gz > source/patch_forward_report.py
+          python source/patch_forward_report.py
+          tar -xzf source/v418-research-overlay.tar.gz -C .
+      - name: Use the shared checked-in forecast pipeline
+        run: git show HEAD:scripts/v418_pipeline.py > scripts/v418_pipeline.py
+      - name: Install v4.20.0 forward-watchlist and memory-manifest overlay
+        run: |
+          python -m scripts.v420_upgrade --install --repo-root .
+          python -m scripts.v420_upgrade --self-test
+      - name: Restore persistent scanner memory branch
+        run: |
+          git fetch origin scanner-memory:refs/remotes/origin/scanner-memory
+          git worktree add /tmp/scanner-memory refs/remotes/origin/scanner-memory
+      - name: Refresh sampled public DEX, token lead and aggregator feeds
+        run: python -m scripts.v418_fast_refresh --outdir fast-run --memory-dir /tmp/scanner-memory --run-id "$GITHUB_RUN_ID"
+      - name: Persist compact forecast and outcome ledger
+        run: |
+          mkdir -p /tmp/scanner-memory/forecasts /tmp/scanner-memory/outcomes
+          git -C /tmp/scanner-memory add forecasts outcomes memory-manifest.json
+          if ! git -C /tmp/scanner-memory diff --cached --quiet; then
+            git -C /tmp/scanner-memory -c user.name="github-actions[bot]" -c user.email="41898282+github-actions[bot]@users.noreply.github.com" commit -m "Persist fast-refresh scanner memory for run ${GITHUB_RUN_ID}"
+            git -C /tmp/scanner-memory push origin HEAD:refs/heads/scanner-memory
+          else
+            echo "No memory changes to persist."
+          fi
+      - name: Upload fast-refresh report and audit
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: rocket-fast-refresh-${{ github.run_id }}
+          path: fast-run/
+          if-no-files-found: warn
+          retention-days: 7

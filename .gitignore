@@ -1,0 +1,31 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# C extensions
+*.so
+
+# Distribution / packaging
+build/
+dist/
+*.egg-info/
+RocketHunter.exe
+
+# Local data & run caches
+rocket-hunter-data/
+rocket-runs/
+_task_tmp/
+.pytest_cache/
+handover_bundle/
+identity-audit-backup/
+identity-audit.zip
+
+# Secrets & Environment variables
+.env
+.env.*
+*.lock
+
+# OS artifacts
+Thumbs.db
+.DS_Store

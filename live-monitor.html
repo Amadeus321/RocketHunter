@@ -1,0 +1,47 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta http-equiv="refresh" content="2">
+<title>🚀 Rocket Hunter — Live Monitor</title>
+<style>
+body { background:#0b1120; color:#e2e8f0; font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif; margin:0; padding:24px; }
+.card { background:#111827; border:1px solid #1e293b; border-radius:12px; padding:20px; max-width:880px; margin:0 auto 20px auto; box-shadow:0 10px 25px rgba(0,0,0,0.5); }
+.header { display:flex; justify-content:space-between; align-items:center; border-bottom:1px solid #1e293b; padding-bottom:14px; margin-bottom:16px; }
+.title { font-size:22px; font-weight:800; color:#38bdf8; display:flex; align-items:center; gap:8px; }
+.badge-status { background:#065f46; color:#34d399; padding:4px 12px; border-radius:999px; font-weight:700; font-size:12px; }
+.grid { display:grid; grid-template-columns:repeat(4,1fr); gap:12px; margin-bottom:16px; }
+.stat { background:#0f172a; padding:12px; border-radius:8px; border:1px solid #1e293b; text-align:center; }
+.stat-val { font-size:20px; font-weight:800; color:#f8fafc; margin-top:4px; }
+.stat-lbl { font-size:11px; color:#94a3b8; text-transform:uppercase; font-weight:600; }
+.terminal { background:#050811; border:1px solid #1e293b; border-radius:8px; padding:14px; font-family:Consolas,monospace; font-size:12px; color:#a5f3fc; line-height:1.6; max-height:220px; overflow-y:auto; }
+@keyframes blink { 0%,100% { opacity:1; } 50% { opacity:0.5; } }
+</style>
+</head>
+<body>
+<div class="card">
+  <div style="font-size:13px;font-weight:700;color:#38bdf8;background:#0f172a;border:1px solid #1e293b;border-radius:8px;padding:9px 14px;margin-bottom:14px;letter-spacing:0.02em;">
+    Scan: id (local-run-20261111T181258Z) version(v4.26.6) · 118 Ranked Candidates counted
+  </div>
+  <div class="header">
+    <div class="title">🚀 Rocket Hunter — Live Scan Monitor</div>
+    <div><span class="badge-status" style="background:rgba(16, 185, 129, 0.2);color:#34d399;">COMPLETED</span></div>
+  </div>
+  <div class="grid">
+    <div class="stat"><div class="stat-lbl">Elapsed Time</div><div class="stat-val" style="color:#38bdf8;">⏱️ 01:15:27</div></div>
+    <div class="stat"><div class="stat-lbl">Started (Israel Time)</div><div class="stat-val">20:12:59 IST</div></div>
+    <div class="stat"><div class="stat-lbl">Clock (Israel Time)</div><div class="stat-val">22:46:10 IST</div></div>
+    <div class="stat"><div class="stat-lbl">Active Stage</div><div class="stat-val" style="color:#10b981;">7/7 (Done)</div></div>
+  </div>
+  <div style="background:#1e293b;border-radius:8px;overflow:hidden;height:24px;position:relative;margin:16px 0;"><div style="background:linear-gradient(90deg,#06b6d4,#10b981);width:100%;height:100%;transition:width 0.5s;"></div><span style="position:absolute;left:50%;top:50%;transform:translate(-50%,-50%);font-weight:700;font-size:12px;color:#fff;">100% Completed</span></div>
+  <div style="background:#0f172a;border:1px solid #1e293b;border-radius:8px;padding:12px;margin-bottom:16px;">
+    <div style="display:flex;justify-content:space-between;padding:8px 6px;color:#94a3b8;"><span>1. Preflight System & Network Probes</span><span style="color:#10b981;font-weight:700;">✔ COMPLETED</span></div><div style="display:flex;justify-content:space-between;padding:8px 6px;color:#94a3b8;"><span>2. Market Sweep & Universe Discovery (9,000+ Assets)</span><span style="color:#10b981;font-weight:700;">✔ COMPLETED</span></div><div style="display:flex;justify-content:space-between;padding:8px 6px;color:#94a3b8;"><span>3. Post-Scan Audits (CVD, Depth, Security, Routers)</span><span style="color:#10b981;font-weight:700;">✔ COMPLETED</span></div><div style="display:flex;justify-content:space-between;padding:8px 6px;color:#94a3b8;"><span>4. 24h Forward & Single-TP Modeling (OHLCV Candles)</span><span style="color:#10b981;font-weight:700;">✔ COMPLETED</span></div><div style="display:flex;justify-content:space-between;padding:8px 6px;color:#94a3b8;"><span>5. Early Breakout & Scan-End Live Price Refresh</span><span style="color:#10b981;font-weight:700;">✔ COMPLETED</span></div><div style="display:flex;justify-content:space-between;padding:8px 6px;color:#94a3b8;"><span>6. Deterministic Qualification Gate (+40% single-TP)</span><span style="color:#10b981;font-weight:700;">✔ COMPLETED</span></div><div style="display:flex;justify-content:space-between;padding:8px 6px;color:#94a3b8;"><span>7. Final Report Finalization & Results</span><span style="color:#10b981;font-weight:700;">✔ COMPLETED</span></div>
+  </div>
+  <div style="font-size:12px;font-weight:700;color:#94a3b8;margin-bottom:6px;">LIVE SCAN LOG STREAM:</div>
+  <div class="terminal"><div>Updated root forward HTML watchlist: C:\Users\user\RocketHunter\forward-24h-rocket.html</div><div>$ C:\Users\user\AppData\Local\Microsoft\WindowsApps\PythonSoftwareFoundation.Python.3.13_qbz5n2kfra8p0\python.exe scripts/run_full_scan.py --mark-complete --outdir C:\Users\user\RocketHunter\rocket-runs\local-run-20261111T181258Z</div><div>$ C:\Users\user\AppData\Local\Microsoft\WindowsApps\PythonSoftwareFoundation.Python.3.13_qbz5n2kfra8p0\python.exe scripts/render_forward_watchlist_markdown.py --input C:\Users\user\RocketHunter\rocket-runs\local-run-20261111T181258Z\forward-24h-rocket.json --output C:\Users\user\RocketHunter\rocket-runs\local-run-20261111T181258Z\forward-24h-rocket.md</div><div>Rejecting Risky/Honeypot candidate \u725b\u903c\u4eba\u751f/WBNB: GECKOTERMINAL_GT_SCORE_POOR: 45.0/100</div><div>Rejecting Risky/Honeypot candidate DACT/WBNB: HONEYPOT_ZERO_SELLS: 313 buys / 0 sells in 24h</div><div>Rejecting Risky/Honeypot candidate VEYL/SOL: RUGCHECK_SOLANA_DANGER: Low Liquidity</div><div>Rejecting Risky/Honeypot candidate GEL/USDC: GECKOTERMINAL_GT_SCORE_POOR: 35.1/100</div><div>Rejecting Risky/Honeypot candidate DACT/WBNB: HONEYPOT_ZERO_SELLS: 313 buys / 0 sells in 24h</div><div>Rejecting Risky/Honeypot candidate VEYL/SOL: RUGCHECK_SOLANA_DANGER: Low Liquidity</div><div>Wrote finalized forward watchlist: C:\Users\user\RocketHunter\rocket-runs\local-run-20261111T181258Z\forward-24h-rocket.md</div><div>Wrote finalized forward HTML watchlist: C:\Users\user\RocketHunter\rocket-runs\local-run-20261111T181258Z\forward-24h-rocket.html</div><div>Updated root forward HTML watchlist: C:\Users\user\RocketHunter\forward-24h-rocket.html</div></div>
+  <div style="margin-top:16px;text-align:center;">
+    <a href="forward-24h-rocket.html" onclick="if(window.parent&&window.parent!=window){window.parent.postMessage({action:'navigate',page:'rocket'},'*');return false;}" style="display:inline-block;background:#0284c7;color:#fff;text-decoration:none;font-weight:700;padding:10px 20px;border-radius:8px;font-size:13px;cursor:pointer;">Open Final Report (forward-24h-rocket.html) ↗</a>
+  </div>
+</div>
+</body>
+</html>

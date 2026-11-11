@@ -1,0 +1,99 @@
+name: Verify forward 24h required trade fields
+
+on:
+  pull_request:
+    branches: [master]
+    paths:
+      - ".github/workflows/**"
+      - "source/**"
+      - "scripts/**"
+      - "tests/**"
+      - "README.md"
+      - "VERSION"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Restore base runtime and v4.15.3 overlay
+        run: |
+          tar -xzf source/rocket-hunt-core-v4.15.2.tar.gz -C .
+          tar -xzf source/rocket-hunt-v4.15.3-overlay.tar.gz -C .
+          gzip -dc source/patch_forward_report.py.gz > source/patch_forward_report.py
+          python source/patch_forward_report.py
+          rm -f source/patch_forward_report.py
+          mkdir -p tests
+          gzip -dc source/test_forward_24h_required_fields.py.gz > tests/test_forward_24h_required_fields.py
+          tar -xzf source/v418-research-overlay.tar.gz -C .
+      - name: Install v4.18.1 forward-age guard and matching test baseline
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          pipeline = Path("scripts/v418_pipeline.py")
+          text = pipeline.read_text(encoding="utf-8")
+          old = 'PIPELINE_VERSION = "4.18.0"'
+          new = 'PIPELINE_VERSION = "4.18.1"'
+          if old in text:
+              pipeline.write_text(text.replace(old, new, 1), encoding="utf-8")
+          elif new not in text:
+              raise SystemExit("Expected v4.18.0/v4.18.1 pipeline declaration was not found")
+
+          test_path = Path("tests/test_v418_pipeline.py")
+          test_text = test_path.read_text(encoding="utf-8")
+          import_marker = "from scripts.v418_pipeline import (" + chr(10)
+          if "    PIPELINE_VERSION," not in test_text:
+              if import_marker not in test_text:
+                  raise SystemExit("Could not locate v4.18 pipeline test import")
+              test_text = test_text.replace(import_marker, import_marker + "    PIPELINE_VERSION," + chr(10), 1)
+          old_assert = 'self.assertEqual(j["pipeline_version"], "4.18.0")'
+          new_assert = 'self.assertEqual(j["pipeline_version"], PIPELINE_VERSION)'
+          if old_assert in test_text:
+              test_text = test_text.replace(old_assert, new_assert, 1)
+          elif new_assert not in test_text:
+              raise SystemExit("Could not locate pipeline-version assertion")
+          test_path.write_text(test_text, encoding="utf-8")
+          PY
+          gzip -dc source/v4181-forward-age-guard.py.gz > scripts/v418_forward_guard.py
+          gzip -dc source/test_v4181-forward-age-guard.py.gz > tests/test_v418_forward_guard.py
+      - name: Install v4.19.0 collector and memory upgrade
+        run: |
+          python -m scripts.v419_upgrade --install --repo-root .
+          python -m scripts.v419_upgrade --self-test
+          python -m scripts.v420_upgrade --install --repo-root .
+          python -m scripts.v420_upgrade --self-test
+      - name: Restore current tracked DEX safety integration after legacy archive extraction
+        run: |
+          git show HEAD:scripts/forward_24h_report.py > scripts/forward_24h_report.py
+          git show HEAD:scripts/post_scan_audit.py > scripts/post_scan_audit.py
+          git show HEAD:scripts/dex_onchain_evidence.py > scripts/dex_onchain_evidence.py
+      - name: Verify DEX loss-pattern gate wiring
+        run: |
+          python - <<'PY'
+          from scripts import dex_loss_guard, forward_24h_report
+          import sys
+          sys.path.insert(0, "scripts")
+          import post_scan_audit
+          import dex_onchain_evidence
+          assert callable(dex_onchain_evidence.enrich_candidate)
+          assert callable(post_scan_audit.audit_dex_loss_guard)
+          assert callable(dex_loss_guard.evaluate_dex_candidate)
+          assert callable(post_scan_audit.audit_dex_loss_guard)
+          assert callable(forward_24h_report.enforce_dex_loss_guard)
+          PY
+      - name: Run all deterministic tests and CLI smoke checks
+        run: |
+          python -m unittest discover -s tests -p 'test_*.py' -v
+          python -m compileall -q scripts tests
+          python scripts/rocket_hunt.py --help >/dev/null
+          python scripts/run_full_scan.py --help >/dev/null
+          python scripts/forward_24h_report.py --help >/dev/null
+          python -m scripts.v418_forward_guard --help >/dev/null

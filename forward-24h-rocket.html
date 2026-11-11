@@ -1,0 +1,281 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Rocket Hunter — Forward 24h Watchlist (v4.26.6)</title>
+<style>
+:root {
+  color-scheme: dark;
+  --bg: #101820;
+  --panel: #17232d;
+  --panel-alt: #1d2d3a;
+  --line: #2a3a46;
+  --text: #e8eff3;
+  --muted: #a6b6c1;
+  --accent: #72d6bd;
+  --warn: #f0c674;
+  --green: #4ade80;
+  --red: #f87171;
+  --blue: #60a5fa;
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--text); font: 15px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif; }
+main { width: min(1680px, 96vw); max-width: 96vw; margin: 24px auto 60px; }
+h1, h2, h3, p { margin-top: 0; }
+h1 { font-size: clamp(1.6rem, 3.5vw, 2.2rem); margin-bottom: 6px; }
+h2 { font-size: 1.2rem; margin-bottom: 14px; color: var(--text); }
+h3 { font-size: 1.05rem; margin-bottom: 6px; }
+.meta, .muted { color: var(--muted); font-size: 0.9rem; }
+.eyebrow { color: var(--accent); font-size: 0.8rem; font-weight: 700; letter-spacing: 0.12em; text-transform: uppercase; margin-bottom: 4px; }
+.grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 12px; margin: 20px 0; }
+.card, section { background: var(--panel); border: 1px solid var(--line); border-radius: 12px; }
+.card { padding: 16px; }
+.card-label { color: var(--muted); font-size: 0.82rem; }
+.card-value { font-size: 1.3rem; font-weight: 700; margin-top: 6px; overflow-wrap: anywhere; }
+section { padding: 22px; margin: 18px 0; }
+.table-wrap { overflow-x: auto; margin-top: 8px; }
+table { border-collapse: collapse; width: 100%; min-width: 800px; text-align: left; }
+th, td { border-bottom: 1px solid var(--line); padding: 10px 10px; vertical-align: top; }
+th { color: var(--muted); font-size: 0.8rem; font-weight: 600; text-transform: uppercase; letter-spacing: 0.05em; }
+code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 0.88rem; background: var(--panel-alt); padding: 2px 6px; border-radius: 4px; border: 1px solid var(--line); }
+.badge { display: inline-block; padding: 2px 8px; border-radius: 6px; font-size: 0.78rem; font-weight: 700; letter-spacing: 0.04em; }
+.badge.ok { background: rgba(74, 222, 128, 0.15); color: var(--green); border: 1px solid rgba(74, 222, 128, 0.3); }
+.badge.warn { background: rgba(240, 198, 116, 0.15); color: var(--warn); border: 1px solid rgba(240, 198, 116, 0.3); }
+.badge.info { background: rgba(96, 165, 250, 0.15); color: var(--blue); border: 1px solid rgba(96, 165, 250, 0.3); }
+.banner { padding: 20px; border-radius: 10px; margin: 8px 0; border: 1px solid var(--line); }
+.banner.zero { background: rgba(240, 198, 116, 0.06); border-color: rgba(240, 198, 116, 0.3); }
+.banner.warn { background: rgba(248, 113, 113, 0.08); border-color: rgba(248, 113, 113, 0.3); }
+.banner-badge { display: inline-block; font-size: 0.72rem; font-weight: 800; letter-spacing: 0.1em; color: var(--warn); margin-bottom: 6px; }
+.green { color: var(--green); font-weight: 700; }
+.note { border-left: 3px solid var(--accent); padding-left: 14px; margin-top: 14px; }
+a { color: var(--accent); text-decoration: none; }
+a:hover { text-decoration: underline; }
+.pos-chk-lbl {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  background: rgba(56, 189, 248, 0.08);
+  border: 1px solid rgba(56, 189, 248, 0.25);
+  padding: 4px 8px;
+  border-radius: 6px;
+  cursor: pointer;
+  font-size: 0.8rem;
+  font-weight: 600;
+  color: var(--accent);
+  transition: all 0.2s ease;
+  user-select: none;
+}
+.pos-chk-lbl:hover {
+  background: rgba(56, 189, 248, 0.18);
+  border-color: var(--accent);
+}
+.pos-chk-lbl input[type="checkbox"] {
+  cursor: pointer;
+  accent-color: var(--accent);
+  width: 15px;
+  height: 15px;
+}
+.btn-sm {
+  padding: 5px 10px;
+  font-size: 0.82rem;
+  font-weight: 700;
+  border-radius: 6px;
+  cursor: pointer;
+  border: 1px solid transparent;
+  transition: all 0.15s ease;
+}
+.btn-save {
+  background: rgba(16, 185, 129, 0.2);
+  color: #34d399;
+  border-color: rgba(16, 185, 129, 0.4);
+}
+.btn-save:hover {
+  background: rgba(16, 185, 129, 0.35);
+}
+.btn-del {
+  background: rgba(239, 68, 68, 0.15);
+  color: #f87171;
+  border-color: rgba(239, 68, 68, 0.3);
+  margin-left: 4px;
+}
+.btn-del:hover {
+  background: rgba(239, 68, 68, 0.3);
+}
+.btn-reset {
+  background: rgba(245, 158, 11, 0.15);
+  color: #fbbf24;
+  border-color: rgba(245, 158, 11, 0.3);
+}
+.btn-reset:hover {
+  background: rgba(245, 158, 11, 0.3);
+}
+.input-dark {
+  background: #090d16;
+  border: 1px solid var(--line);
+  color: var(--text);
+  padding: 6px 8px;
+  border-radius: 6px;
+  font-size: 0.85rem;
+}
+.input-dark:focus {
+  outline: none;
+  border-color: var(--accent);
+}
+@media print {
+  :root { color-scheme: light; --bg: #fff; --panel: #fff; --line: #ccd5da; --text: #18232a; --muted: #52636e; }
+  body { background: #fff; }
+}
+</style>
+</head>
+<body>
+<main>
+<header>
+<div class="eyebrow">Rocket Hunter · Production Scan Output</div>
+<h1>Forward 24h Watchlist</h1>
+<p class="meta">Finished 2026-11-11 21:28:25 IST · General version <code>v4.26.6</code></p>
+</header>
+
+<div class="grid">
+  <div class="card" style="border-left: 3px solid var(--accent);">
+    <div class="card-label">Scan Finished (Israel Time)</div>
+    <div class="card-value" style="color:var(--accent);font-size:1.25rem;">2026-11-11 21:28:25 IST</div>
+  </div>
+  <div class="card">
+    <div class="card-label">Scan Status</div>
+    <div class="card-value"><span class="badge ok">COMPLETED</span></div>
+  </div>
+  <div class="card">
+    <div class="card-label">Run ID</div>
+    <div class="card-value" style="font-size:0.95rem;"><code>local-run-20261111T181258Z</code></div>
+  </div>
+  <div class="card">
+    <div class="card-label">Ranked Opportunities</div>
+    <div class="card-value">118</div>
+  </div>
+</div>
+
+<section>
+<h2>1. Verified Actionable Opportunities</h2>
+<p class="meta">Strict single-TP architecture: minimum +40.00% upside, no stop loss, no trailing stop. Only candidates passing live price refresh, exact token/pool verification, safety audit, and two-way executable quotes appear here.</p>
+<div class="table-wrap"><table><thead><tr><th>Pair</th><th>Chain</th><th>Current Price</th><th>Single TP</th><th>Potential (% till TP)</th><th>Pool Address</th><th>Token Contract</th><th>Verification</th><th>Safety</th><th>Execution</th><th>Take Position</th></tr></thead><tbody><tr><td><strong>HOLD/SOL</strong></td><td>solana</td><td>$0.0006215</td><td>$0.0011855342</td><td class="green">+90.75%</td><td><code>GUsid5mPW6KiExjQDDggoTHrFv4ecGqqAgYwiHa4Ujbb</code></td><td><code>4iJ7xEQrUvVUQH9KVStvw3FaY2PZDd7RtR4L9zx2pump</code></td><td><span class="badge ok">QUALIFIED</span></td><td><span class="badge ok">PASS</span></td><td><span class="badge ok">PASS</span></td><td><label class="pos-chk-lbl"><input type="checkbox" class="pos-checkbox" data-pair="HOLD/SOL" data-chain="solana" data-entry="0.0006215" data-tp="0.0011855342" data-pot="+90.75%" data-pool="GUsid5mPW6KiExjQDDggoTHrFv4ecGqqAgYwiHa4Ujbb" data-token="4iJ7xEQrUvVUQH9KVStvw3FaY2PZDd7RtR4L9zx2pump" data-version="v4.26.6" data-run="local-run-20261111T181258Z" onchange="toggleCandidatePosition(this)"> <span>Take Position</span></label></td></tr><tr><td><strong>HOLD/HOLD</strong></td><td>solana</td><td>$0.0005392243</td><td>$0.0008665908</td><td class="green">+60.71%</td><td><code>2tFKnU5e2Aoq5AtunAo7w9V5hVZNyeJrL4U6RE7Uwig9</code></td><td><code>4iJ7xEQrUvVUQH9KVStvw3FaY2PZDd7RtR4L9zx2pump</code></td><td><span class="badge ok">QUALIFIED</span></td><td><span class="badge ok">PASS</span></td><td><span class="badge ok">PASS</span></td><td><label class="pos-chk-lbl"><input type="checkbox" class="pos-checkbox" data-pair="HOLD/HOLD" data-chain="solana" data-entry="0.0005392243" data-tp="0.0008665908" data-pot="+60.71%" data-pool="2tFKnU5e2Aoq5AtunAo7w9V5hVZNyeJrL4U6RE7Uwig9" data-token="4iJ7xEQrUvVUQH9KVStvw3FaY2PZDd7RtR4L9zx2pump" data-version="v4.26.6" data-run="local-run-20261111T181258Z" onchange="toggleCandidatePosition(this)"> <span>Take Position</span></label></td></tr><tr><td><strong>BINKY/WBTC</strong></td><td>solana</td><td>$0.00007714</td><td>$0.0002432533</td><td class="green">+215.34%</td><td><code>3TyDhMqhQdroh9zBo7CpnZ31GbY96jptiPfgX6ktRozH</code></td><td><code>2g23GpSneyx7Uqb25YKA6i66m8f1VDYwpGCVGXhdwK8h</code></td><td><span class="badge ok">QUALIFIED</span></td><td><span class="badge ok">PASS</span></td><td><span class="badge ok">PASS</span></td><td><label class="pos-chk-lbl"><input type="checkbox" class="pos-checkbox" data-pair="BINKY/WBTC" data-chain="solana" data-entry="0.00007714" data-tp="0.0002432533" data-pot="+215.34%" data-pool="3TyDhMqhQdroh9zBo7CpnZ31GbY96jptiPfgX6ktRozH" data-token="2g23GpSneyx7Uqb25YKA6i66m8f1VDYwpGCVGXhdwK8h" data-version="v4.26.6" data-run="local-run-20261111T181258Z" onchange="toggleCandidatePosition(this)"> <span>Take Position</span></label></td></tr><tr><td><strong>咪好/SOL</strong></td><td>solana</td><td>$0.0003999</td><td>$0.000976456</td><td class="green">+144.18%</td><td><code>GSucfCJDqx8pShmYr2KokoAbjUHjq6ivvAfkmi5A8KSB</code></td><td><code>Hg3w7GdPViZ5URuCNnK6EwXLzSTmVwX6UXLeD6Pbpump</code></td><td><span class="badge ok">QUALIFIED</span></td><td><span class="badge ok">PASS</span></td><td><span class="badge ok">PASS</span></td><td><label class="pos-chk-lbl"><input type="checkbox" class="pos-checkbox" data-pair="咪好/SOL" data-chain="solana" data-entry="0.0003999" data-tp="0.000976456" data-pot="+144.18%" data-pool="GSucfCJDqx8pShmYr2KokoAbjUHjq6ivvAfkmi5A8KSB" data-token="Hg3w7GdPViZ5URuCNnK6EwXLzSTmVwX6UXLeD6Pbpump" data-version="v4.26.6" data-run="local-run-20261111T181258Z" onchange="toggleCandidatePosition(this)"> <span>Take Position</span></label></td></tr><tr><td><strong>DacityCoin / ETH</strong></td><td>eth</td><td>$0.01688</td><td>$0.0298049213</td><td class="green">+76.57%</td><td><code>0x03310c366360cc330652b7a56cea1785546a7e30023652fe5e1313211bdcccbd</code></td><td><code>0xc4700ae5a5e6cd6b70e7190a0458e568089e98e2</code></td><td><span class="badge ok">QUALIFIED</span></td><td><span class="badge ok">PASS</span></td><td><span class="badge ok">PASS</span></td><td><label class="pos-chk-lbl"><input type="checkbox" class="pos-checkbox" data-pair="DacityCoin / ETH" data-chain="eth" data-entry="0.01688" data-tp="0.0298049213" data-pot="+76.57%" data-pool="0x03310c366360cc330652b7a56cea1785546a7e30023652fe5e1313211bdcccbd" data-token="0xc4700ae5a5e6cd6b70e7190a0458e568089e98e2" data-version="v4.26.6" data-run="local-run-20261111T181258Z" onchange="toggleCandidatePosition(this)"> <span>Take Position</span></label></td></tr><tr><td><strong>PAYDAY / SOL</strong></td><td>solana</td><td>$0.000245</td><td>$0.000363496</td><td class="green">+48.37%</td><td><code>9rQAUw4uNyfsqsJ9F3BPo3hBFY1V6ptaEtPkRhhH3zpL</code></td><td><code>uHMWNFjUNxbPy1q43WrdbzygmJwdeh6AiQm1NKdxPAY</code></td><td><span class="badge ok">QUALIFIED</span></td><td><span class="badge ok">PASS</span></td><td><span class="badge ok">PASS</span></td><td><label class="pos-chk-lbl"><input type="checkbox" class="pos-checkbox" data-pair="PAYDAY / SOL" data-chain="solana" data-entry="0.000245" data-tp="0.000363496" data-pot="+48.37%" data-pool="9rQAUw4uNyfsqsJ9F3BPo3hBFY1V6ptaEtPkRhhH3zpL" data-token="uHMWNFjUNxbPy1q43WrdbzygmJwdeh6AiQm1NKdxPAY" data-version="v4.26.6" data-run="local-run-20261111T181258Z" onchange="toggleCandidatePosition(this)"> <span>Take Position</span></label></td></tr></tbody></table></div>
+</section>
+
+<section>
+<h2>2. Unverified Research Watchlist — NOT QUALIFIED</h2>
+<p class="meta">Research rankings and hypothetical upside do not satisfy the technical TP or verification gates. All 0 mature research candidates meeting the mandatory +40.00% threshold shown.</p>
+<p class="muted">No unverified research candidates met the mandatory +40.00% potential threshold.</p>
+<p class="meta note">*The 24h upside scenario is a volatility/momentum scenario from hourly candles, not a predicted return or calibrated probability. Initial downside is an ATR-based reference stop. Scenario R:R is upside scenario divided by initial stop distance.</p>
+</section>
+
+
+
+<div id="toast-msg" style="display:none;position:fixed;bottom:24px;right:24px;background:#1e293b;border:1px solid #38bdf8;color:#f8fafc;padding:12px 18px;border-radius:8px;font-size:13px;font-weight:600;box-shadow:0 8px 24px rgba(0,0,0,0.5);z-index:9999;"></div>
+</main>
+
+<script>
+let journalPositions = [];
+
+function showToast(text, isError) {
+  const el = document.getElementById('toast-msg');
+  if (!el) return;
+  el.textContent = text;
+  el.style.display = 'block';
+  el.style.borderColor = isError ? '#ef4444' : '#10b981';
+  el.style.color = isError ? '#f87171' : '#34d399';
+  setTimeout(() => { el.style.display = 'none'; }, 3500);
+}
+
+async function loadJournal() {
+  try {
+    const res = await fetch('/api/journal');
+    if (!res.ok) return;
+    const data = await res.json();
+    journalPositions = data.positions || [];
+    syncCandidateCheckboxes();
+  } catch (e) {
+    console.error('Error loading journal:', e);
+  }
+}
+
+function syncCandidateCheckboxes() {
+  const chks = document.querySelectorAll('.pos-checkbox');
+  chks.forEach(chk => {
+    const pool = (chk.getAttribute('data-pool') || '').trim();
+    const pair = (chk.getAttribute('data-pair') || '').trim();
+    const run = (chk.getAttribute('data-run') || '').trim();
+    const match = journalPositions.find(p => (pool && p.pool_address === pool) || (p.pair === pair && p.run_id === run));
+    chk.checked = !!match;
+    if (chk.parentElement) {
+      const span = chk.parentElement.querySelector('span');
+      if (chk.checked) {
+        chk.parentElement.style.background = 'rgba(16, 185, 129, 0.2)';
+        chk.parentElement.style.borderColor = 'rgba(16, 185, 129, 0.5)';
+        if (span) span.textContent = '✓ Taken';
+      } else {
+        chk.parentElement.style.background = '';
+        chk.parentElement.style.borderColor = '';
+        if (span) span.textContent = 'Take Position';
+      }
+    }
+  });
+}
+
+async function toggleCandidatePosition(el) {
+  const isChecked = el.checked;
+  const pool = el.getAttribute('data-pool') || '';
+  const pair = el.getAttribute('data-pair') || '';
+  const run = el.getAttribute('data-run') || '';
+
+  if (isChecked) {
+    const payload = {
+      pair: pair,
+      chain: el.getAttribute('data-chain') || '',
+      entry_price: el.getAttribute('data-entry') || '',
+      single_tp: el.getAttribute('data-tp') || '',
+      potential_pct: el.getAttribute('data-pot') || '',
+      pool_address: pool,
+      token_contract: el.getAttribute('data-token') || '',
+      software_version: el.getAttribute('data-version') || 'v4.26.6',
+      run_id: run,
+      status: 'OPEN'
+    };
+    try {
+      const res = await fetch('/api/journal/record', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify(payload)
+      });
+      const data = await res.json();
+      if (data.status === 'OK' || data.status === 'EXISTS') {
+        showToast(`Position ${pair} recorded! Track follow-up in Status Dashboard.`);
+        await loadJournal();
+      }
+    } catch (e) {
+      showToast('Failed to record position.', true);
+    }
+  } else {
+    const match = journalPositions.find(p => (pool && p.pool_address === pool) || (p.pair === pair && p.run_id === run));
+    if (match) {
+      try {
+        const res = await fetch('/api/journal/delete', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({id: match.id})
+        });
+        const data = await res.json();
+        if (data.status === 'OK') {
+          showToast(`Position ${pair} removed from Journal.`);
+          await loadJournal();
+        }
+      } catch (e) {
+        showToast('Failed to remove position.', true);
+      }
+    }
+  }
+}
+
+document.addEventListener('DOMContentLoaded', loadJournal);
+</script>
+</body>
+</html>

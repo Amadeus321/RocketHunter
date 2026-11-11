@@ -1,0 +1,244 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="icon" type="image/x-icon" href="/favicon.ico">
+<title>Rocket Hunter — Desktop Control Center</title>
+<style>
+:root {
+  --bg-dark: #0b1120;
+  --sidebar-bg: #0f172a;
+  --sidebar-border: #1e293b;
+  --sidebar-active: #0284c7;
+  --text-main: #f8fafc;
+  --text-muted: #94a3b8;
+  --accent: #38bdf8;
+  --green: #10b981;
+}
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body {
+  display: flex;
+  height: 100vh;
+  width: 100vw;
+  overflow: hidden;
+  background: var(--bg-dark);
+  color: var(--text-main);
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+}
+
+/* ── SIDEBAR ── */
+#sidebar {
+  width: 250px;
+  min-width: 250px;
+  background: var(--sidebar-bg);
+  border-right: 1px solid var(--sidebar-border);
+  display: flex;
+  flex-direction: column;
+  justify-content: space-between;
+  padding: 20px 14px;
+}
+
+.brand {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 0 8px 18px 8px;
+  border-bottom: 1px solid var(--sidebar-border);
+  margin-bottom: 16px;
+}
+.brand-title {
+  font-size: 19px;
+  font-weight: 800;
+  color: var(--accent);
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.brand-sub {
+  font-size: 11px;
+  color: var(--text-muted);
+  font-weight: 600;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+}
+
+.nav-menu {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  flex: 1;
+}
+.nav-item {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 11px 14px;
+  border-radius: 8px;
+  font-size: 13.5px;
+  font-weight: 600;
+  color: var(--text-muted);
+  text-decoration: none;
+  cursor: pointer;
+  transition: all 0.2s ease;
+  user-select: none;
+}
+.nav-item:hover {
+  background: #1e293b;
+  color: #fff;
+}
+.nav-item.active {
+  background: #0284c7;
+  color: #ffffff;
+  box-shadow: 0 4px 12px rgba(2, 132, 199, 0.4);
+}
+.nav-icon {
+  font-size: 16px;
+}
+
+.sidebar-footer {
+  border-top: 1px solid var(--sidebar-border);
+  padding: 14px 8px 0 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.status-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 11px;
+  font-weight: 700;
+  color: var(--green);
+  background: rgba(16, 185, 129, 0.12);
+  padding: 4px 10px;
+  border-radius: 999px;
+  width: fit-content;
+}
+.clock-text {
+  font-size: 11px;
+  color: var(--text-muted);
+  font-family: Consolas, monospace;
+}
+
+/* ── MAIN CONTENT VIEWPORT ── */
+#viewport {
+  flex: 1;
+  height: 100vh;
+  position: relative;
+  background: var(--bg-dark);
+}
+#contentFrame {
+  width: 100%;
+  height: 100%;
+  border: none;
+  background: var(--bg-dark);
+}
+</style>
+</head>
+<body>
+
+<!-- SIDEBAR -->
+<aside id="sidebar">
+  <div>
+    <div class="brand" style="display:flex; align-items:center; gap:12px; margin-bottom: 24px;">
+      <img src="rocket-icon.png" alt="Rocket Hunter" style="width:36px; height:36px; border-radius:50%; box-shadow:0 0 12px rgba(2,132,199,0.5);">
+      <div>
+        <div class="brand-title">Rocket Hunter</div>
+        <div class="brand-sub" id="versionLabel">v4.26.6 · Autonomous</div>
+      </div>
+    </div>
+
+    <!-- Navigation Menu (Accessible from any page) -->
+    <nav class="nav-menu">
+      <div class="nav-item active" onclick="navigate('home', this)">
+        <span class="nav-icon">🎛️</span>
+        <span>Control & Live Monitor</span>
+      </div>
+      <div class="nav-item" onclick="navigate('rocket', this)">
+        <span class="nav-icon">🚀</span>
+        <span>Forward 24h Rocket</span>
+      </div>
+      <div class="nav-item" onclick="navigate('status', this)">
+        <span class="nav-icon">📊</span>
+        <span>Status Dashboard</span>
+      </div>
+    </nav>
+  </div>
+
+  <div class="sidebar-footer">
+    <div class="status-pill" id="sidebarStatus">✔ READY</div>
+    <div class="clock-text" id="sidebarClock">Israel: --:--:-- IST</div>
+  </div>
+</aside>
+
+<!-- MAIN CONTENT VIEWPORT -->
+<main id="viewport">
+  <iframe id="contentFrame" src="/app_home.html"></iframe>
+</main>
+
+<script>
+const PAGES = {
+  home: '/app_home.html',
+  monitor: '/app_home.html',
+  rocket: '/forward-24h-rocket.html',
+  status: '/status-dashboard.html'
+};
+
+function navigate(pageKey, element) {
+  // Update active state in sidebar
+  document.querySelectorAll('.nav-item').forEach(el => el.classList.remove('active'));
+  if (element) {
+    element.classList.add('active');
+  } else {
+    const navItems = document.querySelectorAll('.nav-item');
+    if ((pageKey === 'home' || pageKey === 'monitor') && navItems[0]) navItems[0].classList.add('active');
+    else if (pageKey === 'rocket' && navItems[1]) navItems[1].classList.add('active');
+    else if (pageKey === 'status' && navItems[2]) navItems[2].classList.add('active');
+  }
+
+  // Update iframe source
+  const frame = document.getElementById('contentFrame');
+  const targetUrl = PAGES[pageKey] || PAGES.home;
+  frame.src = targetUrl + '?t=' + Date.now();
+}
+
+// Live Israel Clock and Status in Sidebar
+function updateSidebarStatus() {
+  try {
+    const now = new Date();
+    const istString = now.toLocaleTimeString('en-GB', { timeZone: 'Asia/Jerusalem' });
+    document.getElementById('sidebarClock').innerText = 'Israel: ' + istString + ' IST';
+  } catch (e) {}
+
+  fetch('/api/status').then(res => res.json()).then(data => {
+    const pill = document.getElementById('sidebarStatus');
+    if (data.is_paused) {
+      pill.innerText = '⏸️ PAUSED';
+      pill.style.color = '#fbbf24';
+      pill.style.background = 'rgba(245, 158, 11, 0.2)';
+    } else if (data.is_completed) {
+      pill.innerText = '✔ READY';
+      pill.style.color = '#10b981';
+      pill.style.background = 'rgba(16, 185, 129, 0.15)';
+    } else {
+      const pctStr = (data.progress_pct !== undefined && data.progress_pct > 0) ? ` (${data.progress_pct}%)` : '';
+      pill.innerText = '● SCANNING' + pctStr;
+      pill.style.color = '#38bdf8';
+      pill.style.background = 'rgba(56, 189, 248, 0.15)';
+    }
+  }).catch(() => {});
+}
+setInterval(updateSidebarStatus, 2000);
+updateSidebarStatus();
+
+// Listen to child iframe navigation requests
+window.addEventListener('message', function(event) {
+  if (event.data && event.data.action === 'navigate') {
+    const target = event.data.page;
+    navigate(target);
+  }
+});
+</script>
+</body>
+</html>
