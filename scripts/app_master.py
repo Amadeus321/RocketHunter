@@ -581,14 +581,23 @@ def launch_new_scan() -> str:
 
     py_exe = get_python_exe()
     scan_script = SCRIPTS_DIR / "run_local_scan.py"
+    log_file_path = outdir / "local-run.log"
+
+    started_utc = dt.datetime.now(dt.timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+    with log_file_path.open("a", encoding="utf-8") as lf:
+        lf.write(f"[{started_utc}] Initializing autonomous scan pipeline...\n")
+        lf.flush()
 
     # Strictly CREATE_NO_WINDOW so no black console/PowerShell window opens
     flags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
 
+    log_handle = log_file_path.open("a", encoding="utf-8")
     proc = subprocess.Popen(
         [py_exe, str(scan_script), "--outdir", str(outdir), "--max-runtime-minutes", "170"],
         cwd=str(ROOT),
         creationflags=flags,
+        stdout=log_handle,
+        stderr=subprocess.STDOUT,
     )
     try:
         (outdir / "scan-pid.txt").write_text(str(proc.pid), encoding="utf-8")
@@ -596,7 +605,6 @@ def launch_new_scan() -> str:
         pass
 
     # Immediately write scan-status.json with PID so Scan History and Control Center show it instantly
-    started_utc = dt.datetime.now(dt.timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
     status_file = outdir / "scan-status.json"
     status_file.write_text(json.dumps({
         "status": "IN_PROGRESS",
@@ -616,7 +624,7 @@ def trigger_dashboard_refresh():
     def _run():
         try:
             from scripts import status_dashboard
-            status_dashboard.main(["--output", str(ROOT / "status-dashboard.html")])
+            status_dashboard.main(["--root", str(ROOT), "--output", str(ROOT / "status-dashboard.html")])
         except Exception:
             pass
     threading.Thread(target=_run, daemon=True).start()

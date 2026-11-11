@@ -23,6 +23,7 @@ from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
+repo_root = ROOT
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 DEFAULT_MEMORY = ROOT / "rocket-hunter-data" / "scanner-memory"
@@ -478,7 +479,10 @@ def main(argv: list[str] | None = None) -> int:
         p.error("--workers and --preflight-workers must be between 1 and 12")
     outdir, memory_dir = args.outdir.resolve(), args.memory_dir.resolve()
     if outdir.exists() and any(outdir.iterdir()):
-        p.error(f"output directory must be new or empty: {outdir}")
+        allowed = {"scan-status.json", "scan-pid.txt", "local-run.log"}
+        existing_files = {f.name for f in outdir.iterdir()}
+        if not existing_files.issubset(allowed):
+            p.error(f"output directory must be new or empty: {outdir}")
     outdir.mkdir(parents=True, exist_ok=True)
     run_id = "local-" + uuid.uuid4().hex
     started, started_utc = time.monotonic(), utc_now()
@@ -503,7 +507,7 @@ def main(argv: list[str] | None = None) -> int:
     # Immediately render status-dashboard.html so Scan History shows this scan as IN_PROGRESS
     try:
         from scripts import status_dashboard
-        status_dashboard.main(["--output", str(repo_root / "status-dashboard.html")])
+        status_dashboard.main(["--root", str(repo_root), "--output", str(repo_root / "status-dashboard.html")])
     except Exception:
         pass
     try:
@@ -693,7 +697,7 @@ def main(argv: list[str] | None = None) -> int:
         # Always re-render status-dashboard.html to ensure scan history is never stale
         try:
             from scripts import status_dashboard
-            status_dashboard.main(["--output", str(repo_root / "status-dashboard.html")])
+            status_dashboard.main(["--root", str(repo_root), "--output", str(repo_root / "status-dashboard.html")])
         except Exception:
             pass
 

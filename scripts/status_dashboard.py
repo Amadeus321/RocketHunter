@@ -7,6 +7,7 @@ import datetime as dt
 import html
 import json
 import math
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -25,7 +26,10 @@ except ImportError:
             return {"positions": [], "ai_learning_stats": {}}
 
 
-ROOT = Path(__file__).resolve().parents[1]
+if getattr(sys, "frozen", False):
+    ROOT = Path(sys.executable).resolve().parent
+else:
+    ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_OUTPUT_NAME = "status-dashboard.html"
 UNKNOWN = "Unknown"
 UNAVAILABLE = "Unavailable"
@@ -330,12 +334,15 @@ def _latest(items: list[dict[str, Any]]) -> dict[str, Any] | None:
 
 
 def _scan_history(runs_root: Path) -> list[dict[str, Any]]:
-    if not runs_root.exists():
+    target_root = runs_root
+    if not target_root.exists() and (ROOT / "rocket-runs").exists():
+        target_root = ROOT / "rocket-runs"
+    if not target_root.exists():
         return []
-    if not _regular_directory(runs_root):
-        raise DashboardError(f"scan runs root must be a regular directory: {runs_root}")
+    if not _regular_directory(target_root):
+        raise DashboardError(f"scan runs root must be a regular directory: {target_root}")
     scans = []
-    for run_dir in runs_root.iterdir():
+    for run_dir in target_root.iterdir():
         if run_dir.is_symlink() or not run_dir.is_dir():
             continue
         scan_path = run_dir / "rocket-hunt.json"
