@@ -264,33 +264,15 @@ def get_python_exe() -> str:
 def sync_root_reports():
     run_dir = get_latest_run_dir()
     if run_dir:
-        src_html = run_dir / "forward-24h-rocket.html"
-        dst_html = ROOT / "forward-24h-rocket.html"
-        if src_html.exists():
-            try:
-                if not dst_html.exists() or src_html.stat().st_mtime > dst_html.stat().st_mtime:
-                    shutil.copy2(src_html, dst_html)
-            except Exception:
-                pass
-    # Keep status-dashboard.html scan history fresh if stale
-    dst_dash = ROOT / "status-dashboard.html"
-    status_py = SCRIPTS_DIR / "status_dashboard.py"
-    if status_py.exists():
-        need_refresh = False
-        if not dst_dash.exists():
-            need_refresh = True
-        elif (time.time() - dst_dash.stat().st_mtime) > 60:
-            need_refresh = True
-        if need_refresh:
-            try:
-                py_exe = get_python_exe()
-                subprocess.Popen(
-                    [py_exe, str(status_py), "--output", str(dst_dash)],
-                    cwd=str(ROOT),
-                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0)
-                )
-            except Exception:
-                pass
+        for fname in ("forward-24h-rocket.html", "forward-24h-rocket.md"):
+            src = run_dir / fname
+            dst = ROOT / fname
+            if src.exists():
+                try:
+                    if not dst.exists() or src.stat().st_mtime > dst.stat().st_mtime:
+                        shutil.copy2(src, dst)
+                except Exception:
+                    pass
 
 
 def find_scan_pid(run_dir: Path) -> int | None:
@@ -817,6 +799,8 @@ def start_local_server() -> tuple[http.server.HTTPServer, int]:
 
 
 def main():
+    import multiprocessing
+    multiprocessing.freeze_support()
     import webview
 
     server, port = start_local_server()
@@ -837,4 +821,6 @@ def main():
 
 
 if __name__ == "__main__":
+    import multiprocessing
+    multiprocessing.freeze_support()
     main()
