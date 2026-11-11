@@ -680,7 +680,7 @@ def _render_scan_history(items: list[dict[str, Any]], root_available: bool) -> s
             )
         content = "".join(rows)
     return (
-        '<div class="table-wrap"><table><thead><tr>'
+        '<div class="table-wrap table-scroll"><table><thead><tr>'
         "<th>Run directory</th><th>Status</th><th>Run ID</th><th>Started &ndash; Finished (Israel Time)</th>"
         f"</tr></thead><tbody>{content}</tbody></table></div>"
     )
@@ -950,6 +950,12 @@ section {{ padding: 22px; margin: 18px 0; }}
 .badge-warn {{ background: rgba(245, 158, 11, 0.15); color: #fbbf24; padding: 3px 8px; border-radius: 6px; font-size: 12px; font-weight: 700; }}
 .badge-danger {{ background: rgba(239, 68, 68, 0.15); color: #f87171; border: 1px solid rgba(239, 68, 68, 0.3); padding: 3px 8px; border-radius: 6px; font-size: 12px; font-weight: 700; }}
 .table-wrap {{ overflow-x: auto; border: 1px solid var(--line); border-radius: 8px; margin: 10px 0; background: #0c1322; }}
+.table-scroll {{ max-height: 440px; overflow-y: auto; overflow-x: auto; scrollbar-width: thin; scrollbar-color: #334155 #0b1120; }}
+.table-scroll::-webkit-scrollbar {{ width: 8px; height: 8px; }}
+.table-scroll::-webkit-scrollbar-track {{ background: #0b1120; border-radius: 4px; }}
+.table-scroll::-webkit-scrollbar-thumb {{ background: #334155; border-radius: 4px; }}
+.table-scroll::-webkit-scrollbar-thumb:hover {{ background: #475569; }}
+.table-scroll th {{ position: sticky; top: 0; z-index: 3; background: #0f172a; box-shadow: inset 0 -1px 0 var(--line); }}
 table {{ border-collapse: collapse; width: 100%; min-width: 720px; text-align: left; font-size: 13px; }}
 th, td {{ border-bottom: 1px solid rgba(30, 41, 59, 0.7); padding: 10px 12px; vertical-align: top; }}
 th {{ background: #0f172a; color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: 0.05em; font-weight: 700; }}
