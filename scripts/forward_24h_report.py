@@ -10,6 +10,13 @@ import json
 import math
 import os
 import sys
+
+if sys.platform == "win32":
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
 import time
 import urllib.error
 import urllib.parse
@@ -1633,8 +1640,9 @@ def main(argv=None):
         prefix = (existing_md + "\n\n") if existing_md else ""
         Path(args.markdown).parent.mkdir(parents=True, exist_ok=True)
         Path(args.markdown).write_text(prefix + md + "\n", encoding="utf-8")
+        top_asset_safe = str(top.get("asset") or "").encode("ascii", "replace").decode("ascii")
         print("Forward 24h Top Rocket: %s | status=%s | current=%s | single TP=%s | time stop=%s" % (
-            top.get("asset"), top.get("entry_decision"), top.get("price"),
+            top_asset_safe, top.get("entry_decision"), top.get("price"),
             (top.get("trade_plan") or {}).get("single_take_profit"), (top.get("trade_plan") or {}).get("time_stop_24h")), flush=True)
         print("Forward candidates: discovered DEX=%d CEX=%d; forecast-eligible=%d; OHLCV=%d" % (
             doc["data_collection"]["selected_dex_candidates"], doc["data_collection"]["selected_cex_candidates"],

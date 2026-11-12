@@ -193,6 +193,8 @@ def prepare_runtime(runtime_store: Path, deadline: float, log_path: Path) -> Pat
                                     ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
             shutil.copy2(ROOT / "VERSION", staging / "VERSION")
             env = os.environ.copy()
+            env["PYTHONUTF8"] = "1"
+            env["PYTHONIOENCODING"] = "utf-8"
             installers = (
                 [sys.executable, "-m", "scripts.v419_upgrade", "--install", "--repo-root", str(staging)],
                 [sys.executable, "-m", "scripts.v423_provider_expansion", "--install", "--repo-root", str(staging)],
@@ -522,6 +524,8 @@ def main(argv: list[str] | None = None) -> int:
                     shutil.copy2(source, baseline / name)
         runtime_root = prepare_runtime(memory_dir.parent / "runtime", deadline, log_path)
         env = os.environ.copy()
+        env["PYTHONUTF8"] = "1"
+        env["PYTHONIOENCODING"] = "utf-8"
         env["SCANNER_MEMORY_DIR"] = str(snapshot)
         env["ROCKET_HUNTER_SHARED_MEMORY_DIR"] = str(memory_dir)
         env["ROCKET_HUNTER_RUN_ID"] = run_id

@@ -591,6 +591,10 @@ def launch_new_scan() -> str:
     # Strictly CREATE_NO_WINDOW so no black console/PowerShell window opens
     flags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
 
+    scan_env = os.environ.copy()
+    scan_env["PYTHONUTF8"] = "1"
+    scan_env["PYTHONIOENCODING"] = "utf-8"
+
     log_handle = log_file_path.open("a", encoding="utf-8")
     proc = subprocess.Popen(
         [py_exe, str(scan_script), "--outdir", str(outdir), "--max-runtime-minutes", "170"],
@@ -598,6 +602,7 @@ def launch_new_scan() -> str:
         creationflags=flags,
         stdout=log_handle,
         stderr=subprocess.STDOUT,
+        env=scan_env,
     )
     try:
         (outdir / "scan-pid.txt").write_text(str(proc.pid), encoding="utf-8")
