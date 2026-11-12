@@ -715,7 +715,12 @@ def render_html(document: dict[str, Any]) -> str:
             raw_list.extend(document["verified_actionable_opportunities"])
 
         refreshed_done = False
-        if refresh_and_filter_candidates and scan_status == "COMPLETED":
+        if isinstance(document.get("verified_actionable_opportunities"), list) and document["verified_actionable_opportunities"]:
+            actionable = list(document["verified_actionable_opportunities"])
+            research_candidates = list(document.get("unverified_research_watchlist") or [])
+            discovery_candidates = list(document.get("young_discovery_only_leads") or [])
+            refreshed_done = True
+        elif refresh_and_filter_candidates and scan_status == "COMPLETED":
             try:
                 act_ref, watch_ref = refresh_and_filter_candidates(raw_list, 40.0)
                 if act_ref or watch_ref:
