@@ -517,7 +517,11 @@ def render_report(document: dict[str, Any]) -> str:
         if entry is not None and target is not None and method is not None:
             upside = canonical_tp_upside(entry, target)
             if upside is not None:
-                lines.append(f"**{pair} TP: {upside:+.2f}%**")
+                safe_tp = _number(candidate.get("frontrun_safe_target_potential_pct"))
+                if safe_tp is not None:
+                    lines.append(f"**{pair} TP: {upside:+.2f}%** *(AURA Front-Run Safe Target: {safe_tp:+.2f}%)*")
+                else:
+                    lines.append(f"**{pair} TP: {upside:+.2f}%**")
             lines.append("")
         forward_rank = _number(candidate.get("forward_opportunity_rank"))
         forward_score = _number(candidate.get("forward_opportunity_score"))

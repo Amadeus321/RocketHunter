@@ -649,23 +649,41 @@ def refresh_and_filter_candidates(
             get_aura_learned_weights = lambda: {}
 
     aura_weights = get_aura_learned_weights()
+    frontrun_buffer = float(aura_weights.get("tp_frontrun_buffer_pct", 0.965))
 
     def _rocket_conviction_score(c: dict[str, Any]) -> float:
-        """Ranks candidates by explosive breakout power, volume velocity, and upside potential."""
+        """Ranks candidates by AURA learned feature weights, 9-engine breakout confluence, and realistic expected return."""
         pot = float(c.get("tp_upside_pct") or c.get("potential_pct") or 0.0)
         early = float(c.get("early_breakout_score") or 0.0)
+        confl = float(c.get("breakout_confluence_score") or early)
+        opp_rank = float(c.get("realistic_opportunity_rank") or 0.0)
         vol = float(c.get("volume_24h_usd") or 0.0)
         liq = float(c.get("liquidity_usd") or 0.0)
         turnover = (vol / liq) if liq > 0 else 0.0
         turnover_score = min(25.0, math.log1p(turnover) * 10.0)
 
-        # Scale upside potential: reward assets with massive explosive gains (+50% to +500%+)
+        # Scale upside potential: reward assets with realistic explosive gains
         upside_component = min(50.0, (pot / 8.0))
 
-        w_momentum = aura_weights.get("volume_breakout_momentum", 0.90)
-        w_mult = aura_weights.get("breakout_explosiveness_multiplier", 1.20)
+        w_momentum = aura_weights.get("momentum_acceleration", aura_weights.get("volume_breakout_momentum", 0.90))
+        w_vol = aura_weights.get("volume_intelligence", 0.90)
+        w_mult = aura_weights.get("breakout_explosiveness_multiplier", 1.15)
+        w_cvd = aura_weights.get("buy_sell_pressure", 0.85)
+        w_liq = aura_weights.get("liquidity_depth", 0.85)
 
-        total_score = (early * 0.40 * w_momentum) + (upside_component * 0.45 * w_mult) + (turnover_score * 0.15)
+        # Apply frontrun buffer to ensure targets don't fail just below resistance (FAIR/SOL lesson)
+        if pot >= 40.0:
+            c["frontrun_safe_target_potential_pct"] = round(pot * frontrun_buffer, 2)
+
+        if opp_rank > 0:
+            total_score = (
+                (opp_rank * 0.35 * w_mult)
+                + (confl * 0.30 * w_momentum)
+                + (upside_component * 0.20 * w_vol)
+                + (turnover_score * 0.15 * w_cvd)
+            )
+        else:
+            total_score = (early * 0.40 * w_momentum) + (upside_component * 0.45 * w_mult) + (turnover_score * 0.15 * w_vol)
         return total_score
 
     # Sort strictly by AURA explosive rocket power score
