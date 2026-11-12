@@ -1,4 +1,4 @@
-# Crypto Pre-Breakout — v4.26.6 strict qualification and bounded local scan
+# Crypto Pre-Breakout — v4.26.7 strict qualification and bounded local scan
 
 **DexPaprika all-network early-breakout discovery / 24h MFE monitor:** v4.25.0  
 **Birdeye free multichain rotation:** v4.24.0  
@@ -12,6 +12,12 @@
 **External data budget:** $0 — public endpoints only
 **Actionable shortlist:** final candidates must pass the canonical single-TP +40.00% gate and independent identity, price, safety, and buy/sell quote checks. Discovery leads remain separate; an empty qualified list is reported as zero.
 **Scan duration:** local manual execution is the primary path; each full local run has a 170-minute default deadline and a hard maximum of 180 minutes. Runs use isolated output folders and merge learning memory safely. GitHub Actions is optional.
+
+### v4.26.7 — fix user position journal refresh/deletion glitch & AURA learning state sync
+
+- **Fix User Position Journal Input Wiping**: Eliminates aggressive client-side polling DOM destruction and removes the 30-second `<meta http-equiv="refresh">` tag in Section 3 "User Position Journal & AI Follow-Up (Real Trades) — AURA Learning Engine". Field edits (e.g., TP hit dropdown selection, Final P/L %, and follow-up notes) now preserve focus, reconcile non-destructively, auto-save smoothly on blur/change/debounce without deleting user typing, and provide instant visual save confirmations.
+- **Clean Field Defaults**: Eliminates the synthetic `"Unknown"` placeholder from input values so fields display clean user values or helpful placeholders.
+- **AURA Version Provenance**: Automatically tags newly recorded positions and the trained AURA model version with `v4.26.7` (`AURA-v4.26.7`) while preserving historical records with their original version provenance.
 
 ### v4.26.6 — strict technical TP qualification and separated result lanes
 

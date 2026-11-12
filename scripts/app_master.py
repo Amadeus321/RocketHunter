@@ -164,7 +164,7 @@ def get_version() -> str:
             return f"v{v}" if not v.startswith("v") else v
         except Exception:
             pass
-    return "v4.26.6"
+    return "v4.26.7"
 
 
 def get_latest_completed_run_dir() -> Path | None:

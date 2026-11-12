@@ -2052,7 +2052,7 @@ def update_position_monitor(outdir: Path, memory_dir: Path, run_id: str) -> dict
     # remains intact; only the independently verified action lane is filtered.
     finalization_now = datetime.now(timezone.utc)
     actionable = qualify_final_actionable_candidates(candidates, finalization_now)
-    forward["general_version"] = "v4.26.6"
+    forward["general_version"] = "v4.26.7"
     forward["scan_finished_utc"] = finalization_now.replace(microsecond=0).isoformat().replace("+00:00", "Z")
     forward["github_actions_run_id"] = str(run_id) if run_id else None
     repository = os.environ.get("GITHUB_REPOSITORY")

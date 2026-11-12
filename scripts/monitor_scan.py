@@ -319,7 +319,7 @@ def run_loop(target_run_dir: Path | None = None, loop: bool = True) -> None:
             try:
                 version_val = (ROOT / "VERSION").read_text(encoding="utf-8").strip()
             except Exception:
-                version_val = "v4.26.6"
+                version_val = "v4.26.7"
         if not version_val.startswith("v"):
             version_val = f"v{version_val}"
 

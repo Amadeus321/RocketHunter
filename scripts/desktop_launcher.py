@@ -64,7 +64,7 @@ def clear_screen() -> None:
 
 def banner() -> None:
     ver_file = ROOT / "VERSION"
-    ver = ver_file.read_text(encoding="utf-8").strip() if ver_file.exists() else "v4.26.6"
+    ver = ver_file.read_text(encoding="utf-8").strip() if ver_file.exists() else "v4.26.7"
     print("═" * 72)
     print(f"       🚀 ROCKET HUNTER {ver} — DESKTOP SCANNER LAUNCHER")
     print("           Algorithmic DeFi & Microcap Opportunity Discovery")

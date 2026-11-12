@@ -35,6 +35,18 @@ UNKNOWN = "Unknown"
 UNAVAILABLE = "Unavailable"
 
 
+def _project_version() -> str:
+    try:
+        ver_file = ROOT / "VERSION"
+        if ver_file.exists():
+            v = ver_file.read_text(encoding="utf-8").strip()
+            if v:
+                return f"v{v}" if not v.startswith("v") else v
+    except Exception:
+        pass
+    return "v4.26.7"
+
+
 def _format_israel_time(dt_val: Any) -> str:
     if not dt_val or dt_val == UNAVAILABLE or dt_val == "unavailable" or dt_val == UNKNOWN:
         return UNAVAILABLE
@@ -853,14 +865,16 @@ def render(summary: dict[str, Any]) -> str:
             pair = _esc(pos.get("pair"))
             chain = _esc(pos.get("chain"))
             pool_addr = _esc(pos.get("pool_address") or "—")
-            ver = _esc(pos.get("software_version") or "v4.26.6")
+            ver = _esc(pos.get("software_version") or _project_version())
             entry = _esc(pos.get("entry_price") or "—")
             tp = _esc(pos.get("single_tp") or "—")
             pot = _esc(pos.get("potential_pct") or "+40%")
             ist_time = _esc(pos.get("entered_at_ist") or "—")
             st = pos.get("status") or "OPEN"
-            pnl = _esc(pos.get("final_pnl_pct") or "")
-            notes = _esc(pos.get("notes") or "")
+            pnl_raw = pos.get("final_pnl_pct") or ""
+            pnl = "" if str(pnl_raw).strip().lower() == "unknown" else _esc(pnl_raw, missing="")
+            notes_raw = pos.get("notes") or ""
+            notes = "" if str(notes_raw).strip().lower() == "unknown" else _esc(notes_raw, missing="")
             pnl_num = _number(pnl) or 0.0
             pnl_color = "var(--green)" if (st in ("TP_HIT", "CLOSED_WIN") or pnl_num > 0) else ("var(--danger)" if (st == "CLOSED_LOSS" or pnl_num < 0) else "var(--text)")
             pos_tbody_rows.append(
@@ -872,30 +886,29 @@ def render(summary: dict[str, Any]) -> str:
                 f'<td>${tp} <span class="green" style="font-size:0.8rem;">({pot})</span></td>'
                 f'<td style="font-size:0.85rem;">{ist_time}</td>'
                 f'<td>'
-                f'<select class="input-dark" id="status-{pid}">'
+                f'<select class="input-dark" id="status-{pid}" onchange="handleStatusChange(\'{pid}\', this.value)">'
                 f'<option value="OPEN" {"selected" if st == "OPEN" else ""}>OPEN</option>'
                 f'<option value="TP_HIT" {"selected" if st == "TP_HIT" else ""}>TP_HIT (+40%+)</option>'
                 f'<option value="CLOSED_WIN" {"selected" if st == "CLOSED_WIN" else ""}>CLOSED_WIN</option>'
                 f'<option value="CLOSED_LOSS" {"selected" if st == "CLOSED_LOSS" else ""}>CLOSED_LOSS</option>'
                 f'</select>'
                 f'</td>'
-                f'<td><input type="text" class="input-dark" style="width:90px;font-weight:700;color:{pnl_color};" id="pnl-{pid}" value="{pnl}" placeholder="+45.0%"></td>'
-                f'<td><input type="text" class="input-dark" style="width:100%;min-width:180px;" id="notes-{pid}" value="{notes}" placeholder="Optional notes for internal AI learning..."></td>'
+                f'<td><input type="text" class="input-dark" style="width:90px;font-weight:700;color:{pnl_color};" id="pnl-{pid}" data-pot="{pot}" value="{pnl}" placeholder="+45.0%" oninput="handlePnlInput(\'{pid}\', this)" onblur="savePosition(\'{pid}\', true)" onkeydown="if(event.key===\'Enter\')this.blur()"></td>'
+                f'<td><input type="text" class="input-dark" style="width:100%;min-width:180px;" id="notes-{pid}" value="{notes}" placeholder="Optional notes for internal AI learning..." oninput="handleNotesInput(\'{pid}\', this)" onblur="savePosition(\'{pid}\', true)" onkeydown="if(event.key===\'Enter\')this.blur()"></td>'
                 f'<td style="white-space:nowrap;">'
-                f'<button type="button" class="btn-sm btn-save" onclick="savePosition(\'{pid}\')">💾 Save</button>'
+                f'<button type="button" class="btn-sm btn-save" id="btn-save-{pid}" onclick="savePosition(\'{pid}\', false)">💾 Save</button>'
                 f'<button type="button" class="btn-sm btn-del" onclick="deletePosition(\'{pid}\')">🗑️</button>'
                 f'</td>'
                 f'</tr>'
             )
         pos_tbody_html = "".join(pos_tbody_rows)
     else:
-        pos_tbody_html = '<tr><td colspan="9" class="muted" style="text-align:center;padding:18px;">No confirmed positions yet. Check "Take Position" on any candidate in Forward 24h Watchlist to begin AI follow-up tracking.</td></tr>'
+        pos_tbody_html = '<tr><td colspan="10" class="muted" style="text-align:center;padding:18px;">No confirmed positions yet. Check "Take Position" on any candidate in Forward 24h Watchlist to begin AI follow-up tracking.</td></tr>'
 
     return f"""<!doctype html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<meta http-equiv="refresh" content="30">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <link rel="icon" type="image/x-icon" href="/favicon.ico">
 <title>Rocket Hunter — System & Status Dashboard</title>
@@ -1208,6 +1221,9 @@ pre {{
 </main>
 
 <script>
+let cachedJournalJson = '';
+let autoSaveTimers = {{}};
+
 function showJournalMsg(text, isError) {{
   const el = document.getElementById('journal-msg');
   if (!el) return;
@@ -1217,6 +1233,45 @@ function showJournalMsg(text, isError) {{
   el.style.color = isError ? '#f87171' : '#34d399';
   el.style.border = isError ? '1px solid rgba(239, 68, 68, 0.3)' : '1px solid rgba(16, 185, 129, 0.3)';
   setTimeout(() => {{ el.style.display = 'none'; }}, 4000);
+}}
+
+function handleStatusChange(pid, newStatus) {{
+  const statusEl = document.getElementById('status-' + pid);
+  if (statusEl) statusEl.dataset.dirty = 'true';
+  const pnlEl = document.getElementById('pnl-' + pid);
+  if (newStatus === 'TP_HIT' && pnlEl) {{
+    const currentVal = (pnlEl.value || '').trim();
+    if (!currentVal || currentVal.toLowerCase() === 'unknown' || currentVal === '0' || currentVal === '0%') {{
+      const pot = pnlEl.getAttribute('data-pot') || '+40.0%';
+      pnlEl.value = pot;
+      pnlEl.style.color = 'var(--green)';
+      pnlEl.dataset.dirty = 'true';
+    }}
+  }}
+  savePosition(pid, true);
+}}
+
+function handlePnlInput(pid, inputEl) {{
+  inputEl.dataset.dirty = 'true';
+  const clean = inputEl.value.trim().replace('%', '');
+  const num = parseFloat(clean);
+  if (!isNaN(num)) {{
+    inputEl.style.color = num > 0 ? 'var(--green)' : (num < 0 ? 'var(--danger)' : 'var(--text)');
+  }} else {{
+    inputEl.style.color = 'var(--text)';
+  }}
+  if (autoSaveTimers[pid + '_pnl']) clearTimeout(autoSaveTimers[pid + '_pnl']);
+  autoSaveTimers[pid + '_pnl'] = setTimeout(() => {{
+    savePosition(pid, true);
+  }}, 1200);
+}}
+
+function handleNotesInput(pid, inputEl) {{
+  inputEl.dataset.dirty = 'true';
+  if (autoSaveTimers[pid + '_notes']) clearTimeout(autoSaveTimers[pid + '_notes']);
+  autoSaveTimers[pid + '_notes'] = setTimeout(() => {{
+    savePosition(pid, true);
+  }}, 1200);
 }}
 
 async function loadJournalData() {{
@@ -1236,49 +1291,92 @@ async function loadJournalData() {{
 function renderJournalTable(positions) {{
   const tbody = document.getElementById('journal-tbody');
   if (!tbody) return;
+
   if (!positions || positions.length === 0) {{
+    cachedJournalJson = JSON.stringify(positions);
     tbody.innerHTML = '<tr><td colspan="10" class="muted" style="text-align:center;padding:18px;">No confirmed positions yet. Check "Take Position" on any candidate in Forward 24h Watchlist to begin AI follow-up tracking.</td></tr>';
     return;
   }}
-  const rows = positions.map(pos => {{
+
+  const emptyCell = tbody.querySelector('td[colspan="10"]');
+  if (emptyCell) tbody.innerHTML = '';
+
+  const incomingIds = new Set(positions.map(p => p.id));
+
+  // Remove rows no longer in positions
+  Array.from(tbody.children).forEach(row => {{
+    const rowId = row.id.replace('pos-row-', '');
+    if (!incomingIds.has(rowId)) {{
+      row.remove();
+    }}
+  }});
+
+  // Reconcile row by row to protect input focus and in-progress typing
+  positions.forEach(pos => {{
     const pid = pos.id || '';
     const pair = pos.pair || '';
     const chain = pos.chain || '';
     const pool = pos.pool_address || '—';
-    const ver = pos.software_version || 'v4.26.6';
+    const ver = pos.software_version || 'v4.26.7';
     const entry = pos.entry_price || '—';
     const tp = pos.single_tp || '—';
     const pot = pos.potential_pct || '+40%';
     const ist_time = pos.entered_at_ist || '—';
     const st = pos.status || 'OPEN';
-    const pnl = pos.final_pnl_pct || '';
-    const notes = pos.notes || '';
+    const pnl = (pos.final_pnl_pct === 'Unknown' || !pos.final_pnl_pct) ? '' : pos.final_pnl_pct;
+    const notes = (pos.notes === 'Unknown' || !pos.notes) ? '' : pos.notes;
     const pnlNum = parseFloat(pnl) || 0;
     const pnlColor = (st === 'TP_HIT' || st === 'CLOSED_WIN' || pnlNum > 0) ? 'var(--green)' : ((st === 'CLOSED_LOSS' || pnlNum < 0) ? 'var(--danger)' : 'var(--text)');
-    return `<tr id="pos-row-${{pid}}">
-      <td><strong>${{pair}}</strong><br><span class="meta">${{chain}}</span></td>
-      <td><code>${{pool}}</code></td>
-      <td><code>${{ver}}</code></td>
-      <td>$${{entry}}</td>
-      <td>$${{tp}} <span class="green" style="font-size:0.8rem;">(${{pot}})</span></td>
-      <td style="font-size:0.85rem;">${{ist_time}}</td>
-      <td>
-        <select class="input-dark" id="status-${{pid}}">
-          <option value="OPEN" ${{st === 'OPEN' ? 'selected' : ''}}>OPEN</option>
-          <option value="TP_HIT" ${{st === 'TP_HIT' ? 'selected' : ''}}>TP_HIT (+40%+)</option>
-          <option value="CLOSED_WIN" ${{st === 'CLOSED_WIN' ? 'selected' : ''}}>CLOSED_WIN</option>
-          <option value="CLOSED_LOSS" ${{st === 'CLOSED_LOSS' ? 'selected' : ''}}>CLOSED_LOSS</option>
-        </select>
-      </td>
-      <td><input type="text" class="input-dark" style="width:90px;font-weight:700;color:${{pnlColor}};" id="pnl-${{pid}}" value="${{pnl}}" placeholder="+45.0%"></td>
-      <td><input type="text" class="input-dark" style="width:100%;min-width:180px;" id="notes-${{pid}}" value="${{notes}}" placeholder="Optional notes for internal AI learning..."></td>
-      <td style="white-space:nowrap;">
-        <button type="button" class="btn-sm btn-save" onclick="savePosition('${{pid}}')">💾 Save</button>
-        <button type="button" class="btn-sm btn-del" onclick="deletePosition('${{pid}}')">🗑️</button>
-      </td>
-    </tr>`;
-  }}).join('');
-  tbody.innerHTML = rows;
+
+    let existingRow = document.getElementById('pos-row-' + pid);
+    if (!existingRow) {{
+      const tr = document.createElement('tr');
+      tr.id = 'pos-row-' + pid;
+      tr.innerHTML = `
+        <td><strong>${{pair}}</strong><br><span class="meta">${{chain}}</span></td>
+        <td><code>${{pool}}</code></td>
+        <td><code>${{ver}}</code></td>
+        <td>$${{entry}}</td>
+        <td>$${{tp}} <span class="green" style="font-size:0.8rem;">(${{pot}})</span></td>
+        <td style="font-size:0.85rem;">${{ist_time}}</td>
+        <td>
+          <select class="input-dark" id="status-${{pid}}" onchange="handleStatusChange('${{pid}}', this.value)">
+            <option value="OPEN" ${{st === 'OPEN' ? 'selected' : ''}}>OPEN</option>
+            <option value="TP_HIT" ${{st === 'TP_HIT' ? 'selected' : ''}}>TP_HIT (+40%+)</option>
+            <option value="CLOSED_WIN" ${{st === 'CLOSED_WIN' ? 'selected' : ''}}>CLOSED_WIN</option>
+            <option value="CLOSED_LOSS" ${{st === 'CLOSED_LOSS' ? 'selected' : ''}}>CLOSED_LOSS</option>
+          </select>
+        </td>
+        <td><input type="text" class="input-dark" style="width:90px;font-weight:700;color:${{pnlColor}};" id="pnl-${{pid}}" data-pot="${{pot}}" value="${{pnl}}" placeholder="+45.0%" oninput="handlePnlInput('${{pid}}', this)" onblur="savePosition('${{pid}}', true)" onkeydown="if(event.key==='Enter')this.blur()"></td>
+        <td><input type="text" class="input-dark" style="width:100%;min-width:180px;" id="notes-${{pid}}" value="${{notes}}" placeholder="Optional notes for internal AI learning..." oninput="handleNotesInput('${{pid}}', this)" onblur="savePosition('${{pid}}', true)" onkeydown="if(event.key==='Enter')this.blur()"></td>
+        <td style="white-space:nowrap;">
+          <button type="button" class="btn-sm btn-save" id="btn-save-${{pid}}" onclick="savePosition('${{pid}}', false)">💾 Save</button>
+          <button type="button" class="btn-sm btn-del" onclick="deletePosition('${{pid}}')">🗑️</button>
+        </td>
+      `;
+      tbody.appendChild(tr);
+    }} else {{
+      const statusEl = document.getElementById('status-' + pid);
+      if (statusEl && statusEl !== document.activeElement && statusEl.dataset.dirty !== 'true') {{
+        if (statusEl.value !== st) statusEl.value = st;
+      }}
+
+      const pnlEl = document.getElementById('pnl-' + pid);
+      if (pnlEl && pnlEl !== document.activeElement && pnlEl.dataset.dirty !== 'true') {{
+        if (pnlEl.value !== pnl) {{
+          pnlEl.value = pnl;
+          pnlEl.style.color = pnlColor;
+        }}
+      }}
+
+      const notesEl = document.getElementById('notes-' + pid);
+      if (notesEl && notesEl !== document.activeElement && notesEl.dataset.dirty !== 'true') {{
+        if (notesEl.value !== notes) notesEl.value = notes;
+      }}
+    }}
+  }});
+
+  cachedJournalJson = JSON.stringify(positions);
 }}
 
 function renderMonitorTable(positions) {{
@@ -1334,10 +1432,11 @@ document.addEventListener('DOMContentLoaded', () => {{
   setInterval(loadJournalData, 4000);
 }});
 
-async function savePosition(id) {{
+async function savePosition(id, isAutoSave = false) {{
   const statusEl = document.getElementById(`status-${{id}}`);
   const pnlEl = document.getElementById(`pnl-${{id}}`);
   const notesEl = document.getElementById(`notes-${{id}}`);
+  const btnEl = document.getElementById(`btn-save-${{id}}`);
   if (!statusEl) return;
 
   const payload = {{
@@ -1355,13 +1454,49 @@ async function savePosition(id) {{
     }});
     const data = await res.json();
     if (data.status === 'OK') {{
-      showJournalMsg('Position updated! Internal AI learning engine adapted to this outcome.');
-      await loadJournalData();
+      if (statusEl) statusEl.dataset.dirty = 'false';
+      if (pnlEl) {{
+        pnlEl.dataset.dirty = 'false';
+        const pVal = parseFloat(pnlEl.value) || 0;
+        pnlEl.style.color = (statusEl.value === 'TP_HIT' || statusEl.value === 'CLOSED_WIN' || pVal > 0) ? 'var(--green)' : ((statusEl.value === 'CLOSED_LOSS' || pVal < 0) ? 'var(--danger)' : 'var(--text)');
+      }}
+      if (notesEl) notesEl.dataset.dirty = 'false';
+
+      if (btnEl) {{
+        const origText = btnEl.innerHTML;
+        btnEl.innerHTML = '✓ Saved';
+        btnEl.style.borderColor = 'var(--green)';
+        btnEl.style.color = 'var(--green)';
+        setTimeout(() => {{
+          btnEl.innerHTML = origText;
+          btnEl.style.borderColor = '';
+          btnEl.style.color = '';
+        }}, 1500);
+      }}
+
+      if (!isAutoSave) {{
+        showJournalMsg('Position updated! Internal AI learning engine adapted to this outcome.');
+      }}
+
+      try {{
+        const jRes = await fetch('/api/journal');
+        if (jRes.ok) {{
+          const jData = await jRes.json();
+          const positions = jData.positions || [];
+          renderJournalTable(positions);
+          renderMonitorTable(positions);
+          updateTopMetrics(positions);
+        }}
+      }} catch (e) {{}}
     }} else {{
-      showJournalMsg(data.message || 'Error updating position', true);
+      if (!isAutoSave) {{
+        showJournalMsg(data.message || 'Error updating position', true);
+      }}
     }}
   }} catch (e) {{
-    showJournalMsg('Failed to update position.', true);
+    if (!isAutoSave) {{
+      showJournalMsg('Failed to update position.', true);
+    }}
   }}
 }}
 

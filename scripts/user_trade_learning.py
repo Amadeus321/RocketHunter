@@ -29,6 +29,18 @@ def _now_ist_str() -> str:
     return utc.astimezone(ist).strftime("%Y-%m-%d %H:%M:%S IST")
 
 
+def get_software_version() -> str:
+    try:
+        ver_file = ROOT / "VERSION"
+        if ver_file.exists():
+            v = ver_file.read_text(encoding="utf-8").strip()
+            if v:
+                return f"v{v}" if not v.startswith("v") else v
+    except Exception:
+        pass
+    return "v4.26.7"
+
+
 def get_journal() -> dict[str, Any]:
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     if not JOURNAL_FILE.exists():
@@ -88,7 +100,7 @@ def record_position(pos: dict[str, Any]) -> dict[str, Any]:
     pair = str(pos.get("pair") or "").strip()
     pool = str(pos.get("pool_address") or "").strip()
     run_id = str(pos.get("run_id") or "").strip()
-    version = str(pos.get("software_version") or "v4.26.6").strip()
+    version = str(pos.get("software_version") or get_software_version()).strip()
 
     pos_id = pos.get("id") or f"pos_{pair}_{pool[:8]}_{int(dt.datetime.now().timestamp())}".replace("/", "_")
 
@@ -238,7 +250,7 @@ def train_ai_from_user_journal() -> dict[str, Any]:
     ai_model = {
         "ai_name": "AURA",
         "ai_full_name": "AURA (Adaptive Universal Rocket Algorithm)",
-        "model_version": "AURA-v4.26.6",
+        "model_version": f"AURA-{get_software_version()}",
         "last_trained_ist": _now_ist_str(),
         "total_taken_positions": total,
         "open_positions": open_count,

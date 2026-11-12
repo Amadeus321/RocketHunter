@@ -1,4 +1,4 @@
-# Rocket Hunter repository audit — v4.26.6
+# Rocket Hunter repository audit — v4.26.7
 
 ## Latest qualification and audit-persistence changes
 

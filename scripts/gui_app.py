@@ -38,7 +38,7 @@ def get_version() -> str:
             return f"v{v}" if not v.startswith("v") else v
         except Exception:
             pass
-    return "v4.26.6"
+    return "v4.26.7"
 
 
 def is_pid_running(pid: int) -> bool:

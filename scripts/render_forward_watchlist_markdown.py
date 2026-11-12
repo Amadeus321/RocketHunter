@@ -49,7 +49,7 @@ def _project_version() -> str:
                 return f"v{v}" if not v.startswith("v") else v
     except Exception:
         pass
-    return "v4.26.6"
+    return "v4.26.7"
 
 
 def _format_israel_time(dt_val: Any) -> str:
@@ -1206,7 +1206,7 @@ async function toggleCandidatePosition(el) {{
       potential_pct: el.getAttribute('data-pot') || '',
       pool_address: pool,
       token_contract: el.getAttribute('data-token') || '',
-      software_version: el.getAttribute('data-version') || 'v4.26.6',
+      software_version: el.getAttribute('data-version') || 'v4.26.7',
       run_id: run,
       status: 'OPEN'
     }};

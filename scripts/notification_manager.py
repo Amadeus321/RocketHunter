@@ -210,7 +210,7 @@ def send_scan_completed_notification(
     ranked_count: int = 0,
     actionable_count: int = 0,
     top_candidate: str = "—",
-    version: str = "v4.26.6"
+    version: str = "v4.26.7"
 ) -> dict[str, Any]:
     cfg = load_config()
     if not cfg.get("enabled"):
