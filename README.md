@@ -1,5 +1,7 @@
-# Crypto Pre-Breakout — v4.27.0 strict qualification and bounded local scan
+# Crypto Pre-Breakout — v4.28.0 strict qualification and bounded local scan
 
+**9-Engine Imminent Breakout & 24h Probabilistic Returns:** v4.28.0  
+**AURA Machine-Learning Feature-Attribution Upgrade:** v4.28.0  
 **Unified multi-provider discovery & 180m budget manager:** v4.27.0  
 **DexPaprika all-network early-breakout discovery / 24h MFE monitor:** v4.25.0  
 **Birdeye free multichain rotation:** v4.24.0  
@@ -13,6 +15,35 @@
 **External data budget:** $0 — public endpoints only
 **Actionable shortlist:** final candidates must pass the canonical single-TP +40.00% gate and independent identity, price, safety, and buy/sell quote checks. Discovery leads remain separate; an empty qualified list is reported as zero.
 **Scan duration:** local manual execution is the primary path; each full local run has a 170-minute default deadline and a hard maximum of 180 minutes. Runs use isolated output folders and merge learning memory safely. GitHub Actions is optional.
+
+### v4.28.0 — Phase 2 & Phase 3: 9-Engine Imminent Breakout Model, 24h Probabilistic Returns & AURA ML Feature Attribution
+
+- **9-Engine Imminent Breakout Acceleration Model** (`scripts/breakout_signal_engines.py`):
+  Evaluates behavioral acceleration and rate-of-change anomalies rather than raw historical gains across 9 independent signal engines:
+  1. *Momentum Acceleration*: detects price velocity acceleration before major breakouts.
+  2. *Volume Intelligence*: evaluates 5m-to-1h turnover burst ratios and organic volume expansion.
+  3. *Buy/Sell Pressure*: tracks taker buy volume dominance and positive CVD proxy.
+  4. *Liquidity Intelligence*: measures exit liquidity depth cushions and liquidity-to-FDV ratios.
+  5. *Accumulation Detection*: identifies compression coils, higher lows, and supply absorption.
+  6. *Smart-Money Research*: analyzes transaction volume clusters and community takeover dynamics.
+  7. *Breakout Prediction*: measures proximity to resistance and volatility expansion.
+  8. *Ecosystem Flow*: integrates DefiLlama chain flow multipliers and multi-provider corroboration.
+  9. *Risk Intelligence*: applies hard penalties for thin liquidity rugs, wash trading, and late exhaustion.
+- **24-Hour Probabilistic Expected Return Engine** (`scripts/expected_return_engine.py`):
+  - Strictly enforces the mandatory technical TP minimum (+40.00%).
+  - Estimates $P(\text{TP}_{40\%} \text{ within 24h})$ probability using logit-scaled confluence and liquidity factors.
+  - Computes Expected Net 24-Hour Return ($E[R_{24h}]$) factoring win probability, downside drawdown, and DEX execution slippage drag.
+  - Projects Maximum Favorable Excursion (MFE) and Maximum Adverse Excursion (MAE).
+  - Estimates hours to target and reversal/front-run risk.
+  - Generates a realistic opportunity rank prioritizing assets with high win odds and positive net return over speculative low-probability setups.
+- **AURA Genuine Machine-Learning Feature-Attribution Upgrade** (`scripts/user_trade_learning.py`):
+  - Upgraded internal AI learning engine from simple win/loss counters to empirical feature-attribution learning.
+  - Reconstructs/extracts 0-100 feature vectors for user-taken trades across all 9 breakout dimensions.
+  - Computes empirical covariance and attribution between feature values and actual user-reported trade outcomes (Final P/L %).
+  - Trains exclusively on user-confirmed taken positions (`trained_on_user_positions_only: True`), preserving historical forecasts without fabricating labels.
+  - Retains permanent negative regression safeguards (FAIR/SOL near-miss front-run buffer, USOE/SOL liquidity cushion, CORLA/WBNB honeypot).
+  - Preserves software version provenance for every position record (`software_version`).
+  - Automatically updates active model version to `AURA-v4.28.0`.
 
 ### v4.27.0 — Phase 1: Unified Network Registry, Multi-Lane DEX Screener & DefiLlama Flow Intelligence
 

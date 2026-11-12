@@ -120,6 +120,10 @@ def pick_candidates(report, dex_limit=140, cex_limit=25):
                 "quote_token_address", "quote_symbol",
                 "dexpaprika_token_order_swapped_for_tracking",
                 "source", "retrieved_utc", "source_url", "pair_url",
+                "breakout_confluence_score", "breakout_engine_scores", "breakout_acceleration_signals",
+                "probability_tp_hit_24h_pct", "expected_net_24h_return_pct", "potential_mfe_24h_pct",
+                "potential_mae_24h_pct", "estimated_hours_to_target", "reversal_risk_score",
+                "realistic_opportunity_rank",
             }
             if prefer_signal or prefer_token_mapping:
                 # A normalized DEX-pool record is authoritative for which
@@ -1469,7 +1473,12 @@ def main(argv=None):
                                "hyperliquid_day_volume_usd", "hyperliquid_match_status",
                                "funding_8h_pct", "oi_change_4h_pct", "oi_velocity_1h_pct",
                                "derivatives_checked", "derivatives_audit_status",
-                               "derivatives_market_status", "derivatives_timestamp_utc"):
+                               "derivatives_market_status", "derivatives_timestamp_utc",
+                               "breakout_confluence_score", "breakout_engine_scores",
+                               "breakout_acceleration_signals", "probability_tp_hit_24h_pct",
+                               "expected_net_24h_return_pct", "potential_mfe_24h_pct",
+                               "potential_mae_24h_pct", "estimated_hours_to_target",
+                               "reversal_risk_score", "realistic_opportunity_rank"):
                 if risk_field in item_meta:
                     ranked[risk_field] = item_meta.get(risk_field)
             projected = num(ranked.get("projected_24h_upside_pct"))
@@ -1489,7 +1498,11 @@ def main(argv=None):
                 100.0 * min(1.0, math.log1p(max(0.0, projected)) / math.log1p(250.0))
                 if projected is not None and projected > 0 else None
             )
-            if early is not None and projection_score is not None:
+            opp_rank = num(ranked.get("realistic_opportunity_rank"))
+            if opp_rank is not None and early is not None:
+                ranked["ranking_score_24h"] = round(max(0.0, 0.45 * opp_rank + 0.35 * early + 0.20 * base_score - risk_reward_penalty), 2)
+                ranked["ranking_model_24h"] = "45% realistic opportunity (win prob + net return) + 35% breakout confluence + 20% base research - downside penalty"
+            elif early is not None and projection_score is not None:
                 ranked["ranking_score_24h"] = round(max(0.0, 0.55 * early + 0.20 * base_score + 0.25 * projection_score - risk_reward_penalty), 2)
                 ranked["ranking_model_24h"] = "55% early-breakout + 20% base research + 25% candle-backed upside scenario - downside/R:R penalty"
             elif early is not None:

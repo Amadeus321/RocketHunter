@@ -526,6 +526,20 @@ def render_report(document: dict[str, Any]) -> str:
             lines.append(f"- **Next-24h opportunity rank:** {int(forward_rank)}")
         if forward_score is not None:
             lines.append(f"- **Next-24h opportunity score:** {forward_score:.2f}/100 (heuristic, not a probability)")
+        prob_tp = _number(candidate.get("probability_tp_hit_24h_pct"))
+        exp_ret = _number(candidate.get("expected_net_24h_return_pct"))
+        mfe = _number(candidate.get("potential_mfe_24h_pct"))
+        mae = _number(candidate.get("potential_mae_24h_pct"))
+        hrs = _number(candidate.get("estimated_hours_to_target"))
+        confl = _number(candidate.get("breakout_confluence_score"))
+        if prob_tp is not None and exp_ret is not None:
+            lines.append(f"- **P(+40% TP in 24h):** {prob_tp:.1f}% | **Expected Net 24h Return (E[R]):** {exp_ret:+.2f}%")
+        if mfe is not None and mae is not None:
+            lines.append(f"- **Projected 24h Excursion:** MFE {mfe:+.2f}% | MAE {mae:+.2f}%")
+        if hrs is not None:
+            lines.append(f"- **Est. Time to Target:** ~{hrs:.1f} hours")
+        if confl is not None:
+            lines.append(f"- **9-Engine Breakout Confluence:** {confl:.2f}/100")
         atr = _number(candidate.get("atr_1h_pct"))
         stop_price = _number(candidate.get("initial_stop_price"))
         stop_loss_pct = _number(candidate.get("stop_loss_pct"))

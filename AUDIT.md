@@ -1,4 +1,36 @@
-# Rocket Hunter repository audit — v4.27.0
+# Rocket Hunter repository audit — v4.28.0
+
+## v4.28.0 (Phase 2 & Phase 3) Architectural Upgrades
+
+- **9-Engine Imminent Breakout Detection System** (`scripts/breakout_signal_engines.py`):
+  Evaluates behavioral acceleration and rate-of-change anomalies rather than raw historical gains across 9 independent engines:
+  1. Momentum Acceleration (velocity expansion before breakout)
+  2. Volume Intelligence (organic turnover expansion & 5m-to-1h burst ratio)
+  3. Buy/Sell Pressure (taker buy share and CVD delta)
+  4. Liquidity Intelligence (depth cushion & exit liquidity)
+  5. Accumulation Detection (consolidation compression & absorption)
+  6. Smart-Money Research (holder distribution & wallet behavior)
+  7. Breakout Prediction (volatility expansion & resistance proximity)
+  8. Ecosystem Intelligence (capital rotation & network flow)
+  9. Risk Intelligence (wash trading, late chase, honeypot & liquidity rug risks)
+
+- **24-Hour Probabilistic Expected Return & Excursion Engine** (`scripts/expected_return_engine.py`):
+  Computes execution-aware risk-adjusted metrics:
+  - Enforces mandatory technical TP minimum (+40.00%).
+  - Probability of reaching +40% target within 24 hours ($P(\text{TP}_{40\%} \text{ within 24h})$).
+  - Expected net 24-hour return ($E[R_{24h}]$) factoring win probability, downside drawdown, and DEX execution slippage drag.
+  - Potential Maximum Favorable Excursion (MFE) and Maximum Adverse Excursion (MAE).
+  - Estimated time to target.
+  - Realistic opportunity ranking prioritizing assets with high win odds and positive net return over speculative low-probability setups.
+
+- **AURA Genuine Machine-Learning Feature-Attribution Upgrade** (`scripts/user_trade_learning.py`):
+  - Upgraded internal AI learning engine from simple win/loss counters to empirical feature-attribution learning.
+  - Reconstructs/extracts 0-100 feature vectors for user-taken trades across all 9 breakout dimensions.
+  - Learns empirical covariance and attribution between feature values and actual user-reported trade outcomes (Final P/L %).
+  - Trains exclusively on user-confirmed taken positions (`trained_on_user_positions_only: True`), preserving historical forecasts without fabricating labels.
+  - Retains permanent negative regression safeguards (FAIR/SOL near-miss front-run buffer, USOE/SOL liquidity cushion, CORLA/WBNB honeypot).
+  - Preserves software version provenance for every position record (`software_version`).
+  - Automatically updates active model version to `AURA-v4.28.0`.
 
 ## Latest qualification and audit-persistence changes
 

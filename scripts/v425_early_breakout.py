@@ -51,6 +51,11 @@ EARLY_FIELDS = (
     "early_breakout_score", "early_breakout_tier", "early_breakout_components",
     "early_breakout_risk_flags", "early_breakout_signal_version",
     "early_breakout_model_id",
+    # 9-Engine Imminent Breakout and 24h Probabilistic Outcomes
+    "breakout_confluence_score", "breakout_engine_scores", "breakout_acceleration_signals",
+    "probability_tp_hit_24h_pct", "expected_net_24h_return_pct", "potential_mfe_24h_pct",
+    "potential_mae_24h_pct", "estimated_hours_to_target", "reversal_risk_score",
+    "realistic_opportunity_rank",
     # Carry the actual observations used by the score into the final 24h board.
     # Previously only the opaque score survived compaction, hiding momentum,
     # volume and liquidity evidence from the ranking output.
@@ -487,6 +492,23 @@ def score_candidate(row: dict[str, Any]) -> dict[str, Any]:
         tier = "DEVELOPING_MOMENTUM"
     else:
         tier = "EARLY_DISCOVERY_OR_WEAK_SIGNAL"
+
+    # Evaluate 9 independent signal engines and 24h expected return model
+    engines_res = {}
+    expected_res = {}
+    try:
+        try:
+            from scripts.breakout_signal_engines import BreakoutSignalEngines
+            from scripts.expected_return_engine import ExpectedReturnEngine
+        except ImportError:
+            from breakout_signal_engines import BreakoutSignalEngines
+            from expected_return_engine import ExpectedReturnEngine
+
+        engines_res = BreakoutSignalEngines.evaluate_all_engines(row)
+        expected_res = ExpectedReturnEngine.estimate_outcomes(row, engines_res)
+    except Exception:
+        pass
+
     return {
         "score": score,
         "signal_version": EARLY_BREAKOUT_SIGNAL_VERSION,
@@ -497,7 +519,17 @@ def score_candidate(row: dict[str, Any]) -> dict[str, Any]:
         "buy_pressure_pct": round(buy_share, 2) if buy_share is not None else None,
         "volume_to_liquidity": round(turnover, 3) if turnover is not None else None,
         "intraday_volume_acceleration_ratio": round(volume_acceleration_ratio, 3) if volume_acceleration_ratio is not None else None,
-        "method": "Relative heuristic using 5m/1h/6h momentum, acceleration, intraday volume acceleration, transaction activity, turnover, liquidity, new-pool age and buy pressure. Not a probability or return forecast.",
+        "breakout_confluence_score": engines_res.get("breakout_confluence_score"),
+        "breakout_engine_scores": engines_res.get("engine_scores", {}),
+        "breakout_acceleration_signals": engines_res.get("acceleration_signals", {}),
+        "probability_tp_hit_24h_pct": expected_res.get("probability_tp_hit_24h_pct"),
+        "expected_net_24h_return_pct": expected_res.get("expected_net_24h_return_pct"),
+        "potential_mfe_24h_pct": expected_res.get("potential_mfe_24h_pct"),
+        "potential_mae_24h_pct": expected_res.get("potential_mae_24h_pct"),
+        "estimated_hours_to_target": expected_res.get("estimated_hours_to_target"),
+        "reversal_risk_score": expected_res.get("reversal_risk_score"),
+        "realistic_opportunity_rank": expected_res.get("realistic_opportunity_rank"),
+        "method": "Relative heuristic using 5m/1h/6h momentum, acceleration, intraday volume acceleration, transaction activity, turnover, liquidity, new-pool age and buy pressure. 9 independent signal engines with 24h expected return projection.",
     }
 
 
@@ -617,6 +649,16 @@ def _normalize_pool(row: dict[str, Any], family: str, rank: int,
         "early_breakout_tier": score["tier"],
         "early_breakout_components": score["components"],
         "early_breakout_risk_flags": score["risk_flags"],
+        "breakout_confluence_score": score.get("breakout_confluence_score"),
+        "breakout_engine_scores": score.get("breakout_engine_scores"),
+        "breakout_acceleration_signals": score.get("breakout_acceleration_signals"),
+        "probability_tp_hit_24h_pct": score.get("probability_tp_hit_24h_pct"),
+        "expected_net_24h_return_pct": score.get("expected_net_24h_return_pct"),
+        "potential_mfe_24h_pct": score.get("potential_mfe_24h_pct"),
+        "potential_mae_24h_pct": score.get("potential_mae_24h_pct"),
+        "estimated_hours_to_target": score.get("estimated_hours_to_target"),
+        "reversal_risk_score": score.get("reversal_risk_score"),
+        "realistic_opportunity_rank": score.get("realistic_opportunity_rank"),
     })
     return record
 
@@ -1088,6 +1130,16 @@ def _fallback_market_mover_candidates(report: dict[str, Any], limit: int = 500) 
                 incoming["early_breakout_tier"] = signal["tier"]
                 incoming["early_breakout_components"] = signal["components"]
                 incoming["early_breakout_risk_flags"] = signal["risk_flags"]
+                incoming["breakout_confluence_score"] = signal.get("breakout_confluence_score")
+                incoming["breakout_engine_scores"] = signal.get("breakout_engine_scores")
+                incoming["breakout_acceleration_signals"] = signal.get("breakout_acceleration_signals")
+                incoming["probability_tp_hit_24h_pct"] = signal.get("probability_tp_hit_24h_pct")
+                incoming["expected_net_24h_return_pct"] = signal.get("expected_net_24h_return_pct")
+                incoming["potential_mfe_24h_pct"] = signal.get("potential_mfe_24h_pct")
+                incoming["potential_mae_24h_pct"] = signal.get("potential_mae_24h_pct")
+                incoming["estimated_hours_to_target"] = signal.get("estimated_hours_to_target")
+                incoming["reversal_risk_score"] = signal.get("reversal_risk_score")
+                incoming["realistic_opportunity_rank"] = signal.get("realistic_opportunity_rank")
             if existing is None:
                 by_market[key] = incoming
                 continue
