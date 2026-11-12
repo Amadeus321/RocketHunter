@@ -495,9 +495,16 @@ def main(argv: list[str] | None = None) -> int:
     snapshot = outdir / "memory-snapshot"
     baseline = outdir / "memory-baseline"
     status_path = outdir / "scan-status.json"
+
+    # Initialize Phase 1 Unified 180-Minute Scanning Budget Manager
+    from scripts.unified_budget_manager import UnifiedBudgetManager
+    budget_mgr = UnifiedBudgetManager(args.max_runtime_minutes)
+    budget_mgr.start_phase("preflight_and_registries")
+
     state = {
         "status": "IN_PROGRESS", "run_id": run_id, "scan_started_utc": started_utc,
         "process_id": os.getpid(),
+        "unified_budget": budget_mgr.get_summary(),
         **metadata,
     }
     status_path.write_text(json.dumps(state, indent=2) + "\n", encoding="utf-8")
@@ -531,8 +538,18 @@ def main(argv: list[str] | None = None) -> int:
         env["ROCKET_HUNTER_RUN_ID"] = run_id
         base_budget = max(1.0, min(150.0, args.max_runtime_minutes * 0.72))
         cmds = [build_scan_command(args, outdir, base_budget)]
+
+        budget_mgr.start_phase("global_multichain_discovery")
+        state["unified_budget"] = budget_mgr.get_summary()
+        status_path.write_text(json.dumps(state, indent=2) + "\n", encoding="utf-8")
+
         _run_required(cmds[0], deadline, env, log_path, runtime_root,
                       "bounded discovery/preflight/report stage failed")
+
+        budget_mgr.start_phase("candidate_enrichment")
+        state["unified_budget"] = budget_mgr.get_summary()
+        status_path.write_text(json.dumps(state, indent=2) + "\n", encoding="utf-8")
+
         stages = [
             [sys.executable, "-m", "scripts.v418_pipeline", "--outdir", str(outdir), "--memory-dir", str(snapshot), "--run-id", run_id],
             [sys.executable, "-m", "scripts.v418_forward_guard", "--outdir", str(outdir), "--memory-dir", str(snapshot), "--run-id", run_id],
@@ -543,12 +560,21 @@ def main(argv: list[str] | None = None) -> int:
         for cmd in stages:
             _run_required(cmd, deadline, env, log_path, runtime_root,
                           "quality, memory, or safety-audit stage failed")
+
+        budget_mgr.start_phase("deep_verification_safety")
+        state["unified_budget"] = budget_mgr.get_summary()
+        status_path.write_text(json.dumps(state, indent=2) + "\n", encoding="utf-8")
+
         forward = [sys.executable, "scripts/forward_24h_report.py", "--report", str(outdir / "rocket-hunt.json"),
                    "--markdown", str(outdir / "forward-24h-rocket.md"), "--out", str(outdir / "forward-24h-rocket.json"),
                    "--dex-limit", "140", "--cex-limit", "25", "--timeout", "8", "--gecko-interval", "12.0"]
         (outdir / "forward-24h-rocket.md").write_text("", encoding="utf-8")
         _run_required(forward, deadline, env, log_path, runtime_root,
                       "forward report generation failed")
+
+        budget_mgr.start_phase("finalization_and_reports")
+        state["unified_budget"] = budget_mgr.get_summary()
+        status_path.write_text(json.dumps(state, indent=2) + "\n", encoding="utf-8")
         post = [
             [sys.executable, "-m", "scripts.v418_forward_guard", "--outdir", str(outdir), "--memory-dir", str(snapshot), "--run-id", run_id],
             [sys.executable, "-m", "scripts.v419_upgrade", "--outdir", str(outdir), "--memory-dir", str(snapshot), "--run-id", run_id],
@@ -566,9 +592,11 @@ def main(argv: list[str] | None = None) -> int:
         final = [sys.executable, "scripts/run_full_scan.py", "--mark-complete", "--outdir", str(outdir)]
         _run_required(final, deadline, env, log_path, runtime_root,
                       "could not finalize scan state")
+        budget_mgr.end_phase("finalization_and_reports")
         state.update(json.loads(status_path.read_text(encoding="utf-8")))
         state.update({"status": "COMPLETED", "scan_finished_utc": utc_now(),
-                      "scan_duration_seconds": round(time.monotonic() - started, 3)})
+                      "scan_duration_seconds": round(time.monotonic() - started, 3),
+                      "unified_budget": budget_mgr.get_summary()})
         status_path.write_text(json.dumps(state, indent=2) + "\n", encoding="utf-8")
         for name in ("rocket-hunt.json", "forward-24h-rocket.json"):
             path = outdir / name

@@ -412,6 +412,62 @@ def install_provider_hooks(mod: Any) -> None:
                 "registry_scope": "Selected rotating GeckoTerminal network IDs, not all pools on those networks.",
             },
         }
+
+        # Build Unified Network Registry and Cross-Provider Corroboration (Phase 1)
+        try:
+            try:
+                from scripts.unified_network_registry import UnifiedNetworkRegistry, normalize_chain
+                from scripts.defillama_flow_engine import compute_ecosystem_flow_score
+            except ImportError:
+                from unified_network_registry import UnifiedNetworkRegistry, normalize_chain
+                from defillama_flow_engine import compute_ecosystem_flow_score
+
+            unified_reg = UnifiedNetworkRegistry()
+            for ch in (defillama.get("dex_volume_chains") or []):
+                unified_reg.record_provider_result(ch, "defillama", "OK")
+            for ch in (defillama.get("chains_registry") or []):
+                unified_reg.record_provider_result(ch, "defillama", "OK")
+            for ch in dss:
+                c_cnt = sum(1 for c in getattr(self, "candidates", []) if normalize_chain(c.get("chain")) == normalize_chain(ch))
+                unified_reg.record_provider_result(ch, "dexscreener", "OK", pools_count=c_cnt)
+            for ch in (gecko_config.get("gecko_networks_selected") or []):
+                c_cnt = sum(1 for c in getattr(self, "candidates", []) if "gecko" in str(c.get("source", "")) and normalize_chain(c.get("chain")) == normalize_chain(ch))
+                unified_reg.record_provider_result(ch, "geckoterminal", "OK", pools_count=c_cnt)
+
+            # Corroborate candidates across providers
+            for cand in getattr(self, "candidates", []):
+                c_chain = normalize_chain(cand.get("chain"))
+                c_token = str(cand.get("address") or cand.get("token_address") or "").lower()
+                c_pool = str(cand.get("pool_address") or "").lower()
+                c_src = str(cand.get("source") or "")
+                seen_provs = set()
+                for p in ("dexscreener", "gecko", "dextools", "dexpaprika"):
+                    if p in c_src:
+                        seen_provs.add("geckoterminal" if p == "gecko" else p)
+
+                # Check matches with other candidate observations
+                for other in getattr(self, "candidates", []):
+                    if other is cand:
+                        continue
+                    o_src = str(other.get("source") or "")
+                    o_token = str(other.get("address") or other.get("token_address") or "").lower()
+                    o_pool = str(other.get("pool_address") or "").lower()
+                    if (c_pool and o_pool and c_pool == o_pool) or (c_token and o_token and c_token == o_token):
+                        for p in ("dexscreener", "gecko", "dextools", "dexpaprika"):
+                            if p in o_src:
+                                seen_provs.add("geckoterminal" if p == "gecko" else p)
+
+                cand["cross_provider_corroboration"] = {
+                    "corroborated": len(seen_provs) > 1,
+                    "provider_count": len(seen_provs),
+                    "providers": sorted(list(seen_provs)),
+                }
+
+            unified_summary = unified_reg.get_summary()
+            registries["unified_network_registry"] = unified_summary
+            result["unified_network_registry"] = unified_summary
+        except Exception:
+            pass
         result.setdefault("coverage", {}).update({
             "discovery_sources_version": DISCOVERY_SOURCES_VERSION,
             "provider_registries_v423": registries,

@@ -652,7 +652,7 @@ class RocketHunter:
                                  "boost_amount": x.get("boost_amount"), "boost_total": x.get("boost_total")}
                                 for x in leads.values()]
         leads_list = list(leads.values())[:max_token_lookups]
-        def lookup(item):
+        def lookup_single(item):
             chain, address = item["chain"], item["address"]
             url = "%s/token-pairs/v1/%s/%s" % (DEX_ROOT, quote(str(chain), safe=""), quote(str(address), safe=""))
             payload = self._fetch_json("dexscreener_token_pairs", url)
@@ -667,9 +667,50 @@ class RocketHunter:
                     row["boost_total"] = item.get("boost_total")
                     candidates.append(row)
             return candidates
-        with ThreadPoolExecutor(max_workers=min(self.workers, max(1, len(leads_list)))) as pool:
-            for batch in pool.map(lookup, leads_list):
-                self.candidates.extend(batch)
+
+        # Batch lookup in slices of up to 30 addresses for high throughput and rate-limit safety
+        addresses = [x["address"] for x in leads_list if x.get("address")]
+        chunks = [addresses[i : i + 30] for i in range(0, len(addresses), 30)]
+
+        def lookup_batch(chunk):
+            addrs_str = ",".join(chunk)
+            url = "%s/latest/dex/tokens/%s" % (DEX_ROOT, addrs_str)
+            payload = self._fetch_json("dexscreener_batch_tokens", url)
+            pairs = _items(payload)
+            candidates = []
+            matched_addrs = set()
+            for pair in pairs:
+                base = pair.get("baseToken") or {}
+                addr = base.get("address")
+                chain = pair.get("chainId")
+                if not addr or not chain:
+                    continue
+                matched_addrs.add(str(addr).lower())
+                lead = leads.get((str(chain).lower(), str(addr).lower()), {})
+                row = parse_dexscreener_pair(pair, chain, addr, lead.get("flags", set()), utc_iso())
+                if row:
+                    row["source_url"] = url
+                    row["promo_sources"] = sorted(lead.get("sources", []))
+                    row["boost_amount"] = lead.get("boost_amount")
+                    row["boost_total"] = lead.get("boost_total")
+                    candidates.append(row)
+            # Fall back to single lookup for missing tokens
+            missing = [a for a in chunk if str(a).lower() not in matched_addrs]
+            for a in missing:
+                for item in leads_list:
+                    if str(item.get("address", "")).lower() == str(a).lower():
+                        candidates.extend(lookup_single(item))
+                        break
+            return candidates
+
+        if chunks:
+            with ThreadPoolExecutor(max_workers=min(self.workers, max(1, len(chunks)))) as pool:
+                for batch in pool.map(lookup_batch, chunks):
+                    self.candidates.extend(batch)
+        else:
+            with ThreadPoolExecutor(max_workers=min(self.workers, max(1, len(leads_list)))) as pool:
+                for batch in pool.map(lookup_single, leads_list):
+                    self.candidates.extend(batch)
 
 
     def coingecko_trending(self, max_coins=30):

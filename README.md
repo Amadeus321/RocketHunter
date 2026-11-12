@@ -1,5 +1,6 @@
-# Crypto Pre-Breakout — v4.26.7 strict qualification and bounded local scan
+# Crypto Pre-Breakout — v4.27.0 strict qualification and bounded local scan
 
+**Unified multi-provider discovery & 180m budget manager:** v4.27.0  
 **DexPaprika all-network early-breakout discovery / 24h MFE monitor:** v4.25.0  
 **Birdeye free multichain rotation:** v4.24.0  
 **Multi-provider discovery / coverage ledger:** v4.23.0  
@@ -12,6 +13,14 @@
 **External data budget:** $0 — public endpoints only
 **Actionable shortlist:** final candidates must pass the canonical single-TP +40.00% gate and independent identity, price, safety, and buy/sell quote checks. Discovery leads remain separate; an empty qualified list is reported as zero.
 **Scan duration:** local manual execution is the primary path; each full local run has a 170-minute default deadline and a hard maximum of 180 minutes. Runs use isolated output folders and merge learning memory safely. GitHub Actions is optional.
+
+### v4.27.0 — Phase 1: Unified Network Registry, Multi-Lane DEX Screener & DefiLlama Flow Intelligence
+
+- **Unified Network Registry**: Normalizes cross-provider identities across Ethereum, Solana, BSC, Base, Arbitrum, Polygon, Avalanche, Optimism, Sui, Blast, Linea, Scroll, Fantom/Sonic, Mantle, zkSync, Aptos, Sei, Mode, PulseChain, TON, Tron, Cronos, Celo, and NEAR. Tracks per-provider query health, supported features, and pool counts.
+- **Upgraded Multi-Lane DEX Screener Discovery**: Expands discovery across fresh token profiles (`/token-profiles/latest/v1`), momentum discovery (`/token-boosts/latest/v1`, `/token-boosts/top/v1`, `/community-takeovers/latest/v1`, `/ads/latest/v1`), and intelligent 30-token batch lookups (`/latest/dex/tokens/{addresses}`), increasing throughput by up to 30x while respecting API pacing.
+- **DefiLlama Ecosystem Flow & Volume Allocation Engine**: Evaluates global 24h DEX volumes and blockchain TVL dynamics to compute ecosystem acceleration scores, automatically routing more discovery budget to expanding ecosystems.
+- **Cross-Provider Evidence Corroboration**: Corroborates discovery evidence across DEX Screener, GeckoTerminal, DexPaprika, and DEXTools, marking multi-provider corroborated candidates with provenance tracking.
+- **Unified 180-Minute Scanning Budget Manager**: Enforces phase budgets (Preflight 5m, Discovery 100m, Enrichment 20m, Verification 30m, Finalization 15m, Safety Reserve 10m) and dynamically rolls forward unused time to prevent run timeouts.
 
 ### v4.26.7 — fix user position journal refresh/deletion glitch & AURA learning state sync
 
