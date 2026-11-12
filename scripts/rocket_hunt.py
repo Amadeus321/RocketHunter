@@ -637,17 +637,22 @@ class RocketHunter:
         try:
             from scripts.dexscreener_discovery import DexScreenerDiscoveryEngine
             ds_engine = DexScreenerDiscoveryEngine(timeout=self.timeout, max_workers=self.workers)
-            leads_dict = ds_engine.discover_promoted_and_fresh_leads()
-            for key, lead in leads_dict.items():
-                chain, addr = lead["chain"], lead["token_address"]
-                lkey = (str(chain).lower(), str(addr).lower())
-                leads.setdefault(lkey, {"chain": chain, "address": addr, "flags": set(), "sources": set()})
-                for f in lead.get("flags", []):
-                    leads[lkey]["flags"].add(f)
-                for s in lead.get("sources", []):
-                    leads[lkey]["sources"].add(s)
-                leads[lkey]["boost_amount"] = max(n(leads[lkey].get("boost_amount")) or 0, n(lead.get("boost_amount")) or 0)
-                leads[lkey]["boost_total"] = max(n(leads[lkey].get("boost_total")) or 0, n(lead.get("boost_total")) or 0)
+            full_candidates = ds_engine.run_full_discovery()
+            if full_candidates:
+                existing_keys = {(str(c.get("chain", "")).lower(), str(c.get("pool_address", "")).lower()) for c in self.candidates}
+                for c in full_candidates:
+                    ckey = (str(c.get("chain", "")).lower(), str(c.get("pool_address", "")).lower())
+                    if ckey not in existing_keys:
+                        self.candidates.append(c)
+                        existing_keys.add(ckey)
+                self.discovery_leads = [
+                    {"chain": x["chain"], "address": x["token_address"],
+                     "sources": sorted(list(x.get("sources", []))), "promo_flags": sorted(list(x.get("flags", []))),
+                     "boost_amount": x.get("boost_amount"), "boost_total": x.get("boost_total")}
+                    for x in ds_engine.discovery_leads.values()
+                ]
+                self.dexscreener_stats = dict(ds_engine.stats)
+                return
         except Exception:
             pass
 
@@ -1181,7 +1186,10 @@ def main(argv=None):
     hunter.gecko_request_interval = max(0.0, a.gecko_request_interval)
     if not 1 <= a.dex_search_limit <= len(DEFAULT_DEX_SEARCH_QUERIES):
         p.error("--dex-search-limit must be between 1 and %d" % len(DEFAULT_DEX_SEARCH_QUERIES))
-    search_queries = DEFAULT_DEX_SEARCH_QUERIES[:a.dex_search_limit]
+    total_q = len(DEFAULT_DEX_SEARCH_QUERIES)
+    q_offset = int(datetime.now(timezone.utc).timestamp() // 3600) % total_q
+    rotated_queries = list(DEFAULT_DEX_SEARCH_QUERIES[q_offset:]) + list(DEFAULT_DEX_SEARCH_QUERIES[:q_offset])
+    search_queries = tuple(rotated_queries[:a.dex_search_limit])
     default_networks = list(DEFAULT_NETWORKS)
     extra_networks = [x for x in a.network if x not in default_networks]
 

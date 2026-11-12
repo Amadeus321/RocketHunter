@@ -886,15 +886,15 @@ def render(summary: dict[str, Any]) -> str:
                 f'<td>${tp} <span class="green" style="font-size:0.8rem;">({pot})</span></td>'
                 f'<td style="font-size:0.85rem;">{ist_time}</td>'
                 f'<td>'
-                f'<select class="input-dark" id="status-{pid}" onchange="handleStatusChange(\'{pid}\', this.value)">'
+                f'<select class="input-dark" id="status-{pid}" onfocus="handleFieldFocus(this)" onchange="handleStatusChange(\'{pid}\', this.value)" onblur="handleFieldBlur(\'{pid}\', this)">'
                 f'<option value="OPEN" {"selected" if st == "OPEN" else ""}>OPEN</option>'
                 f'<option value="TP_HIT" {"selected" if st == "TP_HIT" else ""}>TP_HIT (+40%+)</option>'
                 f'<option value="CLOSED_WIN" {"selected" if st == "CLOSED_WIN" else ""}>CLOSED_WIN</option>'
                 f'<option value="CLOSED_LOSS" {"selected" if st == "CLOSED_LOSS" else ""}>CLOSED_LOSS</option>'
                 f'</select>'
                 f'</td>'
-                f'<td><input type="text" class="input-dark" style="width:90px;font-weight:700;color:{pnl_color};" id="pnl-{pid}" data-pot="{pot}" value="{pnl}" placeholder="+45.0%" oninput="handlePnlInput(\'{pid}\', this)" onblur="savePosition(\'{pid}\', true)" onkeydown="if(event.key===\'Enter\')this.blur()"></td>'
-                f'<td><input type="text" class="input-dark" style="width:100%;min-width:180px;" id="notes-{pid}" value="{notes}" placeholder="Optional notes for internal AI learning..." oninput="handleNotesInput(\'{pid}\', this)" onblur="savePosition(\'{pid}\', true)" onkeydown="if(event.key===\'Enter\')this.blur()"></td>'
+                f'<td><input type="text" class="input-dark" style="width:90px;font-weight:700;color:{pnl_color};" id="pnl-{pid}" data-pot="{pot}" value="{pnl}" placeholder="+45.0%" onfocus="handleFieldFocus(this)" oninput="handlePnlInput(\'{pid}\', this)" onblur="handleFieldBlur(\'{pid}\', this)" onkeydown="if(event.key===\'Enter\'){{this.blur();savePosition(\'{pid}\', false);}}"></td>'
+                f'<td><input type="text" class="input-dark" style="width:100%;min-width:180px;" id="notes-{pid}" value="{notes}" placeholder="Optional notes for internal AI learning..." onfocus="handleFieldFocus(this)" oninput="handleNotesInput(\'{pid}\', this)" onblur="handleFieldBlur(\'{pid}\', this)" onkeydown="if(event.key===\'Enter\'){{this.blur();savePosition(\'{pid}\', false);}}"></td>'
                 f'<td style="white-space:nowrap;">'
                 f'<button type="button" class="btn-sm btn-save" id="btn-save-{pid}" onclick="savePosition(\'{pid}\', false)">💾 Save</button>'
                 f'<button type="button" class="btn-sm btn-del" onclick="deletePosition(\'{pid}\')">🗑️</button>'
@@ -1135,8 +1135,8 @@ pre {{
 <section id="user-trade-journal-section">
   <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:12px;margin-bottom:12px;">
     <div>
-      <h2 style="margin-bottom:4px;">3. User Position Journal &amp; AI Follow-Up (Real Trades) — AURA Learning Engine</h2>
-      <p class="meta" style="margin-bottom:0;">AURA (Adaptive Universal Rocket Algorithm) trains continuously and strictly from positions you confirm taking. Software version is recorded automatically with every trade. Record your final P/L, trade status, and notes to guide future opportunity discovery and scoring.</p>
+      <h2 style="margin-bottom:4px;">3. User Position Journal &amp; AI Follow-Up (Real Trades) — AURA Learning Engine (AURA-v4.29.0 · Software v4.29.0)</h2>
+      <p class="meta" style="margin-bottom:0;">AURA (Adaptive Universal Rocket Algorithm) trains continuously and strictly from positions you confirm taking. Software version (v4.29.0) and AURA version (AURA-v4.29.0) are tracked with every trade to distinguish version history. Record your final P/L, trade status, and notes to guide future opportunity discovery and scoring.</p>
     </div>
     <div></div>
   </div>
@@ -1220,7 +1220,6 @@ pre {{
 
 <script>
 let cachedJournalJson = '';
-let autoSaveTimers = {{}};
 
 function showJournalMsg(text, isError) {{
   const el = document.getElementById('journal-msg');
@@ -1233,9 +1232,34 @@ function showJournalMsg(text, isError) {{
   setTimeout(() => {{ el.style.display = 'none'; }}, 4000);
 }}
 
+function handleFieldFocus(el) {{
+  if (el) el.dataset.editing = 'true';
+}}
+
+function handleFieldBlur(pid, el) {{
+  if (el) {{
+    el.dataset.editing = 'false';
+    if (el.dataset.dirty === 'true') {{
+      savePosition(pid, true);
+    }}
+  }}
+}}
+
+function isFieldBeingEdited(el) {{
+  if (!el) return false;
+  if (el === document.activeElement) return true;
+  if (el.dataset.editing === 'true') return true;
+  if (el.dataset.dirty === 'true') return true;
+  if (el.dataset.userModified === 'true') return true;
+  return false;
+}}
+
 function handleStatusChange(pid, newStatus) {{
   const statusEl = document.getElementById('status-' + pid);
-  if (statusEl) statusEl.dataset.dirty = 'true';
+  if (statusEl) {{
+    statusEl.dataset.dirty = 'true';
+    statusEl.dataset.userModified = 'true';
+  }}
   const pnlEl = document.getElementById('pnl-' + pid);
   if (newStatus === 'TP_HIT' && pnlEl) {{
     const currentVal = (pnlEl.value || '').trim();
@@ -1244,13 +1268,14 @@ function handleStatusChange(pid, newStatus) {{
       pnlEl.value = pot;
       pnlEl.style.color = 'var(--green)';
       pnlEl.dataset.dirty = 'true';
+      pnlEl.dataset.userModified = 'true';
     }}
   }}
-  savePosition(pid, true);
 }}
 
 function handlePnlInput(pid, inputEl) {{
   inputEl.dataset.dirty = 'true';
+  inputEl.dataset.userModified = 'true';
   const clean = inputEl.value.trim().replace('%', '');
   const num = parseFloat(clean);
   if (!isNaN(num)) {{
@@ -1258,18 +1283,11 @@ function handlePnlInput(pid, inputEl) {{
   }} else {{
     inputEl.style.color = 'var(--text)';
   }}
-  if (autoSaveTimers[pid + '_pnl']) clearTimeout(autoSaveTimers[pid + '_pnl']);
-  autoSaveTimers[pid + '_pnl'] = setTimeout(() => {{
-    savePosition(pid, true);
-  }}, 1200);
 }}
 
 function handleNotesInput(pid, inputEl) {{
   inputEl.dataset.dirty = 'true';
-  if (autoSaveTimers[pid + '_notes']) clearTimeout(autoSaveTimers[pid + '_notes']);
-  autoSaveTimers[pid + '_notes'] = setTimeout(() => {{
-    savePosition(pid, true);
-  }}, 1200);
+  inputEl.dataset.userModified = 'true';
 }}
 
 async function loadJournalData() {{
@@ -1338,15 +1356,15 @@ function renderJournalTable(positions) {{
         <td>$${{tp}} <span class="green" style="font-size:0.8rem;">(${{pot}})</span></td>
         <td style="font-size:0.85rem;">${{ist_time}}</td>
         <td>
-          <select class="input-dark" id="status-${{pid}}" onchange="handleStatusChange('${{pid}}', this.value)">
+          <select class="input-dark" id="status-${{pid}}" onfocus="handleFieldFocus(this)" onchange="handleStatusChange('${{pid}}', this.value)" onblur="handleFieldBlur('${{pid}}', this)">
             <option value="OPEN" ${{st === 'OPEN' ? 'selected' : ''}}>OPEN</option>
             <option value="TP_HIT" ${{st === 'TP_HIT' ? 'selected' : ''}}>TP_HIT (+40%+)</option>
             <option value="CLOSED_WIN" ${{st === 'CLOSED_WIN' ? 'selected' : ''}}>CLOSED_WIN</option>
             <option value="CLOSED_LOSS" ${{st === 'CLOSED_LOSS' ? 'selected' : ''}}>CLOSED_LOSS</option>
           </select>
         </td>
-        <td><input type="text" class="input-dark" style="width:90px;font-weight:700;color:${{pnlColor}};" id="pnl-${{pid}}" data-pot="${{pot}}" value="${{pnl}}" placeholder="+45.0%" oninput="handlePnlInput('${{pid}}', this)" onblur="savePosition('${{pid}}', true)" onkeydown="if(event.key==='Enter')this.blur()"></td>
-        <td><input type="text" class="input-dark" style="width:100%;min-width:180px;" id="notes-${{pid}}" value="${{notes}}" placeholder="Optional notes for internal AI learning..." oninput="handleNotesInput('${{pid}}', this)" onblur="savePosition('${{pid}}', true)" onkeydown="if(event.key==='Enter')this.blur()"></td>
+        <td><input type="text" class="input-dark" style="width:90px;font-weight:700;color:${{pnlColor}};" id="pnl-${{pid}}" data-pot="${{pot}}" value="${{pnl}}" placeholder="+45.0%" onfocus="handleFieldFocus(this)" oninput="handlePnlInput('${{pid}}', this)" onblur="handleFieldBlur('${{pid}}', this)" onkeydown="if(event.key==='Enter'){{this.blur();savePosition('${{pid}}', false);}}"></td>
+        <td><input type="text" class="input-dark" style="width:100%;min-width:180px;" id="notes-${{pid}}" value="${{notes}}" placeholder="Optional notes for internal AI learning..." onfocus="handleFieldFocus(this)" oninput="handleNotesInput('${{pid}}', this)" onblur="handleFieldBlur('${{pid}}', this)" onkeydown="if(event.key==='Enter'){{this.blur();savePosition('${{pid}}', false);}}"></td>
         <td style="white-space:nowrap;">
           <button type="button" class="btn-sm btn-save" id="btn-save-${{pid}}" onclick="savePosition('${{pid}}', false)">💾 Save</button>
           <button type="button" class="btn-sm btn-del" onclick="deletePosition('${{pid}}')">🗑️</button>
@@ -1355,12 +1373,12 @@ function renderJournalTable(positions) {{
       tbody.appendChild(tr);
     }} else {{
       const statusEl = document.getElementById('status-' + pid);
-      if (statusEl && statusEl !== document.activeElement && statusEl.dataset.dirty !== 'true') {{
+      if (statusEl && !isFieldBeingEdited(statusEl)) {{
         if (statusEl.value !== st) statusEl.value = st;
       }}
 
       const pnlEl = document.getElementById('pnl-' + pid);
-      if (pnlEl && pnlEl !== document.activeElement && pnlEl.dataset.dirty !== 'true') {{
+      if (pnlEl && !isFieldBeingEdited(pnlEl)) {{
         if (pnlEl.value !== pnl) {{
           pnlEl.value = pnl;
           pnlEl.style.color = pnlColor;
@@ -1368,7 +1386,7 @@ function renderJournalTable(positions) {{
       }}
 
       const notesEl = document.getElementById('notes-' + pid);
-      if (notesEl && notesEl !== document.activeElement && notesEl.dataset.dirty !== 'true') {{
+      if (notesEl && !isFieldBeingEdited(notesEl)) {{
         if (notesEl.value !== notes) notesEl.value = notes;
       }}
     }}
@@ -1427,7 +1445,7 @@ function updateTopMetrics(positions) {{
 
 document.addEventListener('DOMContentLoaded', () => {{
   loadJournalData();
-  setInterval(loadJournalData, 4000);
+  setInterval(loadJournalData, 5000);
 }});
 
 async function savePosition(id, isAutoSave = false) {{
@@ -1452,13 +1470,20 @@ async function savePosition(id, isAutoSave = false) {{
     }});
     const data = await res.json();
     if (data.status === 'OK') {{
-      if (statusEl) statusEl.dataset.dirty = 'false';
+      if (statusEl) {{
+        statusEl.dataset.dirty = 'false';
+        statusEl.dataset.userModified = 'false';
+      }}
       if (pnlEl) {{
         pnlEl.dataset.dirty = 'false';
+        pnlEl.dataset.userModified = 'false';
         const pVal = parseFloat(pnlEl.value) || 0;
         pnlEl.style.color = (statusEl.value === 'TP_HIT' || statusEl.value === 'CLOSED_WIN' || pVal > 0) ? 'var(--green)' : ((statusEl.value === 'CLOSED_LOSS' || pVal < 0) ? 'var(--danger)' : 'var(--text)');
       }}
-      if (notesEl) notesEl.dataset.dirty = 'false';
+      if (notesEl) {{
+        notesEl.dataset.dirty = 'false';
+        notesEl.dataset.userModified = 'false';
+      }}
 
       if (btnEl) {{
         const origText = btnEl.innerHTML;
@@ -1481,7 +1506,6 @@ async function savePosition(id, isAutoSave = false) {{
         if (jRes.ok) {{
           const jData = await jRes.json();
           const positions = jData.positions || [];
-          renderJournalTable(positions);
           renderMonitorTable(positions);
           updateTopMetrics(positions);
         }}

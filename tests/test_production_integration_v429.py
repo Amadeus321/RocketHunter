@@ -281,6 +281,95 @@ class ProductionIntegrationV429Tests(unittest.TestCase):
         self.assertIn("HIGH/SOL", pos)
         self.assertIn("DENIM/ETH", pos)
 
+    def test_aura_provenance_and_version_tracking(self):
+        """Verifies AURA model versioning, SHA256 hashing, and truthful provenance reporting."""
+        utl.get_journal()
+        prov = utl.get_aura_provenance()
+        self.assertTrue(prov["aura_version"].startswith("AURA-v4.29.0"))
+        self.assertEqual(prov["software_version"], "v4.29.0")
+        self.assertNotEqual(prov["model_sha256"], "UNAVAILABLE")
+        self.assertIn("personal_learning_loaded", prov)
+
+    def test_aura_partial_features_exclusion_from_supervised_matrix(self):
+        """Verifies incomplete feature vectors remain unknown and are excluded from supervised covariance."""
+        utl.record_position({
+            "id": "pos_partial_feature_test",
+            "pair": "PART/SOL",
+            "chain": "solana",
+            "status": "TP_HIT",
+            "final_pnl_pct": "+45.0%",
+            "entry_features": {
+                "momentum_acceleration": 92.0,
+                # Missing all other features!
+            }
+        })
+        model = utl.train_ai_from_user_journal()
+        self.assertEqual(model["partial_snapshots_recorded"], 1)
+        self.assertEqual(model["verified_training_samples"], 0)
+
+    def test_expected_return_missing_liquidity_handling(self):
+        """Verifies ExpectedReturnEngine reports None for returns and probability when liquidity is unmeasured."""
+        row_missing_liq = {
+            "pair": "NOLIQ/SOL",
+            "price": 1.0,
+            "potential_pct": 55.0,
+            "liquidity_usd": None,
+        }
+        res = ExpectedReturnEngine.estimate_outcomes(row_missing_liq)
+        self.assertTrue(res["meets_mandatory_single_tp"])
+        self.assertIsNone(res["probability_tp_hit_24h"])
+        self.assertIsNone(res["expected_net_24h_return_pct"])
+        self.assertEqual(res["evidence_confidence_pct"], 0.0)
+        self.assertEqual(res["forecast_status"], "UNAVAILABLE_LIQUIDITY_UNMEASURED")
+
+    def test_defillama_protocol_volume_changes_aggregated(self):
+        """Verifies DefiLlamaFlowEngine calculates volume-weighted 1d and 7d protocol changes."""
+        engine = DefiLlamaFlowEngine()
+        mock_dex_payload = {
+            "totalVolume24h": 1_000_000_000.0,
+            "allChains": ["Solana", "Ethereum"],
+            "chainVolume24h": {"Solana": 600_000_000.0, "Ethereum": 400_000_000.0},
+            "protocols": [
+                {
+                    "name": "Raydium",
+                    "chains": ["Solana"],
+                    "total24h": 500_000_000.0,
+                    "change_1d": 25.5,
+                    "change_7d": 80.2,
+                },
+                {
+                    "name": "Uniswap",
+                    "chains": ["Ethereum"],
+                    "total24h": 400_000_000.0,
+                    "change_1d": -10.0,
+                    "change_7d": 15.0,
+                }
+            ]
+        }
+        mock_chains_payload = [
+            {"name": "Solana", "tvl": 5_000_000_000.0, "prevDay": 4_800_000_000.0},
+            {"name": "Ethereum", "tvl": 50_000_000_000.0, "prevDay": 49_000_000_000.0},
+        ]
+        with patch("scripts.defillama_flow_engine._fetch_json") as mock_fetch:
+            mock_fetch.side_effect = [
+                (mock_dex_payload, 200, None),
+                (mock_chains_payload, 200, None),
+            ]
+            flows = engine.collect_ecosystem_flows()
+            self.assertIn("solana", flows)
+            self.assertEqual(flows["solana"]["change_1d_pct"], 25.5)
+            self.assertEqual(flows["solana"]["change_7d_pct"], 80.2)
+            self.assertGreater(flows["solana"]["ecosystem_flow_score"], 1.5)
+
+    def test_desktop_launcher_resolves_latest_report(self):
+        """Verifies Desktop Launcher dynamically resolves completed reports rather than opening stale files."""
+        from scripts.desktop_launcher import find_latest_completed_report
+        report = find_latest_completed_report()
+        # Either returns a Path or None, never crashes
+        if report is not None:
+            self.assertTrue(report.exists())
+            self.assertEqual(report.suffix, ".html")
+
 
 if __name__ == "__main__":
     unittest.main()

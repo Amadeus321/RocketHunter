@@ -5,6 +5,7 @@ Compiles into RocketHunter.exe for 1-click execution without any coding.
 """
 from __future__ import annotations
 
+import json
 import os
 import sys
 import time
@@ -126,13 +127,38 @@ def open_live_monitor() -> None:
         time.sleep(2)
 
 
+def find_latest_completed_report() -> Path | None:
+    """Finds the latest verified scan report from completed runs."""
+    if RUNS_DIR.exists():
+        run_dirs = sorted([d for d in RUNS_DIR.iterdir() if d.is_dir()], reverse=True)
+        for rd in run_dirs:
+            report_file = rd / "forward-24h-rocket.html"
+            if not report_file.exists():
+                continue
+            manifest_file = rd / "manifest.json"
+            if manifest_file.exists():
+                try:
+                    mdata = json.loads(manifest_file.read_text(encoding="utf-8"))
+                    if mdata.get("status") == "COMPLETED" or mdata.get("scan_status") == "COMPLETED":
+                        return report_file
+                except Exception:
+                    pass
+            if report_file.stat().st_size > 1000:
+                return report_file
+
+    if REPORT_HTML.exists() and REPORT_HTML.stat().st_size > 1000:
+        return REPORT_HTML
+    return None
+
+
 def open_results() -> None:
-    if REPORT_HTML.exists():
-        print(f"\n[+] Opening {REPORT_HTML} in your browser...")
-        webbrowser.open(str(REPORT_HTML.resolve().as_uri()))
+    target = find_latest_completed_report()
+    if target and target.exists():
+        print(f"\n[+] Opening verified report {target.name} ({target.parent.name}) in your browser...")
+        webbrowser.open(str(target.resolve().as_uri()))
     else:
-        print("\n[!] forward-24h-rocket.html not found yet. Complete a scan first.")
-        time.sleep(2)
+        print("\n[!] No completed scan report found yet. Run [1] to generate the latest verified scan report.")
+        time.sleep(3)
 
 
 def open_dashboard() -> None:

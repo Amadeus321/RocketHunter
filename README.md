@@ -1,8 +1,8 @@
-# Crypto Pre-Breakout — v4.28.0 strict qualification and bounded local scan
+# Crypto Pre-Breakout — v4.29.0 strict qualification and bounded local scan
 
-**9-Engine Imminent Breakout & 24h Probabilistic Returns:** v4.28.0  
-**AURA Machine-Learning Feature-Attribution Upgrade:** v4.28.0  
-**Unified multi-provider discovery & 180m budget manager:** v4.27.0  
+**9-Engine Imminent Breakout & 24h Probabilistic Returns:** v4.29.0  
+**AURA Machine-Learning Feature-Attribution Upgrade:** v4.29.0  
+**Unified multi-provider discovery & 180m budget manager:** v4.29.0  
 **DexPaprika all-network early-breakout discovery / 24h MFE monitor:** v4.25.0  
 **Birdeye free multichain rotation:** v4.24.0  
 **Multi-provider discovery / coverage ledger:** v4.23.0  
@@ -15,6 +15,19 @@
 **External data budget:** $0 — public endpoints only
 **Actionable shortlist:** final candidates must pass the canonical single-TP +40.00% gate and independent identity, price, safety, and buy/sell quote checks. Discovery leads remain separate; an empty qualified list is reported as zero.
 **Scan duration:** local manual execution is the primary path; each full local run has a 170-minute default deadline and a hard maximum of 180 minutes. Runs use isolated output folders and merge learning memory safely. GitHub Actions is optional.
+
+### v4.29.0 — Architectural Upgrade & Integrity Release
+
+- **AURA Machine-Learning Data Integrity & Real Journal AI Follow-Up** (`scripts/user_trade_learning.py`):
+  Eliminates manufactured feature defaults: missing indicators remain `None`. Excludes incomplete snapshots from supervised covariance matrix calculations while recording them in research memory. Confirmation and execution fields (`user_confirmed_taken`, `entry_reference_price`, `actual_entry_fill`, `actual_exit_fill`, `fees_usd`, `slippage_pct`, `trade_size_usd`, `realized_pnl_pct`) are verified. Soft-archiving a trade preserves valid historical trade lessons. Fully transparent model provenance reports SHA256 hashes, AURA model version (`AURA-v4.29.0`), and personal learning load state.
+- **Frontend Input Stability in User Position Journal** (`status-dashboard.html` / `scripts/status_dashboard.py`):
+  Guarantees active editing fields (`TP_HIT`, `final_pnl_pct`, `notes`) are never wiped by background polling or network reconciliation.
+- **DEX Screener Multi-Lane Discovery & Systematic Query Rotation** (`scripts/rocket_hunt.py` / `scripts/dexscreener_discovery.py`):
+  Integrates fresh/promoted leads, batch token lookups (up to 30 tokens per batch), and rotates across all 34 default DEX search queries systematically over time.
+- **DefiLlama DEX Volume Flow Integration** (`scripts/defillama_flow_engine.py`):
+  Computes volume-weighted 1d and 7d protocol volume changes per chain, dynamically prioritizing fast-growing ecosystems.
+- **Truthful 24-Hour Expected Return Engine** (`scripts/expected_return_engine.py`):
+  Removes synthetic liquidity defaults; explicitly reports `None` for probability and expected return when liquidity is unmeasured.
 
 ### v4.28.0 — Phase 2 & Phase 3: 9-Engine Imminent Breakout Model, 24h Probabilistic Returns & AURA ML Feature Attribution
 

@@ -127,6 +127,77 @@ class TestUserTradeLearning(unittest.TestCase):
         self.assertIn("USOE/SOL", safeguards)
         self.assertIn("CORLA/WBNB", safeguards)
 
+    def test_partial_features_return_none_and_excluded_from_supervised_matrix(self):
+        # A position with ONLY momentum_acceleration
+        partial_pos = {
+            "pair": "PARTIAL/SOL",
+            "chain": "solana",
+            "entry_price": "0.10",
+            "status": "TP_HIT",
+            "final_pnl_pct": "+40.00%",
+            "entry_features": {
+                "momentum_acceleration": 90.0,
+            },
+        }
+        feats = utl.extract_position_features(partial_pos)
+        self.assertIsNotNone(feats)
+        self.assertEqual(feats["momentum_acceleration"], 90.0)
+        # All other unmeasured features MUST be None, NEVER defaulted to 50 or 85!
+        self.assertIsNone(feats["volume_intelligence"])
+        self.assertIsNone(feats["buy_sell_pressure"])
+        self.assertIsNone(feats["liquidity_depth"])
+        self.assertIsNone(feats["risk_safety"])
+
+        # Recording this partial position
+        utl.record_position(partial_pos)
+        ai_model = utl.train_ai_from_user_journal()
+        # It must be counted as a partial snapshot, but NOT in verified_training_samples
+        self.assertEqual(ai_model["partial_snapshots_recorded"], 1)
+        self.assertEqual(ai_model["verified_training_samples"], 0)
+
+    def test_archiving_preserves_confirmed_outcome_in_learning(self):
+        # A completed trade that gets soft-archived on dashboard
+        pos = {
+            "id": "pos_archive_test",
+            "pair": "ARCHIVE/SOL",
+            "chain": "solana",
+            "entry_price": "1.0",
+            "status": "TP_HIT",
+            "final_pnl_pct": "+45.00%",
+            "entry_features": {
+                "momentum_acceleration": 80.0,
+                "volume_intelligence": 85.0,
+                "buy_sell_pressure": 75.0,
+                "liquidity_depth": 70.0,
+                "accumulation_detection": 75.0,
+                "smart_money": 70.0,
+                "breakout_prediction": 80.0,
+                "ecosystem_flow": 75.0,
+                "risk_safety": 90.0,
+            },
+        }
+        utl.record_position(pos)
+        # Soft-archive it from the dashboard
+        del_res = utl.delete_position("pos_archive_test")
+        self.assertEqual(del_res["status"], "OK")
+
+        journal = utl.get_journal()
+        self.assertTrue(journal["positions"][0]["archived"])
+
+        # Learning must still include this valid closed trade!
+        ai_model = utl.train_ai_from_user_journal()
+        self.assertEqual(ai_model["win_count"], 1)
+        self.assertEqual(ai_model["verified_training_samples"], 1)
+
+    def test_backup_rebuild_and_provenance(self):
+        rebuild = utl.backup_and_rebuild_model()
+        self.assertEqual(rebuild["status"], "OK")
+
+        prov = utl.get_aura_provenance()
+        self.assertTrue(prov["aura_version"].startswith("AURA-v4.29.0"))
+        self.assertEqual(prov["software_version"], "v4.29.0")
+        self.assertNotEqual(prov["model_sha256"], "UNAVAILABLE")
+
 
 if __name__ == "__main__":
     unittest.main()

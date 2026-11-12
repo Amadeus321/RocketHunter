@@ -57,24 +57,55 @@ class ExpectedReturnEngine:
         # If mandatory target is missing, record explicit missing values without synthetic defaults
         if tp_target_pct is None:
             return {
+                "model_version": EXPECTED_RETURN_MODEL_VERSION,
+                "meets_mandatory_40pct_tp": False,
                 "meets_mandatory_single_tp": False,
                 "single_tp_target_pct": None,
+                "technical_tp_potential_pct": None,
                 "probability_tp_hit_24h": 0.0,
+                "probability_tp_hit_24h_pct": 0.0,
                 "expected_net_24h_return_pct": None,
-                "potential_mfe_pct": None,
-                "potential_mae_pct": None,
-                "estimated_time_to_target_hours": None,
+                "potential_mfe_24h_pct": None,
+                "potential_mae_24h_pct": None,
+                "estimated_hours_to_target": None,
                 "slippage_drag_pct": None,
+                "reversal_risk_score": None,
+                "evidence_confidence_pct": 0.0,
                 "realistic_opportunity_rank": 0.0,
+                "forecast_type": "HEURISTIC_PREBREAKOUT_ESTIMATE (UNCALIBRATED)",
+                "forecast_status": "TARGET_UNAVAILABLE",
                 "is_calibrated_empirical_model": False,
                 "empirical_validation_status": "TARGET_UNAVAILABLE",
+            }
+
+        # If liquidity is missing or unmeasured, never invent synthetic liquidity
+        if liq is None or liq <= 0:
+            return {
+                "model_version": EXPECTED_RETURN_MODEL_VERSION,
+                "meets_mandatory_40pct_tp": meets_mandatory_tp,
+                "meets_mandatory_single_tp": meets_mandatory_tp,
+                "single_tp_target_pct": tp_target_pct,
+                "technical_tp_potential_pct": tp_target_pct,
+                "probability_tp_hit_24h": None,
+                "probability_tp_hit_24h_pct": None,
+                "expected_net_24h_return_pct": None,
+                "potential_mfe_24h_pct": None,
+                "potential_mae_24h_pct": None,
+                "estimated_hours_to_target": None,
+                "slippage_drag_pct": None,
+                "reversal_risk_score": None,
+                "evidence_confidence_pct": 0.0,
+                "realistic_opportunity_rank": 0.0,
+                "forecast_type": "HEURISTIC_PREBREAKOUT_ESTIMATE (UNCALIBRATED)",
+                "forecast_status": "UNAVAILABLE_LIQUIDITY_UNMEASURED",
+                "is_calibrated_empirical_model": False,
+                "empirical_validation_status": "LIQUIDITY_UNMEASURED",
             }
 
         # 3. Probability of reaching target within 24 hours (Heuristic excursion model)
         base_logit = (confluence_score - 50.0) / 22.0
         target_distance_penalty = max(0.0, (tp_target_pct - 40.0) / 75.0)
-        liq_val = liq if liq is not None else 1000.0
-        liquidity_factor = min(0.35, max(-0.5, math.log10(max(1000.0, liq_val) / 50_000.0) * 0.25))
+        liquidity_factor = min(0.35, max(-0.5, math.log10(liq / 50_000.0) * 0.25))
 
         adjusted_logit = base_logit - target_distance_penalty + liquidity_factor
         prob_raw = 1.0 / (1.0 + math.exp(-adjusted_logit))
@@ -82,7 +113,7 @@ class ExpectedReturnEngine:
 
         # 4. Maximum Adverse Excursion (MAE) projection (Downside drawdown risk)
         base_drawdown = 8.0 + (abs(p1) * 0.2) + (abs(p24) * 0.05)
-        if liq is None or liq < 25_000:
+        if liq < 25_000:
             base_drawdown += 10.0
         elif liq > 250_000:
             base_drawdown = max(4.0, base_drawdown - 3.0)
@@ -93,7 +124,7 @@ class ExpectedReturnEngine:
         potential_mfe_pct = round(tp_target_pct * overshoot_ratio, 2)
 
         # 6. Estimated Execution Drag (DEX slippage & price impact)
-        slippage_drag_pct = 1.2 if (liq and liq >= 100_000) else (2.5 if (liq and liq >= 30_000) else 4.8)
+        slippage_drag_pct = 1.2 if liq >= 100_000 else (2.5 if liq >= 30_000 else 4.8)
 
         # 7. Expected Net 24-Hour Return
         # E[R] = P(TP) * Target - (1 - P(TP)) * |MAE| - Drag
@@ -139,7 +170,10 @@ class ExpectedReturnEngine:
         return {
             "model_version": EXPECTED_RETURN_MODEL_VERSION,
             "meets_mandatory_40pct_tp": meets_mandatory_tp,
+            "meets_mandatory_single_tp": meets_mandatory_tp,
+            "single_tp_target_pct": tp_target_pct,
             "technical_tp_potential_pct": tp_target_pct,
+            "probability_tp_hit_24h": prob_tp_hit,
             "probability_tp_hit_24h_pct": prob_tp_hit,
             "expected_net_24h_return_pct": expected_net_return_pct,
             "potential_mfe_24h_pct": potential_mfe_pct,
@@ -149,6 +183,7 @@ class ExpectedReturnEngine:
             "evidence_confidence_pct": evidence_confidence_pct,
             "realistic_opportunity_rank": opportunity_rank,
             "execution_slippage_drag_pct": slippage_drag_pct,
+            "forecast_type": "HEURISTIC_PREBREAKOUT_ESTIMATE (UNCALIBRATED)",
             "is_calibrated_empirical_model": False,
             "empirical_validation_status": "PREBREAKOUT_HEURISTIC_EXCURSION_MODEL",
         }

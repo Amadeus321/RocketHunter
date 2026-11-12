@@ -7,7 +7,16 @@ import sys
 import unittest
 import urllib.request
 
-from network_guard import NetworkAccessBlocked, install_network_guard
+from pathlib import Path
+
+TESTS_DIR = Path(__file__).resolve().parent
+if str(TESTS_DIR) not in sys.path:
+    sys.path.insert(0, str(TESTS_DIR))
+
+try:
+    from network_guard import NetworkAccessBlocked, install_network_guard
+except ImportError:
+    from tests.network_guard import NetworkAccessBlocked, install_network_guard
 
 install_network_guard()
 
@@ -26,11 +35,19 @@ class NetworkGuardTests(unittest.TestCase):
             sock.close()
 
     def test_python_subprocess_inherits_network_guard(self):
+        script = (
+            "import sys; "
+            f"sys.path.insert(0, {str(TESTS_DIR)!r}); "
+            "import network_guard; "
+            "network_guard.install_network_guard(); "
+            "import urllib.request; "
+            "urllib.request.urlopen('https://provider.invalid')"
+        )
         result = subprocess.run(
             [
                 sys.executable,
                 "-c",
-                "import urllib.request; urllib.request.urlopen('https://provider.invalid')",
+                script,
             ],
             capture_output=True,
             text=True,

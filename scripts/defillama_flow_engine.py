@@ -139,23 +139,65 @@ class DefiLlamaFlowEngine:
                     "token_symbol": row.get("tokenSymbol"),
                 }
 
-        # Parse 24h DEX volumes by chain
+        # Parse 24h DEX volumes by chain and protocol momentum
         if isinstance(dex_payload, dict):
             self.global_dex_volume_24h = float(dex_payload.get("totalVolume24h") or 0.0)
             chains_data = dex_payload.get("allChains") or []
             breakdown = dex_payload.get("chainVolume24h") or {}
+            protocols = dex_payload.get("protocols") or []
 
-            # Parse protocols per chain to calculate volume
+            # Compute volume-weighted 1d and 7d changes per chain from protocols
+            chain_vol_weighted: dict[str, float] = {}
+            chain_chg1_weighted: dict[str, float] = {}
+            chain_chg7_weighted: dict[str, float] = {}
+
+            if isinstance(protocols, list):
+                for proto in protocols:
+                    if not isinstance(proto, dict):
+                        continue
+                    p_vol = float(proto.get("total24h") or proto.get("totalVolume24h") or 0.0)
+                    if p_vol <= 0:
+                        continue
+                    p_chains = proto.get("chains") or ([proto.get("chain")] if proto.get("chain") else [])
+                    if not p_chains:
+                        continue
+                    split_vol = p_vol / len(p_chains)
+                    c1 = proto.get("change_1d")
+                    c7 = proto.get("change_7d")
+                    for pc in p_chains:
+                        pc_canon = normalize_chain(str(pc))
+                        chain_vol_weighted[pc_canon] = chain_vol_weighted.get(pc_canon, 0.0) + split_vol
+                        if c1 is not None:
+                            try:
+                                chain_chg1_weighted[pc_canon] = chain_chg1_weighted.get(pc_canon, 0.0) + (float(c1) * split_vol)
+                            except (ValueError, TypeError):
+                                pass
+                        if c7 is not None:
+                            try:
+                                chain_chg7_weighted[pc_canon] = chain_chg7_weighted.get(pc_canon, 0.0) + (float(c7) * split_vol)
+                            except (ValueError, TypeError):
+                                pass
+
+            # Compute per-chain momentum and flow score
             for chain_name in chains_data:
                 canon = normalize_chain(chain_name)
                 vol_24h = float(breakdown.get(chain_name) or 0.0)
                 tvl_info = tvl_by_chain.get(canon, {})
 
-                # Estimate 1d change if available in protocols
+                # Compute genuine 1d and 7d volume momentum
+                chg_1d: float | None = None
+                chg_7d: float | None = None
+                total_w_vol = chain_vol_weighted.get(canon, 0.0)
+                if total_w_vol > 0:
+                    if canon in chain_chg1_weighted:
+                        chg_1d = round(chain_chg1_weighted[canon] / total_w_vol, 2)
+                    if canon in chain_chg7_weighted:
+                        chg_7d = round(chain_chg7_weighted[canon] / total_w_vol, 2)
+
                 flow_score, weight = compute_ecosystem_flow_score(
                     volume_24h=vol_24h,
-                    change_1d_pct=None,
-                    change_7d_pct=None,
+                    change_1d_pct=chg_1d,
+                    change_7d_pct=chg_7d,
                     tvl_usd=tvl_info.get("tvl_usd"),
                     tvl_1d_change_pct=tvl_info.get("tvl_1d_change_pct"),
                 )
@@ -164,6 +206,8 @@ class DefiLlamaFlowEngine:
                     "canonical_id": canon,
                     "raw_chain_name": chain_name,
                     "volume_24h_usd": vol_24h,
+                    "change_1d_pct": chg_1d,
+                    "change_7d_pct": chg_7d,
                     "tvl_usd": tvl_info.get("tvl_usd"),
                     "tvl_1d_change_pct": tvl_info.get("tvl_1d_change_pct"),
                     "ecosystem_flow_score": flow_score,
