@@ -155,6 +155,31 @@ class TestBreakoutSignalEngines(unittest.TestCase):
         self.assertEqual(result["evidence_status"], "MISSING")
         self.assertEqual(result["confluence_tier"], "INSUFFICIENT_EVIDENCE")
 
+    def test_partial_engine_measurements_reduce_weighted_evidence_coverage(self):
+        result = BreakoutSignalEngines.evaluate_all_engines({
+            "chain": "solana",
+            "change_5m_pct": 2.0,
+            "change_1h_pct": 8.0,
+            "change_6h_pct": 15.0,
+            "change_24h_pct": 25.0,
+            "volume_5m": 10_000.0,
+            "volume_1h": 30_000.0,
+            "volume_24h_usd": 200_000.0,
+            "liquidity_usd": 100_000.0,
+            "dexpaprika_1h_buy_usd": 70_000.0,
+            "dexpaprika_1h_sell_usd": 30_000.0,
+            "potential_pct": 40.0,
+            "wallet_evidence": {
+                "smart_trader_count": 2,
+                "top_10_holders_share_pct": 50.0,
+            },
+            "ecosystem_flow_score": 1.0,
+            "cross_provider_corroboration": {"provider_count": 2},
+        })
+        self.assertEqual(result["engine_evidence_status"]["engine_4_liquidity_depth"], "PARTIAL")
+        self.assertEqual(result["evidence_coverage_pct"], 94.0)
+        self.assertTrue(result["breakout_evidence_eligible"])
+
     def test_target_and_liquidity_alone_do_not_create_expected_return_estimates(self):
         result = ExpectedReturnEngine.estimate_outcomes(
             {"potential_pct": 40.0, "liquidity_usd": 100_000.0}
@@ -268,6 +293,9 @@ class TestExpectedReturnEngine(unittest.TestCase):
         self.assertIn("estimated_hours_to_target", outcomes)
         self.assertGreaterEqual(outcomes["estimated_hours_to_target"], 1.0)
         self.assertLessEqual(outcomes["estimated_hours_to_target"], 24.0)
+        self.assertIsNone(outcomes["evidence_confidence_pct"])
+        self.assertEqual(outcomes["confidence_status"], "NOT_CALIBRATED")
+        self.assertEqual(outcomes["evidence_coverage_pct"], 100.0)
 
     def test_realistic_opportunity_ranking_prefers_high_win_odds_over_hyped_tp(self):
         # Asset A: High theoretical TP (120%), but poor confluence (30) and high reversal risk

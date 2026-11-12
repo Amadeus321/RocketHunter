@@ -45,6 +45,7 @@ class ExpectedReturnEngine:
 
         # 2. Confluence & Velocity Inputs
         confluence_score = None
+        confluence_coverage = None
         if (
             isinstance(confluence_profile, dict)
             and confluence_profile.get("breakout_evidence_eligible") is True
@@ -69,6 +70,7 @@ class ExpectedReturnEngine:
             )
             if coverage is not None and coverage >= 75.0 and candidate_score is not None and statuses_valid:
                 confluence_score = candidate_score
+                confluence_coverage = coverage
 
         def first_measurement(*keys: str) -> float | None:
             for key in keys:
@@ -209,8 +211,7 @@ class ExpectedReturnEngine:
             reversal_risk += 20.0  # Short-window rejection
         reversal_risk_score = round(min(98.0, max(5.0, reversal_risk)), 1)
 
-        # 10. Evidence Confidence & Completeness
-        evidence_confidence_pct = 100.0
+        # Heuristic inputs do not establish statistical confidence.
 
         # 11. Realistic Opportunity Rank Score
         # Prioritizes high expected net return and win probability over speculative inflated TP
@@ -235,7 +236,9 @@ class ExpectedReturnEngine:
             "potential_mae_24h_pct": potential_mae_pct,
             "estimated_hours_to_target": estimated_hours,
             "reversal_risk_score": reversal_risk_score,
-            "evidence_confidence_pct": evidence_confidence_pct,
+            "evidence_confidence_pct": None,
+            "evidence_coverage_pct": confluence_coverage,
+            "confidence_status": "NOT_CALIBRATED",
             "realistic_opportunity_rank": opportunity_rank,
             "execution_slippage_drag_pct": slippage_drag_pct,
             "forecast_type": "HEURISTIC_PREBREAKOUT_ESTIMATE (UNCALIBRATED)",
