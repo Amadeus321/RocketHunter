@@ -69,6 +69,18 @@ def _unavailable_details(status: str, missing: list[str]) -> dict[str, Any]:
     }
 
 
+def _detail_coverage(details: dict[str, Any], measurement_count: int) -> float:
+    status = details.get("evidence_status")
+    if status == "VERIFIED":
+        return 1.0
+    if status != "PARTIAL":
+        return 0.0
+    missing = details.get("missing_measurements")
+    if isinstance(missing, list):
+        return max(0.0, (measurement_count - len(missing)) / measurement_count)
+    return 0.5
+
+
 class BreakoutSignalEngines:
     """Evaluates 9 independent signal engines to detect imminent 24-hour breakouts."""
 
@@ -439,6 +451,7 @@ class BreakoutSignalEngines:
         engine_names = tuple(weights)
         engine_scores = (e1, e2, e3, e4, e5, e6, e7, e8)
         engine_details = (d1, d2, d3, d4, d5, d6, d7, d8)
+        measurement_counts = (3, 4, 2, 2, 3, 2, 3, 2)
         evidence_status = {
             f"engine_{index}_{name}": detail.get("evidence_status", "MISSING")
             for index, (name, detail) in enumerate(zip(engine_names, engine_details), start=1)
@@ -453,13 +466,14 @@ class BreakoutSignalEngines:
         evidence_status["engine_9_risk_safety"] = risk_evidence_status
         measured_weight = 0.0
         weighted_score = 0.0
-        for index, (name, score, weight) in enumerate(
-            zip(engine_names, engine_scores, weights.values()), start=1
+        for index, (name, score, detail, measurement_count, weight) in enumerate(
+            zip(engine_names, engine_scores, engine_details, measurement_counts, weights.values()), start=1
         ):
             status = evidence_status[f"engine_{index}_{name}"]
             if status in {"VERIFIED", "PARTIAL"}:
-                measured_weight += weight
-                weighted_score += score * weight
+                effective_weight = weight * _detail_coverage(detail, measurement_count)
+                measured_weight += effective_weight
+                weighted_score += score * effective_weight
         measured_confluence = weighted_score / measured_weight if measured_weight else 0.0
         evidence_coverage_pct = round(measured_weight * 100.0, 2)
         has_untrusted_evidence = any(

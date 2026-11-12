@@ -2,7 +2,7 @@ name: Verify forward 24h required trade fields
 
 on:
   pull_request:
-    branches: [master]
+    branches: [main]
     paths:
       - ".github/workflows/**"
       - "source/**"
