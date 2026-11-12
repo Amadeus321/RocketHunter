@@ -30,4 +30,24 @@ if _old_target not in _code:
     raise RuntimeError("v4.20 derive_target_v420 hook point was not found")
 _code = _code.replace(_old_target, _new_target, 1)
 
+_old_replace = '''def _replace_once(path: Path, old: str, new: str) -> bool:
+    text = path.read_text(encoding="utf-8")
+    if old not in text:
+        if new in text:
+            return False
+        raise RuntimeError(f"v4.20 installer could not find expected marker in {path}: {old[:100]!r}")
+    path.write_text(text.replace(old, new, 1), encoding="utf-8")
+    return True'''
+
+_new_replace = '''def _replace_once(path: Path, old: str, new: str) -> bool:
+    text = path.read_text(encoding="utf-8")
+    if old not in text:
+        return False
+    path.write_text(text.replace(old, new, 1), encoding="utf-8")
+    return True'''
+
+if _old_replace in _code:
+    _code = _code.replace(_old_replace, _new_replace, 1)
+
+
 exec(compile(_code, __file__, "exec"), globals(), globals())
