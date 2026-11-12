@@ -258,7 +258,7 @@ def _render_position_monitor(document: dict[str, Any]) -> list[str]:
         "| Asset / pair | Market | Pair address | Window closes (UTC) | MFE | Latest return | Protective stop | Status |",
         "|---|---|---|---|---:|---:|---|---|",
     ]
-    for item in active + completed[-20:]:
+    for item in active:
         mfe = _number(item.get("max_favorable_excursion_pct"))
         latest = _number(item.get("latest_return_from_entry_pct"))
         stop_price = _number(item.get("trailing_stop_price")) or _number(item.get("initial_stop_price"))
@@ -952,7 +952,7 @@ def render_html(document: dict[str, Any]) -> str:
 </section>
 """
         else:
-            for item in (active + completed[-20:]):
+            for item in active:
                 mfe = _number(item.get("max_favorable_excursion_pct"))
                 latest = _number(item.get("latest_return_from_entry_pct"))
                 stop_price = _number(item.get("trailing_stop_price")) or _number(item.get("initial_stop_price"))

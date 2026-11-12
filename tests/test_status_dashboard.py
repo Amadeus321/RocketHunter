@@ -278,6 +278,16 @@ class StatusDashboardTests(unittest.TestCase):
         with self.assertRaises(DashboardError):
             main(["--root", str(self.root), "--output", str(self.collections / "observations.jsonl")])
 
+    def test_monitor_table_renders_only_active_positions_excluding_closed_or_tphit(self):
+        self._write_inputs()
+        html = render(summarize(self.root))
+        # Ensure renderMonitorTable strictly filters active positions and maps active only
+        self.assertIn("const active = positions.filter(p => !p.status || p.status === 'OPEN');", html)
+        self.assertIn("if (active.length === 0)", html)
+        self.assertIn("tbody.innerHTML = active.map(p =>", html)
+        # Verify positions.map is not used for reference-position monitoring
+        self.assertNotIn("tbody.innerHTML = positions.map(p =>", html)
+
 
 if __name__ == "__main__":
     unittest.main()

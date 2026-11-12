@@ -485,14 +485,14 @@ function renderMonitorTable(positions) {
   if (!table || !tbody || !empty) return;
   const active = positions.filter(p => !p.status || p.status === 'OPEN');
   if (countEl) countEl.textContent = active.length;
-  if (positions.length === 0) {
+  if (active.length === 0) {
     table.style.display = 'none';
     empty.style.display = 'block';
     return;
   }
   empty.style.display = 'none';
   table.style.display = 'table';
-  tbody.innerHTML = positions.map(p => `<tr>
+  tbody.innerHTML = active.map(p => `<tr>
     <td><strong>${p.pair}</strong></td>
     <td>${p.chain || '—'}</td>
     <td><code>${p.pool_address || '—'}</code></td>
