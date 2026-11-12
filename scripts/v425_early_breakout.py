@@ -53,6 +53,7 @@ EARLY_FIELDS = (
     "early_breakout_model_id",
     # 9-Engine Imminent Breakout and 24h Probabilistic Outcomes
     "breakout_confluence_score", "breakout_engine_scores", "breakout_acceleration_signals",
+    "engine_evidence_status", "evidence_coverage_pct", "breakout_evidence_eligible",
     "probability_tp_hit_24h_pct", "expected_net_24h_return_pct", "potential_mfe_24h_pct",
     "potential_mae_24h_pct", "estimated_hours_to_target", "reversal_risk_score",
     "realistic_opportunity_rank",
@@ -522,6 +523,9 @@ def score_candidate(row: dict[str, Any]) -> dict[str, Any]:
         "breakout_confluence_score": engines_res.get("breakout_confluence_score"),
         "breakout_engine_scores": engines_res.get("engine_scores", {}),
         "breakout_acceleration_signals": engines_res.get("acceleration_signals", {}),
+        "engine_evidence_status": engines_res.get("engine_evidence_status", {}),
+        "evidence_coverage_pct": engines_res.get("evidence_coverage_pct", 0.0),
+        "breakout_evidence_eligible": engines_res.get("breakout_evidence_eligible", False),
         "probability_tp_hit_24h_pct": expected_res.get("probability_tp_hit_24h_pct"),
         "expected_net_24h_return_pct": expected_res.get("expected_net_24h_return_pct"),
         "potential_mfe_24h_pct": expected_res.get("potential_mfe_24h_pct"),
@@ -652,6 +656,9 @@ def _normalize_pool(row: dict[str, Any], family: str, rank: int,
         "breakout_confluence_score": score.get("breakout_confluence_score"),
         "breakout_engine_scores": score.get("breakout_engine_scores"),
         "breakout_acceleration_signals": score.get("breakout_acceleration_signals"),
+        "engine_evidence_status": score.get("engine_evidence_status"),
+        "evidence_coverage_pct": score.get("evidence_coverage_pct"),
+        "breakout_evidence_eligible": score.get("breakout_evidence_eligible"),
         "probability_tp_hit_24h_pct": score.get("probability_tp_hit_24h_pct"),
         "expected_net_24h_return_pct": score.get("expected_net_24h_return_pct"),
         "potential_mfe_24h_pct": score.get("potential_mfe_24h_pct"),
@@ -1133,6 +1140,9 @@ def _fallback_market_mover_candidates(report: dict[str, Any], limit: int = 500) 
                 incoming["breakout_confluence_score"] = signal.get("breakout_confluence_score")
                 incoming["breakout_engine_scores"] = signal.get("breakout_engine_scores")
                 incoming["breakout_acceleration_signals"] = signal.get("breakout_acceleration_signals")
+                incoming["engine_evidence_status"] = signal.get("engine_evidence_status")
+                incoming["evidence_coverage_pct"] = signal.get("evidence_coverage_pct")
+                incoming["breakout_evidence_eligible"] = signal.get("breakout_evidence_eligible")
                 incoming["probability_tp_hit_24h_pct"] = signal.get("probability_tp_hit_24h_pct")
                 incoming["expected_net_24h_return_pct"] = signal.get("expected_net_24h_return_pct")
                 incoming["potential_mfe_24h_pct"] = signal.get("potential_mfe_24h_pct")

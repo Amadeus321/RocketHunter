@@ -30,15 +30,58 @@ def _num(val: Any) -> float | None:
         return None
 
 
+def _measurement(row: dict[str, Any], *keys: str) -> tuple[float | None, str]:
+    stale_fields = row.get("evidence_stale_fields")
+    if isinstance(stale_fields, (list, tuple, set)) and any(key in stale_fields for key in keys):
+        return None, "STALE"
+
+    supplied = [row.get(key) for key in keys if row.get(key) is not None and row.get(key) != ""]
+    values = [_num(value) for value in supplied]
+    if any(value is None for value in values):
+        return None, "CONFLICTING"
+    values = [value for value in values if value is not None]
+    if not values:
+        return None, "MISSING"
+    if any(not math.isclose(value, values[0], rel_tol=1e-6, abs_tol=1e-9) for value in values[1:]):
+        return None, "CONFLICTING"
+    return values[0], "VERIFIED"
+
+
+def _evidence_status(*measurements: tuple[float | None, str]) -> str:
+    statuses = [status for _, status in measurements]
+    if "CONFLICTING" in statuses:
+        return "CONFLICTING"
+    if "STALE" in statuses:
+        return "STALE"
+    present = sum(value is not None for value, _ in measurements)
+    if present == 0:
+        return "MISSING"
+    if present < len(measurements):
+        return "PARTIAL"
+    return "VERIFIED"
+
+
+def _unavailable_details(status: str, missing: list[str]) -> dict[str, Any]:
+    return {
+        "evidence_status": status,
+        "missing_measurements": missing,
+        "unmeasured": status in {"MISSING", "STALE", "CONFLICTING"},
+    }
+
+
 class BreakoutSignalEngines:
     """Evaluates 9 independent signal engines to detect imminent 24-hour breakouts."""
 
     @staticmethod
     def engine_1_momentum_acceleration(row: dict[str, Any]) -> tuple[float, dict[str, Any]]:
         """Engine 1: Increasing price velocity before a major breakout."""
-        p5 = _num(row.get("change_5m_pct") or row.get("price_change_5m")) or 0.0
-        p1 = _num(row.get("change_1h_pct") or row.get("price_change_1h")) or 0.0
-        p6 = _num(row.get("change_6h_pct") or row.get("price_change_6h")) or 0.0
+        p5m = _measurement(row, "change_5m_pct", "price_change_5m")
+        p1h = _measurement(row, "change_1h_pct", "price_change_1h")
+        p6h = _measurement(row, "change_6h_pct", "price_change_6h")
+        status = _evidence_status(p5m, p1h, p6h)
+        if status != "VERIFIED":
+            return 0.0, _unavailable_details(status, ["5m_price_change", "1h_price_change", "6h_price_change"])
+        p5, p1, p6 = p5m[0], p1h[0], p6h[0]
 
         # Velocity comparison: short rate vs medium rate
         v_short = p5 * 12.0  # Annualized to 1h scale
@@ -50,6 +93,7 @@ class BreakoutSignalEngines:
 
         score = min(100.0, (acceleration * 0.4) + (rate_of_change * 0.6) + (max(0.0, p1) * 0.8))
         details = {
+            "evidence_status": status,
             "v_short_annualized": round(v_short, 2),
             "v_1h": round(v_med, 2),
             "acceleration_delta": round(acceleration, 2),
@@ -59,50 +103,74 @@ class BreakoutSignalEngines:
     @staticmethod
     def engine_2_volume_intelligence(row: dict[str, Any]) -> tuple[float, dict[str, Any]]:
         """Engine 2: Abnormal organic volume expansion."""
-        v5 = _num(row.get("volume_5m") or row.get("dexpaprika_5m_volume_usd")) or 0.0
-        v1 = _num(row.get("volume_1h") or row.get("dexpaprika_1h_volume_usd")) or 0.0
-        v24 = _num(row.get("volume_24h_usd") or row.get("volume_24h")) or 0.0
-        liq = _num(row.get("liquidity_usd") or row.get("best_liquidity_pool_usd")) or 1.0
+        v5m = _measurement(row, "volume_5m", "dexpaprika_5m_volume_usd")
+        v1h = _measurement(row, "volume_1h", "dexpaprika_1h_volume_usd")
+        v24h = _measurement(row, "volume_24h_usd", "volume_24h")
+        liquidity = _measurement(row, "liquidity_usd", "best_liquidity_pool_usd")
+        status = _evidence_status(v5m, v1h, v24h, liquidity)
+        if status in {"MISSING", "STALE", "CONFLICTING"}:
+            return 0.0, _unavailable_details(status, ["5m_volume", "1h_volume", "24h_volume", "liquidity"])
+        v5, v1, v24, liq = v5m[0], v1h[0], v24h[0], liquidity[0]
 
-        ratio_5m_1h = (v5 * 12.0 / v1) if v1 > 0 else 1.0
-        turnover_24h = v24 / max(1000.0, liq)
+        ratio_5m_1h = (v5 * 12.0 / v1) if v5 is not None and v1 is not None and v1 > 0 else None
+        turnover_24h = v24 / max(1000.0, liq) if v24 is not None and liq is not None and liq > 0 else None
 
         score = 0.0
-        if ratio_5m_1h >= 3.0:
+        if ratio_5m_1h is not None and ratio_5m_1h >= 3.0:
             score += 45.0
-        elif ratio_5m_1h >= 1.5:
+        elif ratio_5m_1h is not None and ratio_5m_1h >= 1.5:
             score += 25.0
-        elif ratio_5m_1h >= 1.0:
+        elif ratio_5m_1h is not None and ratio_5m_1h >= 1.0:
             score += 10.0
 
-        if 0.5 <= turnover_24h <= 10.0:
+        if turnover_24h is not None and 0.5 <= turnover_24h <= 10.0:
             score += 35.0  # Healthy organic turnover
-        elif turnover_24h > 10.0:
+        elif turnover_24h is not None and turnover_24h > 10.0:
             score += 15.0  # Potential wash / hype
 
-        if v24 >= 50_000:
+        if v24 is not None and v24 >= 50_000:
             score += 20.0
-        elif v24 >= 15_000:
+        elif v24 is not None and v24 >= 15_000:
             score += 10.0
 
         return round(min(100.0, score), 2), {
-            "burst_ratio_5m_1h": round(ratio_5m_1h, 2),
-            "turnover_24h": round(turnover_24h, 2),
+            "evidence_status": status,
+            "missing_measurements": [
+                name for name, measurement in (
+                    ("5m_volume", v5m), ("1h_volume", v1h),
+                    ("24h_volume", v24h), ("liquidity", liquidity),
+                ) if measurement[0] is None
+            ],
+            "burst_ratio_5m_1h": round(ratio_5m_1h, 2) if ratio_5m_1h is not None else None,
+            "turnover_24h": round(turnover_24h, 2) if turnover_24h is not None else None,
         }
 
     @staticmethod
     def engine_3_buy_sell_pressure(row: dict[str, Any]) -> tuple[float, dict[str, Any]]:
         """Engine 3: Strong buying pressure and positive cumulative volume delta (CVD)."""
-        buy_usd = _num(row.get("dexpaprika_1h_buy_usd"))
-        sell_usd = _num(row.get("dexpaprika_1h_sell_usd"))
-        tx_buys = _num(row.get("buys_24h")) or 0.0
-        tx_sells = _num(row.get("sells_24h")) or 0.0
-
-        buy_share = 50.0
-        if buy_usd is not None and sell_usd is not None and (buy_usd + sell_usd) > 0:
-            buy_share = (buy_usd / (buy_usd + sell_usd)) * 100.0
-        elif (tx_buys + tx_sells) > 0:
-            buy_share = (tx_buys / (tx_buys + tx_sells)) * 100.0
+        buy_usd = _measurement(row, "dexpaprika_1h_buy_usd")
+        sell_usd = _measurement(row, "dexpaprika_1h_sell_usd")
+        tx_buys = _measurement(row, "buys_24h")
+        tx_sells = _measurement(row, "sells_24h")
+        dollar_status = _evidence_status(buy_usd, sell_usd)
+        count_status = _evidence_status(tx_buys, tx_sells)
+        if "CONFLICTING" in (dollar_status, count_status):
+            return 0.0, _unavailable_details("CONFLICTING", ["buy_sell_measurements"])
+        if "STALE" in (dollar_status, count_status):
+            return 0.0, _unavailable_details("STALE", ["buy_sell_measurements"])
+        if dollar_status == "VERIFIED":
+            buy_value, sell_value, evidence_status = buy_usd[0], sell_usd[0], "VERIFIED"
+        elif count_status == "VERIFIED":
+            buy_value, sell_value, evidence_status = tx_buys[0], tx_sells[0], "PARTIAL"
+        else:
+            return 0.0, _unavailable_details("MISSING", ["buy_sell_measurements"])
+        if buy_value + sell_value <= 0:
+            return 0.0, {
+                "evidence_status": evidence_status,
+                "taker_buy_share_pct": None,
+                "note": "No measured trades in the selected window",
+            }
+        buy_share = (buy_value / (buy_value + sell_value)) * 100.0
 
         # CVD proxy
         score = 0.0
@@ -115,13 +183,22 @@ class BreakoutSignalEngines:
         else:
             score = max(0.0, buy_share)
 
-        return round(score, 2), {"taker_buy_share_pct": round(buy_share, 2)}
+        return round(score, 2), {
+            "evidence_status": evidence_status,
+            "taker_buy_share_pct": round(buy_share, 2),
+        }
 
     @staticmethod
     def engine_4_liquidity_intelligence(row: dict[str, Any]) -> tuple[float, dict[str, Any]]:
         """Engine 4: Liquidity accumulation and sufficient exit depth cushion."""
-        liq = _num(row.get("liquidity_usd") or row.get("best_liquidity_pool_usd")) or 0.0
-        fdv = _num(row.get("fdv") or row.get("market_cap")) or 0.0
+        liq_measurement = _measurement(row, "liquidity_usd", "best_liquidity_pool_usd")
+        fdv_measurement = _measurement(row, "fdv", "market_cap")
+        if liq_measurement[0] is None or liq_measurement[1] in {"STALE", "CONFLICTING"}:
+            return 0.0, _unavailable_details(liq_measurement[1], ["liquidity"])
+        if fdv_measurement[1] in {"STALE", "CONFLICTING"}:
+            return 0.0, _unavailable_details(fdv_measurement[1], ["fdv"])
+        liq, fdv = liq_measurement[0], fdv_measurement[0]
+        status = _evidence_status(liq_measurement, fdv_measurement)
 
         score = 0.0
         if liq >= 500_000:
@@ -132,24 +209,30 @@ class BreakoutSignalEngines:
             score = 60.0 + (liq - 40_000) / 60_000 * 20.0
         elif liq >= 15_000:
             score = 35.0
-        else:
+        elif liq > 0:
             score = 10.0
 
-        liq_ratio = (liq / fdv * 100.0) if fdv > 0 else 10.0
-        if 8.0 <= liq_ratio <= 35.0:
+        liq_ratio = (liq / fdv * 100.0) if fdv is not None and fdv > 0 else None
+        if liq_ratio is not None and 8.0 <= liq_ratio <= 35.0:
             score = min(100.0, score + 10.0)
 
         return round(score, 2), {
+            "evidence_status": status,
+            "missing_measurements": ["fdv"] if fdv is None else [],
             "liquidity_usd": round(liq, 2),
-            "liquidity_to_fdv_pct": round(liq_ratio, 2) if fdv > 0 else None,
+            "liquidity_to_fdv_pct": round(liq_ratio, 2) if liq_ratio is not None else None,
         }
 
     @staticmethod
     def engine_5_accumulation_detection(row: dict[str, Any]) -> tuple[float, dict[str, Any]]:
         """Engine 5: Consolidation, higher lows, and supply absorption before breakout."""
-        chg_24h = _num(row.get("change_24h_pct") or row.get("change_24h")) or 0.0
-        chg_6h = _num(row.get("change_6h_pct") or row.get("change_6h")) or 0.0
-        chg_1h = _num(row.get("change_1h_pct") or row.get("change_1h")) or 0.0
+        chg24 = _measurement(row, "change_24h_pct", "change_24h")
+        chg6 = _measurement(row, "change_6h_pct", "change_6h")
+        chg1 = _measurement(row, "change_1h_pct", "change_1h")
+        status = _evidence_status(chg24, chg6, chg1)
+        if status != "VERIFIED":
+            return 0.0, _unavailable_details(status, ["24h_price_change", "6h_price_change", "1h_price_change"])
+        chg_24h, chg_6h, chg_1h = chg24[0], chg6[0], chg1[0]
 
         score = 50.0
         # Compression: 24h and 6h moves are modest, but 1h starts to lift
@@ -161,6 +244,7 @@ class BreakoutSignalEngines:
             score = 25.0  # Already pumped, no longer accumulating
 
         return round(score, 2), {
+            "evidence_status": status,
             "consolidation_range": abs(chg_24h),
             "is_tight_coil": bool(-10.0 <= chg_24h <= 25.0 and chg_1h > 2.0),
         }
@@ -169,56 +253,79 @@ class BreakoutSignalEngines:
     def engine_6_smart_money_research(row: dict[str, Any]) -> tuple[float, dict[str, Any]]:
         """Engine 6: Relevant wallet activity and holder distribution."""
         wallet_ev = row.get("wallet_evidence") or row.get("smart_money_wallets") or row.get("top_holders") or row.get("onchain_evidence")
-        txns = _num(row.get("txns_24h")) or (_num(row.get("buys_24h")) or 0.0) + (_num(row.get("sells_24h")) or 0.0)
         promo_flags = row.get("extra", {}).get("promo_flags") or row.get("promo_flags") or []
 
         if isinstance(wallet_ev, dict) and wallet_ev:
-            # VERIFIED onchain wallet and holder intelligence
-            smart_wallets = _num(wallet_ev.get("smart_trader_count")) or 0.0
-            top10_share = _num(wallet_ev.get("top_10_holders_share_pct")) or 50.0
-            score = 60.0
-            if smart_wallets >= 5:
-                score += 25.0
-            elif smart_wallets >= 2:
-                score += 15.0
-            if top10_share < 35.0:
-                score += 15.0  # Well distributed
-            elif top10_share > 75.0:
-                score -= 20.0  # Highly concentrated risk
-            return round(min(100.0, max(0.0, score)), 2), {
-                "evidence_status": "VERIFIED",
-                "smart_traders_tracked": smart_wallets,
-                "top_10_share_pct": top10_share,
-            }
+            smart = _measurement(wallet_ev, "smart_trader_count")
+            top10 = _measurement(wallet_ev, "top_10_holders_share_pct")
+            status = _evidence_status(smart, top10)
+            if status in {"STALE", "CONFLICTING"}:
+                return 0.0, _unavailable_details(status, ["wallet_metrics"])
+            if smart[0] is not None and top10[0] is not None:
+                smart_wallets, top10_share = smart[0], top10[0]
+                if smart_wallets < 0 or not 0 <= top10_share <= 100:
+                    return 0.0, _unavailable_details("CONFLICTING", ["wallet_metrics"])
+                score = 60.0
+                if smart_wallets >= 5:
+                    score += 25.0
+                elif smart_wallets >= 2:
+                    score += 15.0
+                if top10_share < 35.0:
+                    score += 15.0
+                elif top10_share > 75.0:
+                    score -= 20.0
+                return round(min(100.0, max(0.0, score)), 2), {
+                    "evidence_status": "VERIFIED",
+                    "smart_traders_tracked": smart_wallets,
+                    "top_10_share_pct": top10_share,
+                }
+            if smart[0] is not None or top10[0] is not None:
+                return 0.0, {
+                    "evidence_status": "PARTIAL",
+                    "missing_measurements": [
+                        key for key, measurement in (
+                            ("smart_trader_count", smart),
+                            ("top_10_holders_share_pct", top10),
+                        ) if measurement[0] is None
+                    ],
+                    "unmeasured": False,
+                }
 
         # If only transaction counts are present: mark as PARTIAL proxy activity, NOT verified smart money
-        if txns > 0:
-            score = 50.0
-            if txns >= 1500:
+        txns = _measurement(row, "txns_24h")
+        if txns[0] is None:
+            buys = _measurement(row, "buys_24h")
+            sells = _measurement(row, "sells_24h")
+            if buys[0] is not None and sells[0] is not None:
+                txns = (buys[0] + sells[0], "VERIFIED")
+        if txns[0] is not None:
+            if txns[0] < 0:
+                return 0.0, _unavailable_details("CONFLICTING", ["transaction_count"])
+            score = 50.0 if txns[0] > 0 else 0.0
+            if txns[0] >= 1500:
                 score += 20.0
-            elif txns >= 400:
+            elif txns[0] >= 400:
                 score += 10.0
             if "community_takeover" in promo_flags:
                 score += 10.0
             return round(min(80.0, score), 2), {
                 "evidence_status": "PARTIAL",
-                "estimated_transactions": txns,
+                "estimated_transactions": txns[0],
                 "note": "Transaction activity proxy only; no verified wallet tracking",
             }
 
-        # Missing measurements must not silently become neutral or positive scores
-        return 0.0, {
-            "evidence_status": "UNAVAILABLE",
-            "unmeasured": True,
-            "note": "Zero wallet or transaction evidence measured",
-        }
+        return 0.0, _unavailable_details("MISSING", ["wallet_evidence", "transaction_count"])
 
     @staticmethod
     def engine_7_breakout_prediction(row: dict[str, Any]) -> tuple[float, dict[str, Any]]:
         """Engine 7: Imminent resistance breaks and volatility expansion."""
-        pot_pct = _num(row.get("tp_upside_pct") or row.get("potential_pct")) or 40.0
-        p5 = _num(row.get("change_5m_pct") or row.get("price_change_5m")) or 0.0
-        p1 = _num(row.get("change_1h_pct") or row.get("price_change_1h")) or 0.0
+        potential = _measurement(row, "tp_upside_pct", "potential_pct")
+        p5m = _measurement(row, "change_5m_pct", "price_change_5m")
+        p1h = _measurement(row, "change_1h_pct", "price_change_1h")
+        status = _evidence_status(potential, p5m, p1h)
+        if status != "VERIFIED":
+            return 0.0, _unavailable_details(status, ["single_tp_upside", "5m_price_change", "1h_price_change"])
+        pot_pct, p5, p1 = potential[0], p5m[0], p1h[0]
 
         score = 50.0
         # Good setup: clean +40% target with fresh early liftoff (p1 between 3% and 25%)
@@ -229,18 +336,32 @@ class BreakoutSignalEngines:
         elif p1 > 80.0:
             score = 30.0  # Late breakout chase
 
-        return round(score, 2), {"target_upside_pct": pot_pct, "impulse_1h": p1}
+        return round(score, 2), {
+            "evidence_status": status,
+            "target_upside_pct": pot_pct,
+            "impulse_1h": p1,
+        }
 
     @staticmethod
     def engine_8_ecosystem_intelligence(row: dict[str, Any]) -> tuple[float, dict[str, Any]]:
         """Engine 8: Network flow context, chain activity, and capital rotation."""
         chain = str(row.get("chain") or "").lower()
-        flow_score = _num(row.get("ecosystem_flow_score")) or 1.0
-        corroboration = row.get("cross_provider_corroboration") or {}
-        prov_cnt = corroboration.get("provider_count") or 1
+        flow = _measurement(row, "ecosystem_flow_score")
+        corroboration = row.get("cross_provider_corroboration")
+        providers = _measurement(corroboration, "provider_count") if isinstance(corroboration, dict) else (None, "MISSING")
+        status = _evidence_status(flow, providers)
+        if status in {"MISSING", "STALE", "CONFLICTING"}:
+            return 0.0, _unavailable_details(status, ["ecosystem_flow", "provider_count"])
+        flow_score, prov_cnt = flow[0], providers[0]
 
-        score = min(100.0, 50.0 * flow_score + (prov_cnt * 10.0))
+        score = min(100.0, (50.0 * flow_score if flow_score is not None else 0.0)
+                    + (prov_cnt * 10.0 if prov_cnt is not None else 0.0))
         return round(score, 2), {
+            "evidence_status": status,
+            "missing_measurements": [
+                name for name, measurement in (("ecosystem_flow", flow), ("provider_count", providers))
+                if measurement[0] is None
+            ],
             "chain": chain,
             "flow_multiplier": flow_score,
             "corroborating_providers": prov_cnt,
@@ -252,12 +373,17 @@ class BreakoutSignalEngines:
         risks: list[str] = []
         penalty = 0.0
 
-        p24 = _num(row.get("change_24h_pct") or row.get("change_24h")) or 0.0
-        p1 = _num(row.get("change_1h_pct") or row.get("change_1h")) or 0.0
-        liq = _num(row.get("liquidity_usd") or row.get("best_liquidity_pool_usd"))
-        vol = _num(row.get("volume_24h_usd") or row.get("volume_24h")) or 0.0
+        p24m = _measurement(row, "change_24h_pct", "change_24h")
+        p1m = _measurement(row, "change_1h_pct", "change_1h")
+        liqm = _measurement(row, "liquidity_usd", "best_liquidity_pool_usd")
+        volm = _measurement(row, "volume_24h_usd", "volume_24h")
+        if any(value is None for value, _ in (p24m, p1m, liqm, volm)):
+            return 0.0, ["INSUFFICIENT_RISK_EVIDENCE"]
+        if any(status in {"STALE", "CONFLICTING"} for _, status in (p24m, p1m, liqm, volm)):
+            return 0.0, ["UNTRUSTED_RISK_EVIDENCE"]
+        p24, p1, liq, vol = p24m[0], p1m[0], liqm[0], volm[0]
 
-        if liq is None or liq < 10_000:
+        if liq < 10_000:
             risks.append("EXTREME_THIN_LIQUIDITY_RUG_RISK")
             penalty += 40.0
         elif liq < 25_000:
@@ -268,7 +394,7 @@ class BreakoutSignalEngines:
             risks.append("LATE_CHASE_EXHAUSTION_RISK")
             penalty += 25.0
 
-        turnover = (vol / liq) if liq and liq > 0 else 0.0
+        turnover = (vol / liq) if liq > 0 else 0.0
         if turnover > 25.0 and abs(p24) < 15.0:
             risks.append("SUSPECTED_WASH_TRADING_HIGH_TURNOVER_FLAT_PRICE")
             penalty += 35.0
@@ -298,37 +424,63 @@ class BreakoutSignalEngines:
         e8, d8 = self.engine_8_ecosystem_intelligence(row)
         e9, risks = self.engine_9_risk_intelligence(row)
 
-        # Weighted Confluence Score (Weights derived from AURA historical win lessons)
+        # Evidence weights are renormalized over measurements actually present.
         weights = {
             "momentum_acceleration": 0.16,
             "volume_intelligence": 0.16,
             "buy_sell_pressure": 0.15,
-            "liquidity_intelligence": 0.12,
+            "liquidity_depth": 0.12,
             "accumulation_detection": 0.11,
             "smart_money": 0.08,
             "breakout_prediction": 0.12,
             "ecosystem_flow": 0.10,
         }
 
-        raw_confluence = (
-            e1 * weights["momentum_acceleration"]
-            + e2 * weights["volume_intelligence"]
-            + e3 * weights["buy_sell_pressure"]
-            + e4 * weights["liquidity_intelligence"]
-            + e5 * weights["accumulation_detection"]
-            + e6 * weights["smart_money"]
-            + e7 * weights["breakout_prediction"]
-            + e8 * weights["ecosystem_flow"]
+        engine_names = tuple(weights)
+        engine_scores = (e1, e2, e3, e4, e5, e6, e7, e8)
+        engine_details = (d1, d2, d3, d4, d5, d6, d7, d8)
+        evidence_status = {
+            f"engine_{index}_{name}": detail.get("evidence_status", "MISSING")
+            for index, (name, detail) in enumerate(zip(engine_names, engine_details), start=1)
+        }
+        risk_inputs = (
+            _measurement(row, "change_24h_pct", "change_24h"),
+            _measurement(row, "change_1h_pct", "change_1h"),
+            _measurement(row, "liquidity_usd", "best_liquidity_pool_usd"),
+            _measurement(row, "volume_24h_usd", "volume_24h"),
         )
+        risk_evidence_status = _evidence_status(*risk_inputs)
+        evidence_status["engine_9_risk_safety"] = risk_evidence_status
+        measured_weight = 0.0
+        weighted_score = 0.0
+        for index, (name, score, weight) in enumerate(
+            zip(engine_names, engine_scores, weights.values()), start=1
+        ):
+            status = evidence_status[f"engine_{index}_{name}"]
+            if status in {"VERIFIED", "PARTIAL"}:
+                measured_weight += weight
+                weighted_score += score * weight
+        measured_confluence = weighted_score / measured_weight if measured_weight else 0.0
+        evidence_coverage_pct = round(measured_weight * 100.0, 2)
+        has_untrusted_evidence = any(
+            status in {"STALE", "CONFLICTING"} for status in evidence_status.values()
+        )
+        evidence_eligible = (
+            evidence_coverage_pct >= 75.0
+            and risk_evidence_status == "VERIFIED"
+            and not has_untrusted_evidence
+        )
+        final_confluence = measured_confluence if evidence_eligible else 0.0
 
         # Risk safety scaling
-        safety_multiplier = max(0.2, e9 / 100.0)
-        final_confluence = round(raw_confluence * safety_multiplier, 2)
+        safety_multiplier = e9 / 100.0 if risk_evidence_status == "VERIFIED" else 0.0
+        final_confluence = round(final_confluence * safety_multiplier, 2)
 
-        tier = "HIGH_BREAKOUT_CONFLUENCE" if final_confluence >= 75.0 else (
+        tier = "INSUFFICIENT_EVIDENCE" if not evidence_eligible else (
+            "HIGH_BREAKOUT_CONFLUENCE" if final_confluence >= 75.0 else (
             "ACCELERATING_WATCHLIST" if final_confluence >= 60.0 else (
                 "DEVELOPING_SETUP" if final_confluence >= 40.0 else "LOW_CONFLUENCE"
-            )
+            ))
         )
 
         engine_scores = {
@@ -355,6 +507,17 @@ class BreakoutSignalEngines:
 
         return {
             "breakout_confluence_score": final_confluence,
+            "measured_breakout_confluence_score": round(measured_confluence, 2),
+            "evidence_coverage_pct": evidence_coverage_pct,
+            "breakout_evidence_eligible": evidence_eligible,
+            "evidence_status": "CONFLICTING" if "CONFLICTING" in evidence_status.values() else (
+                "STALE" if "STALE" in evidence_status.values() else (
+                    "VERIFIED" if evidence_eligible and evidence_coverage_pct == 100.0 else (
+                        "PARTIAL" if measured_weight else "MISSING"
+                    )
+                )
+            ),
+            "engine_evidence_status": evidence_status,
             "confluence_tier": tier,
             "system_version": BREAKOUT_SYSTEM_VERSION,
             "engines": engine_scores,

@@ -7,6 +7,25 @@ from scripts.breakout_signal_engines import BreakoutSignalEngines
 from scripts.expected_return_engine import ExpectedReturnEngine, MANDATORY_MIN_TP_PCT
 
 
+def _eligible_confluence(score):
+    return {
+        "breakout_confluence_score": score,
+        "breakout_evidence_eligible": True,
+        "evidence_coverage_pct": 100.0,
+        "engine_evidence_status": {
+            "engine_1_momentum_acceleration": "VERIFIED",
+            "engine_2_volume_intelligence": "VERIFIED",
+            "engine_3_buy_sell_pressure": "VERIFIED",
+            "engine_4_liquidity_depth": "VERIFIED",
+            "engine_5_accumulation_detection": "VERIFIED",
+            "engine_6_smart_money": "VERIFIED",
+            "engine_7_breakout_prediction": "VERIFIED",
+            "engine_8_ecosystem_flow": "VERIFIED",
+            "engine_9_risk_safety": "VERIFIED",
+        },
+    }
+
+
 class TestBreakoutSignalEngines(unittest.TestCase):
     """Test the 9 independent signal engines."""
 
@@ -81,10 +100,90 @@ class TestBreakoutSignalEngines(unittest.TestCase):
         self.assertGreaterEqual(score, 60.0)
         self.assertEqual(details["chain"], "solana")
 
+    def test_missing_and_incomplete_evidence_never_receives_positive_engine_scores(self):
+        cases = (
+            (BreakoutSignalEngines.engine_2_volume_intelligence, {}, "MISSING"),
+            (BreakoutSignalEngines.engine_3_buy_sell_pressure, {}, "MISSING"),
+            (BreakoutSignalEngines.engine_5_accumulation_detection, {}, "MISSING"),
+            (
+                BreakoutSignalEngines.engine_6_smart_money_research,
+                {"wallet_evidence": {"smart_trader_count": 4}},
+                "PARTIAL",
+            ),
+            (BreakoutSignalEngines.engine_8_ecosystem_flow, {}, "MISSING"),
+        )
+        for engine, row, expected_status in cases:
+            with self.subTest(engine=engine.__name__):
+                score, details = engine(row)
+                self.assertEqual(score, 0.0)
+                self.assertEqual(details["evidence_status"], expected_status)
+
+    def test_conflicting_measurements_are_not_scored(self):
+        score, details = BreakoutSignalEngines.engine_5_accumulation_detection({
+            "change_24h_pct": 12.0,
+            "change_24h": -12.0,
+            "change_6h_pct": 5.0,
+            "change_1h_pct": 3.0,
+        })
+        self.assertEqual(score, 0.0)
+        self.assertEqual(details["evidence_status"], "CONFLICTING")
+
+    def test_measured_zero_is_distinct_from_missing_volume(self):
+        score, details = BreakoutSignalEngines.engine_2_volume_intelligence({
+            "volume_5m": 0.0,
+            "volume_1h": 0.0,
+            "volume_24h_usd": 0.0,
+            "liquidity_usd": 1_000.0,
+        })
+        self.assertEqual(score, 0.0)
+        self.assertEqual(details["evidence_status"], "VERIFIED")
+
+    def test_stale_measurements_are_not_scored(self):
+        score, details = BreakoutSignalEngines.engine_5_accumulation_detection({
+            "change_24h_pct": 12.0,
+            "change_6h_pct": 5.0,
+            "change_1h_pct": 3.0,
+            "evidence_stale_fields": ["change_1h_pct"],
+        })
+        self.assertEqual(score, 0.0)
+        self.assertEqual(details["evidence_status"], "STALE")
+
+    def test_confluence_requires_minimum_measured_evidence_and_risk_inputs(self):
+        result = BreakoutSignalEngines.evaluate_all_engines({})
+        self.assertEqual(result["breakout_confluence_score"], 0.0)
+        self.assertFalse(result["breakout_evidence_eligible"])
+        self.assertEqual(result["evidence_status"], "MISSING")
+        self.assertEqual(result["confluence_tier"], "INSUFFICIENT_EVIDENCE")
+
+    def test_target_and_liquidity_alone_do_not_create_expected_return_estimates(self):
+        result = ExpectedReturnEngine.estimate_outcomes(
+            {"potential_pct": 40.0, "liquidity_usd": 100_000.0}
+        )
+        self.assertIsNone(result["probability_tp_hit_24h"])
+        self.assertIsNone(result["expected_net_24h_return_pct"])
+        self.assertEqual(result["evidence_confidence_pct"], 0.0)
+        self.assertEqual(result["forecast_status"], "INSUFFICIENT_EVIDENCE")
+
+    def test_expected_return_rejects_untrusted_engine_status(self):
+        row = {
+            "potential_pct": 40.0,
+            "change_1h_pct": 3.0,
+            "change_5m_pct": 1.0,
+            "change_24h_pct": 10.0,
+            "liquidity_usd": 100_000.0,
+            "volume_24h_usd": 20_000.0,
+        }
+        confluence = _eligible_confluence(80.0)
+        confluence["engine_evidence_status"]["engine_9_risk_safety"] = "MISSING"
+        result = ExpectedReturnEngine.estimate_outcomes(row, confluence)
+        self.assertIsNone(result["probability_tp_hit_24h"])
+        self.assertEqual(result["forecast_status"], "INSUFFICIENT_EVIDENCE")
+
     def test_engine_9_risk_intelligence(self):
         safe_row = {
             "liquidity_usd": 150_000.0,
             "age_hours": 18.0,
+            "change_1h_pct": 3.0,
             "change_24h_pct": 35.0,
             "volume_24h_usd": 200_000.0,
         }
@@ -115,6 +214,14 @@ class TestBreakoutSignalEngines(unittest.TestCase):
             "liquidity_usd": 120_000.0,
             "dexpaprika_1h_buy_usd": 70_000.0,
             "dexpaprika_1h_sell_usd": 30_000.0,
+            "potential_pct": 40.0,
+            "fdv": 500_000.0,
+            "wallet_evidence": {
+                "smart_trader_count": 0,
+                "top_10_holders_share_pct": 50.0,
+            },
+            "ecosystem_flow_score": 1.0,
+            "cross_provider_corroboration": {"provider_count": 0},
             "age_hours": 12.0,
         }
         res = BreakoutSignalEngines.evaluate_all_engines(row)
@@ -145,8 +252,9 @@ class TestExpectedReturnEngine(unittest.TestCase):
             "change_24h_pct": 30.0,
             "liquidity_usd": 85_000.0,
             "volume_24h_usd": 180_000.0,
+            "cross_provider_corroboration": {"provider_count": 2},
         }
-        confluence = {"breakout_confluence_score": 75.0}
+        confluence = _eligible_confluence(75.0)
         outcomes = ExpectedReturnEngine.estimate_outcomes(row, confluence)
 
         self.assertIn("probability_tp_hit_24h_pct", outcomes)
@@ -166,20 +274,29 @@ class TestExpectedReturnEngine(unittest.TestCase):
         asset_a = {
             "potential_pct": 120.0,
             "change_1h_pct": 75.0,  # Blow-off top
+            "change_5m_pct": 5.0,
             "change_24h_pct": 250.0,
             "liquidity_usd": 12_000.0,  # Thin liquidity
+            "volume_24h_usd": 100_000.0,
+            "potential_pct": 120.0,
+            "potential_mfe_24h_pct": 120.0,
+            "cross_provider_corroboration": {"provider_count": 1},
         }
-        confluence_a = {"breakout_confluence_score": 35.0}
+        confluence_a = _eligible_confluence(35.0)
         outcomes_a = ExpectedReturnEngine.estimate_outcomes(asset_a, confluence_a)
 
         # Asset B: Moderate TP (50%), strong confluence (80), healthy volume & liquidity
         asset_b = {
             "potential_pct": 50.0,
             "change_1h_pct": 12.0,
+            "change_5m_pct": 1.0,
             "change_24h_pct": 25.0,
             "liquidity_usd": 150_000.0,
+            "volume_24h_usd": 100_000.0,
+            "potential_pct": 50.0,
+            "cross_provider_corroboration": {"provider_count": 2},
         }
-        confluence_b = {"breakout_confluence_score": 82.0}
+        confluence_b = _eligible_confluence(82.0)
         outcomes_b = ExpectedReturnEngine.estimate_outcomes(asset_b, confluence_b)
 
         # Probability for Asset B should be significantly higher

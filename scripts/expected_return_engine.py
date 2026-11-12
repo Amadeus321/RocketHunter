@@ -44,15 +44,43 @@ class ExpectedReturnEngine:
         meets_mandatory_tp = bool(tp_target_pct is not None and tp_target_pct >= MANDATORY_MIN_TP_PCT)
 
         # 2. Confluence & Velocity Inputs
-        confluence_score = 50.0
-        if confluence_profile:
-            confluence_score = float(confluence_profile.get("breakout_confluence_score") or 50.0)
+        confluence_score = None
+        if (
+            isinstance(confluence_profile, dict)
+            and confluence_profile.get("breakout_evidence_eligible") is True
+        ):
+            coverage = _clean_num(confluence_profile.get("evidence_coverage_pct"))
+            candidate_score = _clean_num(confluence_profile.get("breakout_confluence_score"))
+            engine_status = confluence_profile.get("engine_evidence_status")
+            required_engines = (
+                "engine_1_momentum_acceleration",
+                "engine_2_volume_intelligence",
+                "engine_3_buy_sell_pressure",
+                "engine_4_liquidity_depth",
+                "engine_5_accumulation_detection",
+                "engine_6_smart_money",
+                "engine_7_breakout_prediction",
+                "engine_8_ecosystem_flow",
+            )
+            statuses_valid = (
+                isinstance(engine_status, dict)
+                and all(engine_status.get(key) in {"VERIFIED", "PARTIAL", "MISSING"} for key in required_engines)
+                and engine_status.get("engine_9_risk_safety") == "VERIFIED"
+            )
+            if coverage is not None and coverage >= 75.0 and candidate_score is not None and statuses_valid:
+                confluence_score = candidate_score
 
-        p1 = _clean_num(row.get("change_1h_pct") or row.get("change_1h")) or 0.0
-        p5 = _clean_num(row.get("change_5m_pct") or row.get("change_5m")) or 0.0
-        p24 = _clean_num(row.get("change_24h_pct") or row.get("change_24h")) or 0.0
-        liq = _clean_num(row.get("liquidity_usd") or row.get("best_liquidity_pool_usd"))
-        vol = _clean_num(row.get("volume_24h_usd") or row.get("volume_24h"))
+        def first_measurement(*keys: str) -> float | None:
+            for key in keys:
+                if row.get(key) is not None and row.get(key) != "":
+                    return _clean_num(row.get(key))
+            return None
+
+        p1 = first_measurement("change_1h_pct", "change_1h")
+        p5 = first_measurement("change_5m_pct", "change_5m")
+        p24 = first_measurement("change_24h_pct", "change_24h")
+        liq = first_measurement("liquidity_usd", "best_liquidity_pool_usd")
+        vol = first_measurement("volume_24h_usd", "volume_24h")
 
         # If mandatory target is missing, record explicit missing values without synthetic defaults
         if tp_target_pct is None:
@@ -100,6 +128,38 @@ class ExpectedReturnEngine:
                 "forecast_status": "UNAVAILABLE_LIQUIDITY_UNMEASURED",
                 "is_calibrated_empirical_model": False,
                 "empirical_validation_status": "LIQUIDITY_UNMEASURED",
+            }
+
+        if confluence_score is None or any(value is None for value in (p1, p5, p24, vol)):
+            return {
+                "model_version": EXPECTED_RETURN_MODEL_VERSION,
+                "meets_mandatory_40pct_tp": meets_mandatory_tp,
+                "meets_mandatory_single_tp": meets_mandatory_tp,
+                "single_tp_target_pct": tp_target_pct,
+                "technical_tp_potential_pct": tp_target_pct,
+                "probability_tp_hit_24h": None,
+                "probability_tp_hit_24h_pct": None,
+                "expected_net_24h_return_pct": None,
+                "potential_mfe_24h_pct": None,
+                "potential_mae_24h_pct": None,
+                "estimated_hours_to_target": None,
+                "slippage_drag_pct": None,
+                "reversal_risk_score": None,
+                "evidence_confidence_pct": 0.0,
+                "realistic_opportunity_rank": 0.0,
+                "forecast_type": "HEURISTIC_PREBREAKOUT_ESTIMATE (UNCALIBRATED)",
+                "forecast_status": "INSUFFICIENT_EVIDENCE",
+                "missing_measurements": [
+                    name for name, value in (
+                        ("eligible_confluence", confluence_score),
+                        ("1h_price_change", p1),
+                        ("5m_price_change", p5),
+                        ("24h_price_change", p24),
+                        ("24h_volume", vol),
+                    ) if value is None
+                ],
+                "is_calibrated_empirical_model": False,
+                "empirical_validation_status": "INSUFFICIENT_EVIDENCE",
             }
 
         # 3. Probability of reaching target within 24 hours (Heuristic excursion model)
@@ -150,12 +210,7 @@ class ExpectedReturnEngine:
         reversal_risk_score = round(min(98.0, max(5.0, reversal_risk)), 1)
 
         # 10. Evidence Confidence & Completeness
-        corroboration = row.get("cross_provider_corroboration") or {}
-        prov_cnt = corroboration.get("provider_count") or 1
-        has_volume = bool(vol is not None and vol > 10_000)
-        has_liquidity = bool(liq is not None and liq > 15_000)
-        confidence = 0.5 + (0.15 * min(3, prov_cnt)) + (0.1 if has_volume else 0.0) + (0.1 if has_liquidity else 0.0)
-        evidence_confidence_pct = round(min(100.0, confidence * 100.0), 1)
+        evidence_confidence_pct = 100.0
 
         # 11. Realistic Opportunity Rank Score
         # Prioritizes high expected net return and win probability over speculative inflated TP

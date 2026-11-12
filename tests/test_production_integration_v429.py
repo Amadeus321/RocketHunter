@@ -192,8 +192,21 @@ class ProductionIntegrationV429Tests(unittest.TestCase):
             "volume_24h_usd": 100000.0,
             "early_breakout_score": 75.0,
             "breakout_confluence_score": 75.0,
+            "breakout_evidence_eligible": True,
+            "evidence_coverage_pct": 100.0,
             "realistic_opportunity_rank": 80.0,
             "executable_route_verified": True,
+            "engine_evidence_status": {
+                "engine_1_momentum_acceleration": "VERIFIED",
+                "engine_2_volume_intelligence": "VERIFIED",
+                "engine_3_buy_sell_pressure": "VERIFIED",
+                "engine_4_liquidity_depth": "VERIFIED",
+                "engine_5_accumulation_detection": "VERIFIED",
+                "engine_6_smart_money": "VERIFIED",
+                "engine_7_breakout_prediction": "VERIFIED",
+                "engine_8_ecosystem_flow": "VERIFIED",
+                "engine_9_risk_safety": "VERIFIED",
+            },
             "engine_scores": {
                 "engine_1_momentum_acceleration": 90.0,
                 "engine_2_volume_intelligence": 50.0,
@@ -213,6 +226,25 @@ class ProductionIntegrationV429Tests(unittest.TestCase):
              }):
             actionable, _ = refresh_and_filter_candidates([candidate], min_potential_pct=40.0)
             self.assertEqual(len(actionable), 1)
+
+    def test_incomplete_engine_evidence_cannot_be_actionable(self):
+        candidate = {
+            "pair": "PARTIAL/SOL",
+            "chain": "solana",
+            "pool_address": "5tYFviFWQRKV9BJSTHGitbdqEYC1BGUgRUDnSADUXqJP",
+            "contract_address": "CGEDT9QZDvvH5GmVkWJH2BXiMJqMJySC9ihWyr7Spump",
+            "price": 1.0,
+            "final_price_usd": 1.0,
+            "target_price": 1.50,
+            "liquidity_usd": 50000.0,
+            "executable_route_verified": True,
+            "engine_scores": {"engine_1_momentum_acceleration": 95.0},
+        }
+        with patch("scripts.live_price_verifier.run_comprehensive_security_check", return_value=(False, "PASSED")), \
+             patch("scripts.live_price_verifier.verify_live_dexscreener_prices", return_value={}):
+            actionable, watchlist = refresh_and_filter_candidates([candidate], min_potential_pct=40.0)
+        self.assertEqual(actionable, [])
+        self.assertEqual(len(watchlist), 1)
 
     def test_expected_return_engine_no_invented_defaults(self):
         """Verifies ExpectedReturnEngine returns None for missing TP without defaulting to +40%."""

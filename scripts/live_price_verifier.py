@@ -653,28 +653,50 @@ def refresh_and_filter_candidates(
 
     def _rocket_conviction_score(c: dict[str, Any]) -> float:
         """Ranks candidates by AURA learned feature weights, 9-engine breakout confluence, and realistic expected return."""
+        if c.get("breakout_evidence_eligible") is not True:
+            return 0.0
+        evidence_coverage = c.get("evidence_coverage_pct")
+        try:
+            if float(evidence_coverage) < 75.0:
+                return 0.0
+        except (TypeError, ValueError):
+            return 0.0
+
         pot = float(c.get("tp_upside_pct") or c.get("potential_pct") or 0.0)
-        early = float(c.get("early_breakout_score") or 0.0)
-        confl = float(c.get("breakout_confluence_score") or early)
+        confl = float(c.get("breakout_confluence_score") or 0.0)
         opp_rank = float(c.get("realistic_opportunity_rank") or 0.0)
-        vol = float(c.get("volume_24h_usd") or 0.0)
-        liq = float(c.get("liquidity_usd") or 0.0)
-        turnover = (vol / liq) if liq > 0 else 0.0
-        turnover_score = min(25.0, math.log1p(turnover) * 10.0)
 
         # Scale upside potential: reward assets with realistic explosive gains
         upside_component = min(50.0, (pot / 8.0))
 
-        engs = c.get("engine_scores") or c.get("engines") or {}
-        feat_momentum = float(engs.get("engine_1_momentum_acceleration", early or confl))
-        feat_volume = float(engs.get("engine_2_volume_intelligence", min(100.0, turnover_score * 4.0)))
-        feat_cvd = float(engs.get("engine_3_buy_sell_pressure", 50.0))
-        feat_liq = float(engs.get("engine_4_liquidity_depth", engs.get("engine_4_liquidity_intelligence", 50.0)))
-        feat_accum = float(engs.get("engine_5_accumulation_detection", 50.0))
-        feat_smart = float(engs.get("engine_6_smart_money", 50.0))
-        feat_breakout = float(engs.get("engine_7_breakout_prediction", early or 50.0))
-        feat_eco = float(engs.get("engine_8_ecosystem_flow", 50.0))
-        feat_risk = float(engs.get("engine_9_risk_safety", 85.0))
+        engs = c.get("engine_scores") or c.get("engines") or c.get("breakout_engine_scores") or {}
+        evidence = c.get("engine_evidence_status") or {}
+        score_keys = (
+            "engine_1_momentum_acceleration", "engine_2_volume_intelligence",
+            "engine_3_buy_sell_pressure", "engine_4_liquidity_depth",
+            "engine_5_accumulation_detection", "engine_6_smart_money",
+            "engine_7_breakout_prediction", "engine_8_ecosystem_flow",
+            "engine_9_risk_safety",
+        )
+        if not isinstance(engs, dict) or not isinstance(evidence, dict):
+            return 0.0
+        if any(evidence.get(key) not in {"VERIFIED", "PARTIAL"} for key in score_keys):
+            return 0.0
+        try:
+            scores = {key: float(engs[key]) for key in score_keys}
+        except (KeyError, TypeError, ValueError):
+            return 0.0
+        if any(not math.isfinite(value) for value in scores.values()):
+            return 0.0
+        feat_momentum = scores["engine_1_momentum_acceleration"]
+        feat_volume = scores["engine_2_volume_intelligence"]
+        feat_cvd = scores["engine_3_buy_sell_pressure"]
+        feat_liq = scores["engine_4_liquidity_depth"]
+        feat_accum = scores["engine_5_accumulation_detection"]
+        feat_smart = scores["engine_6_smart_money"]
+        feat_breakout = scores["engine_7_breakout_prediction"]
+        feat_eco = scores["engine_8_ecosystem_flow"]
+        feat_risk = scores["engine_9_risk_safety"]
 
         w_momentum = float(aura_weights.get("momentum_acceleration", 0.90))
         w_vol = float(aura_weights.get("volume_intelligence", 0.90))
@@ -741,7 +763,7 @@ def refresh_and_filter_candidates(
             or str(c.get("verification_status") or "").upper() == "QUALIFIED"
         )
 
-        if upstream_qualified and len(actionable) < 10:
+        if c.get("breakout_evidence_eligible") is True and upstream_qualified and len(actionable) < 10:
             if is_cex or (pool and contract and chain and pool not in ("—", "unknown", "None")
                     and contract not in ("—", "unknown", "None") and liq >= 15000.0):
                 cp = dict(c)
