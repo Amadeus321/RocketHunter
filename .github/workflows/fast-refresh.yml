@@ -1,6 +1,8 @@
 name: Free-data fast market refresh
 
 on:
+  schedule:
+    - cron: '0 */6 * * *'
   workflow_dispatch:
 
 permissions:
@@ -36,8 +38,12 @@ jobs:
           python -m scripts.v420_upgrade --self-test
       - name: Restore persistent scanner memory branch
         run: |
-          git fetch origin scanner-memory:refs/remotes/origin/scanner-memory
-          git worktree add /tmp/scanner-memory refs/remotes/origin/scanner-memory
+          if git fetch origin scanner-memory:refs/remotes/origin/scanner-memory 2>/dev/null; then
+            git worktree add /tmp/scanner-memory refs/remotes/origin/scanner-memory
+          else
+            echo "scanner-memory branch not found on remote; initializing fresh branch."
+            git worktree add -B scanner-memory /tmp/scanner-memory
+          fi
       - name: Refresh sampled public DEX, token lead and aggregator feeds
         run: python -m scripts.v418_fast_refresh --outdir fast-run --memory-dir /tmp/scanner-memory --run-id "$GITHUB_RUN_ID"
       - name: Persist compact forecast and outcome ledger
