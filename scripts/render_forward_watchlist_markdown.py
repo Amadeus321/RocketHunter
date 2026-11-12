@@ -17,12 +17,13 @@ except ImportError:
     from tp_gate import canonical_tp_upside
 
 try:
-    from scripts.live_price_verifier import refresh_and_filter_candidates, is_valid_web3_address
+    from scripts.live_price_verifier import refresh_and_filter_candidates, is_valid_web3_address, run_comprehensive_security_check
 except ImportError:
     try:
-        from live_price_verifier import refresh_and_filter_candidates, is_valid_web3_address
+        from live_price_verifier import refresh_and_filter_candidates, is_valid_web3_address, run_comprehensive_security_check
     except ImportError:
         refresh_and_filter_candidates = None
+        run_comprehensive_security_check = None
         def is_valid_web3_address(addr: str) -> bool:
             return bool(addr and len(str(addr).strip()) >= 10 and not str(addr).strip().isdigit())
 
@@ -220,8 +221,12 @@ def _filter_min_potential(candidates: list[dict[str, Any]], min_potential: float
         if liq is not None and liq < 15000.0:
             continue
         flags = set(c.get("early_breakout_risk_flags") or []) | set(c.get("risk_flags") or [])
-        if "EXTREME_THIN_LIQUIDITY" in flags or "LIQUIDITY_UNDER_5000_USD" in flags:
+        if any("HONEYPOT" in f or "UNLOCKED_LP" in f or "WASH_TRADING" in f or "EXTREME_THIN_LIQUIDITY" in f or "LIQUIDITY_UNDER_5000_USD" in f for f in flags):
             continue
+        if run_comprehensive_security_check:
+            is_bad, _ = run_comprehensive_security_check(c)
+            if is_bad:
+                continue
         if potential > 1000.0:
             quality = c.get("quality_gate") if isinstance(c.get("quality_gate"), dict) else {}
             if not quality.get("execution_ready") and not c.get("final_price_verified"):

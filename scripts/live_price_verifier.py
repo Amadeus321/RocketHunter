@@ -42,6 +42,7 @@ DEFILLAMA_PRICES_API = "https://coins.llama.fi/prices/current/{coins}"
 GOPLUS_SECURITY_API = "https://api.gopluslabs.io/api/v1/token_security/{chain_id}?contract_addresses={tokens}"
 GECKOTERMINAL_TOKEN_API = "https://api.geckoterminal.com/api/v2/networks/{network}/tokens/{address}/info"
 RUGCHECK_API = "https://api.rugcheck.xyz/v1/tokens/{mint}/report/summary"
+HONEYPOT_IS_API = "https://api.honeypot.is/v2/IsHoneypot?address={address}&chainID={chain_id}"
 
 CHAIN_MAP_GOPLUS = {
     "ethereum": "1",
@@ -164,65 +165,77 @@ def check_honeypot(pair_data: dict[str, Any]) -> tuple[bool, str]:
     return False, "PASS"
 
 
-def check_goplus_security(chain: str, contract_address: str) -> tuple[bool, str]:
-    """Check GoPlus Security API for open-source status, sell tax, honeypot flags, and trade restrictions."""
+def check_goplus_security(chain: str, contract_address: str) -> tuple[bool, str, int | None]:
+    """Check GoPlus Security API for open-source status, sell tax, honeypot flags, LP locks, and trade restrictions."""
     chain_norm = chain.lower().strip()
     chain_id = CHAIN_MAP_GOPLUS.get(chain_norm)
     if not chain_id or chain_id == "solana" or not contract_address or len(contract_address) < 10:
-        return False, "PASS"
+        return False, "PASS", None
 
     contract_lower = contract_address.lower().strip()
     url = GOPLUS_SECURITY_API.format(chain_id=chain_id, tokens=contract_lower)
     data = _http_get_json(url, timeout=5.0)
     if not isinstance(data, dict):
-        return False, "PASS"
+        return False, "PASS", None
 
     result = data.get("result") or {}
     token_info = result.get(contract_lower) or {}
     if not token_info:
-        return False, "PASS"
+        return False, "PASS", None
 
     # Check is_open_source (Closed source contracts hide honeypots, e.g. ANTAI/WBNB, GEL/USDC)
     is_os = token_info.get("is_open_source")
     if is_os in (0, "0", False):
-        return True, "GOPLUS_CLOSED_SOURCE_RISK: Contract not open-source (unverified bytecode)"
+        return True, "GOPLUS_CLOSED_SOURCE_RISK: Contract not open-source (unverified bytecode)", None
 
     # Check is_honeypot
     is_hp = token_info.get("is_honeypot")
     if is_hp in (1, "1", True):
-        return True, "GOPLUS_HONEYPOT_CONFIRMED"
+        return True, "GOPLUS_HONEYPOT_CONFIRMED: Hard honeypot flag active", None
 
     # Check cannot_sell_all
     cannot_sell = token_info.get("cannot_sell_all")
     if cannot_sell in (1, "1", True):
-        return True, "GOPLUS_CANNOT_SELL_ALL"
+        return True, "GOPLUS_CANNOT_SELL_ALL: Sell restriction detected", None
 
     # Check cannot_buy
     cannot_buy = token_info.get("cannot_buy")
     if cannot_buy in (1, "1", True):
-        return True, "GOPLUS_CANNOT_BUY"
+        return True, "GOPLUS_CANNOT_BUY: Buy restriction detected", None
+
+    # Check honeypot history with same creator
+    if token_info.get("honeypot_with_same_creator") in (1, "1", True):
+        return True, "GOPLUS_HONEYPOT_CREATOR_HISTORY: Deployer has prior honeypot history", None
 
     # Check airdrop scam
     if token_info.get("is_airdrop_scam") in (1, "1", True):
-        return True, "GOPLUS_AIRDROP_SCAM"
+        return True, "GOPLUS_AIRDROP_SCAM: Flagged as airdrop phishing scam", None
 
     # Check slippage/tax modifiable
     if token_info.get("slippage_modifiable") in (1, "1", True):
-        return True, "GOPLUS_MODIFIABLE_TAX_OR_SLIPPAGE"
+        return True, "GOPLUS_MODIFIABLE_TAX_OR_SLIPPAGE: Creator can alter tax fees arbitrarily", None
 
     # Check transfer pausable
     if token_info.get("transfer_pausable") in (1, "1", True):
-        return True, "GOPLUS_TRANSFER_PAUSABLE"
+        return True, "GOPLUS_TRANSFER_PAUSABLE: Transfers can be frozen by admin", None
 
     # Check blacklist function
     if token_info.get("is_blacklisted") in (1, "1", True):
-        return True, "GOPLUS_BLACKLIST_FUNCTION_DETECTED"
+        return True, "GOPLUS_BLACKLIST_FUNCTION_DETECTED: Blacklist function present", None
+
+    # Check anti-whale modifiable
+    if token_info.get("anti_whale_modifiable") in (1, "1", True):
+        return True, "GOPLUS_ANTI_WHALE_MODIFIABLE: Creator can freeze user sells via anti-whale limits", None
+
+    # Check trading cooldown
+    if token_info.get("trading_cooldown") in (1, "1", True):
+        return True, "GOPLUS_TRADING_COOLDOWN: Artificial trading cooldown restriction active", None
 
     # Check sell tax (> 10% is predatory/honeypot, e.g. PRIORS/WBNB with 99% sell tax)
     try:
         sell_tax = float(token_info.get("sell_tax") or 0.0)
         if sell_tax > 0.10:
-            return True, f"GOPLUS_EXCESSIVE_SELL_TAX: {sell_tax * 100:.1f}%"
+            return True, f"GOPLUS_EXCESSIVE_SELL_TAX: {sell_tax * 100:.1f}%", None
     except (ValueError, TypeError):
         pass
 
@@ -230,9 +243,128 @@ def check_goplus_security(chain: str, contract_address: str) -> tuple[bool, str]
     try:
         buy_tax = float(token_info.get("buy_tax") or 0.0)
         if buy_tax > 0.10:
-            return True, f"GOPLUS_EXCESSIVE_BUY_TAX: {buy_tax * 100:.1f}%"
+            return True, f"GOPLUS_EXCESSIVE_BUY_TAX: {buy_tax * 100:.1f}%", None
     except (ValueError, TypeError):
         pass
+
+    # Strict LP Lock & Rug-Pull Protection:
+    # If the liquidity pool is unlocked or creator retains majority of LP, creator can rug at any time (e.g. HUNG/WBNB)
+    lp_holders = token_info.get("lp_holders") or []
+    creator = str(token_info.get("creator_address") or "").lower().strip()
+    total_locked_pct = 0.0
+    creator_unlocked_pct = 0.0
+    for h in lp_holders:
+        addr = str(h.get("address") or "").lower().strip()
+        is_locked = int(h.get("is_locked") or 0)
+        pct = float(h.get("percent") or 0.0) * 100.0
+        if is_locked == 1 or "dead" in addr or addr == "0x0000000000000000000000000000000000000000":
+            total_locked_pct += pct
+        elif addr == creator or int(h.get("is_contract") or 0) == 0:
+            creator_unlocked_pct += pct
+
+    if lp_holders and total_locked_pct < 50.0:
+        return True, f"GOPLUS_UNLOCKED_LP_RISK: Only {total_locked_pct:.1f}% LP locked (unlocked LP rug risk)", None
+    if creator_unlocked_pct >= 20.0:
+        return True, f"GOPLUS_CREATOR_HOLDS_LP: Creator/EOA holds {creator_unlocked_pct:.1f}% unlocked LP", None
+
+    # Top holders supply concentration check (excluding pool pairs and burn address)
+    holders = token_info.get("holders") or []
+    top_non_pool_pct = 0.0
+    non_pool_count = 0
+    for h in holders:
+        addr = str(h.get("address") or "").lower().strip()
+        is_contract = int(h.get("is_contract") or 0)
+        pct = float(h.get("percent") or 0.0) * 100.0
+        if "dead" in addr or addr == "0x0000000000000000000000000000000000000000":
+            continue
+        if is_contract == 1:
+            continue
+        top_non_pool_pct += pct
+        non_pool_count += 1
+        if non_pool_count >= 10:
+            break
+
+    if non_pool_count >= 5 and top_non_pool_pct >= 65.0:
+        return True, f"GOPLUS_HIGH_HOLDER_CONCENTRATION: Top individual holders hold {top_non_pool_pct:.1f}% supply", None
+
+    holder_count = None
+    try:
+        hc = int(token_info.get("holder_count") or 0)
+        if hc > 0:
+            holder_count = hc
+    except (ValueError, TypeError):
+        pass
+
+    return False, "PASS", holder_count
+
+
+def check_wash_trading(pair_data: dict[str, Any], holder_count: int | None = None) -> tuple[bool, str]:
+    """Detect artificial volume churn, bot wash trading, and low-holder pump traps."""
+    vol = pair_data.get("volume") or {}
+    liq = pair_data.get("liquidity") or {}
+    txns = pair_data.get("txns") or {}
+    h24 = txns.get("h24") or {}
+
+    vol_24h = float(vol.get("h24") or 0.0)
+    usd_liq = float(liq.get("usd") or 0.0)
+    buys_24 = int(h24.get("buys") or 0)
+    sells_24 = int(h24.get("sells") or 0)
+    total_txns_24 = buys_24 + sells_24
+
+    if vol_24h >= 50000.0:
+        # 1. Anomalous Volume-to-Liquidity Turnover (e.g. $1.4M vol on $50k liquidity with 180 holders)
+        turnover = vol_24h / max(1000.0, usd_liq)
+        if turnover >= 10.0 and (total_txns_24 < 500 or (holder_count is not None and holder_count < 300)):
+            return True, f"WASH_TRADING_ANOMALOUS_TURNOVER: {turnover:.1f}x 24h volume/liquidity ratio with {total_txns_24} txns / {holder_count or 'few'} holders"
+
+        # 2. Concentrated Average Trade Size on Low Holder Base
+        avg_trade = vol_24h / max(1, total_txns_24)
+        if avg_trade >= 2000.0 and (holder_count is not None and holder_count < 400) and usd_liq < 100000.0:
+            return True, f"WASH_TRADING_CONCENTRATED_SIZE: Avg ${avg_trade:,.0f}/trade on low holder base ({holder_count} holders)"
+
+        # 3. Dead Activity After High Volume Spike (wash trading pump aftermath)
+        vol_1h = float(vol.get("h1") or 0.0)
+        h1_txns = int((txns.get("h1") or {}).get("buys") or 0) + int((txns.get("h1") or {}).get("sells") or 0)
+        if vol_24h > 100000.0 and vol_1h < 500.0 and h1_txns <= 2:
+            return True, "WASH_TRADING_DEAD_AFTERMATH: Inactive token with artificial 24h volume churn"
+
+    return False, "PASS"
+
+
+def check_honeypot_is(chain: str, contract_address: str) -> tuple[bool, str]:
+    """Simulate execution on Honeypot.is API for EVM tokens."""
+    chain_map = {
+        "bsc": 56, "binance": 56,
+        "eth": 1, "ethereum": 1,
+        "base": 8453,
+        "arbitrum": 42161,
+        "polygon": 137, "polygon_pos": 137,
+        "avalanche": 43114, "avax": 43114,
+    }
+    chain_id = chain_map.get(chain.lower().strip())
+    if not chain_id or not contract_address or len(contract_address) < 10:
+        return False, "PASS"
+
+    url = HONEYPOT_IS_API.format(address=contract_address.strip(), chain_id=chain_id)
+    data = _http_get_json(url, timeout=4.0)
+    if not isinstance(data, dict):
+        return False, "PASS"
+
+    hp_res = data.get("honeypotResult") or {}
+    if hp_res.get("isHoneypot") is True:
+        reason = hp_res.get("honeypotReason") or "Token cannot be sold on DEX (Honeypot confirmed)"
+        return True, f"HONEYPOT_IS_CONFIRMED: {reason}"
+
+    summary = data.get("summary") or {}
+    risk = str(summary.get("risk") or "").lower()
+    if risk in ("extremely_high", "high"):
+        flags = summary.get("flags") or []
+        flag_str = ", ".join(flags) if flags else risk
+        return True, f"HONEYPOT_IS_HIGH_RISK: {flag_str}"
+
+    if data.get("simulationSuccess") is False:
+        sim_err = str(data.get("simulationError") or "Execution simulation reverted")
+        return True, f"HONEYPOT_SIMULATION_REVERTED: {sim_err}"
 
     return False, "PASS"
 
@@ -334,7 +466,7 @@ def is_valid_web3_address(addr: str) -> bool:
 
 
 def run_comprehensive_security_check(c: dict[str, Any], pair_info: dict[str, Any] | None = None) -> tuple[bool, str]:
-    """Run all 4 defense layers: DexScreener, GoPlus, GeckoTerminal, and RugCheck."""
+    """Run all 6 defense layers: GoPlus (LP lock & holders), DexScreener honeypot, Wash trading, Honeypot.is, GeckoTerminal, and RugCheck."""
     pool = str(c.get("pool_address") or c.get("pair_address") or "").strip()
     contract = str(c.get("contract_address") or c.get("token_contract") or "").strip()
     chain = str(c.get("chain") or "").strip().lower()
@@ -345,25 +477,41 @@ def run_comprehensive_security_check(c: dict[str, Any], pair_info: dict[str, Any
     if contract and contract not in ("—", "unknown", "None") and not is_valid_web3_address(contract):
         return True, f"INVALID_TOKEN_CONTRACT_FORMAT: '{contract}'"
 
-    # 1. DexScreener layer
+    holder_count = None
+
+    # 1. GoPlus Security Layer (EVM) - includes LP lock, creator holdings, and honeypot flags
+    if contract and chain and chain in CHAIN_MAP_GOPLUS and chain != "solana":
+        is_hp, reason, hc = check_goplus_security(chain, contract)
+        if hc is not None:
+            holder_count = hc
+        if is_hp:
+            return True, reason
+
+    # 2. DexScreener Honeypot & Dump Layer
     if pair_info:
         is_hp, reason = check_honeypot(pair_info)
         if is_hp:
             return True, reason
 
-    # 2. GoPlus Security Layer (EVM)
-    if contract and chain and chain in CHAIN_MAP_GOPLUS and chain != "solana":
-        is_hp, reason = check_goplus_security(chain, contract)
+    # 3. Wash Trading Anomaly Layer
+    if pair_info:
+        is_wt, reason = check_wash_trading(pair_info, holder_count)
+        if is_wt:
+            return True, reason
+
+    # 4. Honeypot.is On-Chain Simulation Layer (EVM)
+    if contract and chain and chain not in ("solana", "sol"):
+        is_hp, reason = check_honeypot_is(chain, contract)
         if is_hp:
             return True, reason
 
-    # 3. GeckoTerminal GT Security Score Layer
+    # 5. GeckoTerminal GT Security Score Layer
     if contract and chain and chain in CHAIN_MAP_GECKO:
         is_hp, reason = check_geckoterminal_security(chain, contract)
         if is_hp:
             return True, reason
 
-    # 4. RugCheck Layer (Solana)
+    # 6. RugCheck Layer (Solana)
     if chain in ("solana", "sol") and contract:
         is_hp, reason = check_rugcheck_solana(contract)
         if is_hp:
@@ -523,27 +671,41 @@ def refresh_and_filter_candidates(
     # Sort strictly by AURA explosive rocket power score
     valid_candidates.sort(key=lambda x: -_rocket_conviction_score(x))
 
-    # Split: top 10 with verified pools into actionable; remaining into research watchlist
+    # Split: ONLY legitimately qualified/execution-ready candidates into actionable; remaining into research watchlist
     actionable = []
     watchlist = []
 
     for c in valid_candidates:
         pool = str(c.get("pool_address") or c.get("pair_address") or "").strip()
         contract = str(c.get("contract_address") or c.get("token_contract") or "").strip()
-        chain = str(c.get("chain") or "").strip()
+        chain = str(c.get("chain") or "").strip().lower()
         liq = float(c.get("liquidity_usd") or 0)
+        mkt_type = str(c.get("market_type") or "").lower()
 
-        if (pool and contract and chain and pool not in ("—", "unknown", "None")
-                and contract not in ("—", "unknown", "None") and liq >= 15000.0 and len(actionable) < 10):
-            cp = dict(c)
-            cp["output_category"] = "VERIFIED_ACTIONABLE_OPPORTUNITY"
-            cp["verification_status"] = "QUALIFIED"
-            cp["safety_status"] = "PASS"
-            cp["execution_status"] = "PASS"
-            cp["final_pool_address"] = pool
-            cp["final_token_contract"] = contract
-            actionable.append(cp)
-        else:
-            watchlist.append(c)
+        # STRICT ACTIONABLE CRITERIA:
+        # Candidate MUST be genuinely verified/execution-ready by upstream audit
+        # NEVER promote unverified research candidates into Section 1!
+        is_cex = mkt_type == "cex_spot" or "CEX" in str(pool)
+        upstream_qualified = (
+            bool(c.get("executable_route_verified"))
+            or str(c.get("entry_decision") or "").upper() == "QUALIFIED"
+            or str(c.get("verification_status") or "").upper() == "QUALIFIED"
+        )
+
+        if upstream_qualified and len(actionable) < 10:
+            if is_cex or (pool and contract and chain and pool not in ("—", "unknown", "None")
+                    and contract not in ("—", "unknown", "None") and liq >= 15000.0):
+                cp = dict(c)
+                cp["output_category"] = "VERIFIED_ACTIONABLE_OPPORTUNITY"
+                cp["verification_status"] = "QUALIFIED"
+                cp["safety_status"] = "PASS"
+                cp["execution_status"] = "PASS"
+                cp["final_pool_address"] = pool
+                cp["final_token_contract"] = contract
+                actionable.append(cp)
+                continue
+
+        # Otherwise it remains in research watchlist (Section 2)
+        watchlist.append(c)
 
     return actionable, watchlist

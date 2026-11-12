@@ -123,7 +123,8 @@ def _parse_security(raw):
     fields = ("is_honeypot", "cannot_buy", "cannot_sell_all", "is_open_source", "is_proxy",
               "is_mintable", "hidden_owner", "can_take_back_ownership", "owner_change_balance",
               "selfdestruct", "transfer_pausable", "is_blacklisted", "buy_tax", "sell_tax",
-              "holder_count", "lp_holder_count", "creator_address")
+              "holder_count", "lp_holder_count", "creator_address", "honeypot_with_same_creator",
+              "is_airdrop_scam", "anti_whale_modifiable", "trading_cooldown")
     selected = {key: raw.get(key) for key in fields if key in raw}
     flags = []
     for key, label in (("is_honeypot", "HONEYPOT"), ("cannot_buy", "CANNOT_BUY"),
@@ -133,7 +134,11 @@ def _parse_security(raw):
                        ("owner_change_balance", "OWNER_CAN_CHANGE_BALANCES"),
                        ("selfdestruct", "SELFDESTRUCT_PRESENT"),
                        ("is_mintable", "MINTABLE"), ("transfer_pausable", "TRANSFER_PAUSABLE"),
-                       ("is_blacklisted", "BLACKLIST_FUNCTION")):
+                       ("is_blacklisted", "BLACKLIST_FUNCTION"),
+                       ("honeypot_with_same_creator", "CREATOR_HONEYPOT_HISTORY"),
+                       ("is_airdrop_scam", "AIRDROP_SCAM"),
+                       ("anti_whale_modifiable", "ANTI_WHALE_MODIFIABLE"),
+                       ("trading_cooldown", "TRADING_COOLDOWN")):
         if str(raw.get(key, "0")) == "1":
             flags.append(label)
     if str(raw.get("is_open_source", "1")) == "0":
@@ -142,6 +147,26 @@ def _parse_security(raw):
         tax = _num(raw.get(key))
         if tax is not None and tax > 0.10:
             flags.append(key.upper() + "_OVER_10_PERCENT")
+
+    # Check LP lock status from lp_holders
+    lp_holders = raw.get("lp_holders") or []
+    creator = str(raw.get("creator_address") or "").lower().strip()
+    if isinstance(lp_holders, list) and lp_holders:
+        total_locked = 0.0
+        creator_unlocked = 0.0
+        for h in lp_holders:
+            if isinstance(h, dict):
+                addr = str(h.get("address") or "").lower().strip()
+                is_locked = int(h.get("is_locked") or 0)
+                pct = float(h.get("percent") or 0.0) * 100.0
+                if is_locked == 1 or "dead" in addr or addr == "0x0000000000000000000000000000000000000000":
+                    total_locked += pct
+                elif addr == creator or int(h.get("is_contract") or 0) == 0:
+                    creator_unlocked += pct
+        if total_locked < 50.0:
+            flags.append(f"UNLOCKED_LP_RUG_RISK_{total_locked:.0f}_PCT_LOCKED")
+        if creator_unlocked >= 20.0:
+            flags.append(f"CREATOR_HOLDS_UNLOCKED_LP_{creator_unlocked:.0f}_PCT")
     # No hard flag is not a SAFE verdict: some fields can be absent and this is
     # a provider scan, not a bytecode audit or a real transaction simulation.
     return {"status": "FLAGGED_REVIEW" if flags else "PROVIDER_CHECK_RETURNED_REVIEW_REQUIRED",

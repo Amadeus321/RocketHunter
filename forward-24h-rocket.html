@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <link rel="icon" type="image/x-icon" href="/favicon.ico">
-<title>Rocket Hunter — Forward 24h Watchlist (v4.26.1)</title>
+<title>Rocket Hunter — Forward 24h Watchlist (v4.26.6)</title>
 <style>
 :root {
   color-scheme: dark;
@@ -134,38 +134,38 @@ a:hover { text-decoration: underline; }
 <header>
 <div class="eyebrow">Rocket Hunter · Production Scan Output</div>
 <h1>Forward 24h Watchlist</h1>
-<p class="meta">Finished 2026-11-12 12:18:15 IST · General version <code>v4.26.1</code></p>
+<p class="meta">Finished 2026-11-12 13:58:55 IST · General version <code>v4.26.6</code></p>
 </header>
 
 <div class="grid">
   <div class="card" style="border-left: 3px solid var(--accent);">
     <div class="card-label">Scan Finished (Israel Time)</div>
-    <div class="card-value" style="color:var(--accent);font-size:1.25rem;">2026-11-12 12:18:15 IST</div>
+    <div class="card-value" style="color:var(--accent);font-size:1.25rem;">2026-11-12 13:58:55 IST</div>
   </div>
   <div class="card">
     <div class="card-label">Scan Status</div>
-    <div class="card-value"><span class="badge warn">FAILED</span></div>
+    <div class="card-value"><span class="badge ok">COMPLETED</span></div>
   </div>
   <div class="card">
     <div class="card-label">Run ID</div>
-    <div class="card-value" style="font-size:0.95rem;"><code>local-run-20261112T100347Z</code></div>
+    <div class="card-value" style="font-size:0.95rem;"><code>local-run-20261112T104037Z</code></div>
   </div>
   <div class="card">
     <div class="card-label">Ranked Opportunities</div>
-    <div class="card-value">165</div>
+    <div class="card-value">106</div>
   </div>
 </div>
 
 <section>
 <h2>1. Verified Actionable Opportunities</h2>
 <p class="meta">Strict single-TP architecture: minimum +40.00% upside, no stop loss, no trailing stop. Only candidates passing live price refresh, exact token/pool verification, safety audit, and two-way executable quotes appear here.</p>
-<div class="banner warn"><h3>SCAN NOT COMPLETED</h3><p>No actionable opportunities are published from an incomplete or in-progress scan.</p></div>
+<div class="banner zero"><div class="banner-badge">FAIL-CLOSED ENFORCED</div><h3>ZERO VERIFIED OPPORTUNITIES</h3><p>Zero candidates passed every mandatory final gate for this scan.</p><p class="meta">Every qualifying trade strictly requires: refreshed live DEX price, verified token contract/pool match, technical single-TP upside &ge; +40.00%, independent safety audit (RugCheck / GoPlus), and two-way executable quotes (Jupiter / 0x).</p></div>
 </section>
 
 <section>
 <h2>2. Unverified Research Watchlist — NOT QUALIFIED</h2>
-<p class="meta">Research rankings and hypothetical upside do not satisfy the technical TP or verification gates. All 0 mature research candidates meeting the mandatory +40.00% threshold shown.</p>
-<p class="muted">No unverified research candidates met the mandatory +40.00% potential threshold.</p>
+<p class="meta">Research rankings and hypothetical upside do not satisfy the technical TP or verification gates. All 1 mature research candidates meeting the mandatory +40.00% threshold shown.</p>
+<div class="table-wrap"><table><thead><tr><th>Pair</th><th>Chain</th><th>Current Price</th><th>Single TP</th><th>Potential (% till TP)</th><th>Pool Address</th><th>Token Contract</th><th>Pool Age</th><th>Status</th><th>Take Position</th></tr></thead><tbody><tr><td><strong>MTXUSDT</strong></td><td>MEXC (Spot)</td><td>$1.4287</td><td>$2.5239</td><td class="green">+76.65%</td><td><code>CEX Order Book (MEXC)</code></td><td><code>CEX Custody (MTX)</code></td><td>—</td><td><span class="badge warn">NOT QUALIFIED</span></td><td><label class="pos-chk-lbl"><input type="checkbox" class="pos-checkbox" data-pair="MTXUSDT" data-chain="MEXC (Spot)" data-entry="1.4287" data-tp="2.5239" data-pot="+76.65%" data-pool="CEX Order Book (MEXC)" data-token="CEX Custody (MTX)" data-version="v4.26.6" data-run="local-run-20261112T104037Z" onchange="toggleCandidatePosition(this)"> <span>Take Position</span></label></td></tr></tbody></table></div>
 <p class="meta note">*The 24h upside scenario is a volatility/momentum scenario from hourly candles, not a predicted return or calibrated probability. Initial downside is an ATR-based reference stop. Scenario R:R is upside scenario divided by initial stop distance.</p>
 </section>
 
