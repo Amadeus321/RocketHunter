@@ -13,12 +13,17 @@ import os
 import smtplib
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
+import sys
 from pathlib import Path
 from typing import Any
 
 logger = logging.getLogger("notification_manager")
 
-ROOT = Path(__file__).resolve().parents[1]
+if getattr(sys, "frozen", False):
+    ROOT = Path(sys.executable).resolve().parent
+else:
+    ROOT = Path(__file__).resolve().parents[1]
+
 DATA_DIR = ROOT / "rocket-hunter-data"
 CONFIG_FILE = DATA_DIR / "notification_config.json"
 

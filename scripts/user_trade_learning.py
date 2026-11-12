@@ -9,10 +9,15 @@ from __future__ import annotations
 
 import datetime as dt
 import json
+import sys
 from pathlib import Path
 from typing import Any
 
-ROOT = Path(__file__).resolve().parents[1]
+if getattr(sys, "frozen", False):
+    ROOT = Path(sys.executable).resolve().parent
+else:
+    ROOT = Path(__file__).resolve().parents[1]
+
 DATA_DIR = ROOT / "rocket-hunter-data"
 JOURNAL_FILE = DATA_DIR / "user_positions_journal.json"
 AI_ENGINE_FILE = DATA_DIR / "ai_learning_engine.json"

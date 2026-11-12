@@ -131,21 +131,36 @@ def _candidate_opportunity_fields(candidate: dict[str, Any]) -> tuple[float | No
     if potential is None and entry is not None and target is not None and entry > 0:
         potential = canonical_tp_upside(entry, target)
 
+    market_type = str(candidate.get("market_type") or "").lower()
+    venue = str(candidate.get("venue") or candidate.get("chain") or "").strip()
+    pair_str = str(candidate.get("pair") or candidate.get("asset") or "").strip()
+    is_cex = market_type.startswith("cex") or venue.lower() in ("mexc", "kucoin", "binance", "bybit", "gate", "bitget", "okx")
+
     pool = (
         candidate.get("final_pool_address")
         or candidate.get("pool_address")
         or candidate.get("pair_address")
         or candidate.get("address")
-        or "—"
     )
+    if not pool or pool == "—":
+        if is_cex:
+            pool = f"CEX Order Book ({venue.upper() or 'SPOT'})"
+        else:
+            pool = "—"
+
     token = (
         candidate.get("final_token_contract")
         or candidate.get("contract_address")
         or candidate.get("token_contract")
         or candidate.get("token_address")
         or candidate.get("mint")
-        or "—"
     )
+    if not token or token == "—":
+        if is_cex:
+            token = f"CEX Custody ({candidate.get('asset') or pair_str})"
+        else:
+            token = "—"
+
     return entry, target, potential, str(pool), str(token)
 
 
@@ -797,7 +812,11 @@ def render_html(document: dict[str, Any]) -> str:
     for c in display_candidates:
         pair = c.get("pair") or c.get("asset") or "Unnamed pair"
         entry, target, potential, pool, token = _candidate_opportunity_fields(c)
-        chain = c.get("chain") or c.get("venue") or "—"
+        venue_val = c.get("venue") or c.get("chain") or ""
+        if str(venue_val).lower() in ("mexc", "kucoin", "binance", "bybit", "gate", "bitget", "okx"):
+            chain = f"{str(venue_val).upper()} (Spot)"
+        else:
+            chain = c.get("chain") or c.get("venue") or "—"
         age = _number(c.get("age_hours"))
         age_str = f"{age:.2f}h" if age is not None else "—"
         pot_str = f"+{potential:.2f}%" if potential is not None else "—"

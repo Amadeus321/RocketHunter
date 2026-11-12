@@ -24,10 +24,10 @@ Only candidates passing the final price, identity, +40% single-TP, safety and tw
 
 | Pair | Chain | Current Price | Single TP | Potential (% till TP) | Pool Address | Token Contract | Verification | Safety | Execution |
 |---|---|---:|---:|---:|---|---|---|---|---|
-| BURNIE / SOL | solana | 0.0008039 | 0.0026474622 | +229.33% | `5tYFviFWQRKV9BJSTHGitbdqEYC1BGUgRUDnSADUXqJP` | `CGEDT9QZDvvH5GmVkWJH2BXiMJqMJySC9ihWyr7Spump` | QUALIFIED | PASS | PASS |
-| ARIA / USDT 0.01% | bsc | 0.2294 | 0.3259987026 | +42.11% | `0xa5dbeaf16fc031eae92175974f8d0a439be4ad17` | `0x5d3a12c42e5372b2cc3264ab3cdcf660a1555238` | QUALIFIED | PASS | PASS |
-| mihao / ETH | eth | 0.005156 | 0.0085271582 | +65.38% | `0xed6c13aa281124eeb8cd9195bba31a3a78b1d6a84665fb3da0ad86cd130f6900` | `0xb3a6add33f777ac6ea0ec88bdf533573c8bbbc03` | QUALIFIED | PASS | PASS |
-| PAYDAY / SOL | solana | 0.0001787 | 0.0002505569 | +40.21% | `9rQAUw4uNyfsqsJ9F3BPo3hBFY1V6ptaEtPkRhhH3zpL` | `uHMWNFjUNxbPy1q43WrdbzygmJwdeh6AiQm1NKdxPAY` | QUALIFIED | PASS | PASS |
+| ARIA / USDT 0.01% | bsc | 0.2267 | 0.3259987026 | +43.80% | `0xa5dbeaf16fc031eae92175974f8d0a439be4ad17` | `0x5d3a12c42e5372b2cc3264ab3cdcf660a1555238` | QUALIFIED | PASS | PASS |
+| BURNIE / SOL | solana | 0.0008698 | 0.0026474622 | +204.38% | `5tYFviFWQRKV9BJSTHGitbdqEYC1BGUgRUDnSADUXqJP` | `CGEDT9QZDvvH5GmVkWJH2BXiMJqMJySC9ihWyr7Spump` | QUALIFIED | PASS | PASS |
+| mihao / ETH | eth | 0.004205 | 0.0085271582 | +102.79% | `0xed6c13aa281124eeb8cd9195bba31a3a78b1d6a84665fb3da0ad86cd130f6900` | `0xb3a6add33f777ac6ea0ec88bdf533573c8bbbc03` | QUALIFIED | PASS | PASS |
+| PAYDAY / SOL | solana | 0.0001618 | 0.0002505569 | +54.86% | `9rQAUw4uNyfsqsJ9F3BPo3hBFY1V6ptaEtPkRhhH3zpL` | `uHMWNFjUNxbPy1q43WrdbzygmJwdeh6AiQm1NKdxPAY` | QUALIFIED | PASS | PASS |
 
 ## Unverified research watchlist — NOT QUALIFIED
 
@@ -35,8 +35,8 @@ Research rankings and hypothetical upside do not satisfy the technical TP or ver
 
 | Pair | Chain | Current Price | Single TP | Potential (% till TP) | Pool Address | Token Contract | Pool Age | Status |
 |---|---|---:|---:|---:|---|---|---:|---|
-| MTXUSDT | mexc | 2.6046 | 3.904 | +49.89% | `—` | `—` | — | NOT QUALIFIED |
-| MTX-USDT | kucoin | 3.0001 | 4.4887 | +49.62% | `—` | `—` | — | NOT QUALIFIED |
+| MTXUSDT | mexc | 2.6046 | 3.904 | +49.89% | `CEX Order Book (MEXC)` | `CEX Custody (MTX)` | — | NOT QUALIFIED |
+| MTX-USDT | kucoin | 3.0001 | 4.4887 | +49.62% | `CEX Order Book (KUCOIN)` | `CEX Custody (MTX)` | — | NOT QUALIFIED |
 | Tilly/SPCX | solana | 0.0000444 | 0.000065083 | +46.58% | `8EgzFk4NyHRPZPFtkCJPWzEg4maciht7xvk5YGfi9Ybd` | `BFfrW2h5CuTMHbDmXeJL5sdKAZVQDHrShwCPf2Jrpump` | 54.50h | NOT QUALIFIED |
 
 > *The 24h upside scenario is a volatility/momentum scenario from hourly candles, not a predicted return or calibrated probability. Initial downside is an ATR-based reference stop, not a guaranteed max loss. Scenario R:R is upside scenario divided by initial stop distance; it is a heuristic, not realized expectancy.
