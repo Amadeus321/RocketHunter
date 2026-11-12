@@ -167,9 +167,11 @@ def parse_dexscreener_pair_record(
 class DexScreenerDiscoveryEngine:
     """Orchestrates comprehensive multi-endpoint DEX Screener opportunity discovery."""
 
-    def __init__(self, workers: int = 4, timeout: int = 8) -> None:
-        self.workers = max(1, min(12, workers))
+    def __init__(self, workers: int = 4, timeout: int = 8, max_workers: int | None = None) -> None:
+        actual_workers = max_workers if max_workers is not None else workers
+        self.workers = max(1, min(12, actual_workers))
         self.timeout = timeout
+        self.search_queries = list(EXPANDED_SEARCH_QUERIES)
         self.discovered_candidates: list[dict[str, Any]] = []
         self.discovery_leads: dict[str, dict[str, Any]] = {}
         self.stats: dict[str, Any] = {
@@ -236,6 +238,8 @@ class DexScreenerDiscoveryEngine:
                 self.stats["ads_fetched"] += count
 
         return self.discovery_leads
+
+    discover_promoted_and_fresh_leads = collect_discovery_leads
 
     def batch_lookup_tokens(self, addresses_by_chain: dict[str, list[str]] | None = None) -> list[dict[str, Any]]:
         """Perform efficient batch token lookups in slices of up to 30 addresses per request."""

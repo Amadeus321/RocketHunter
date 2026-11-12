@@ -633,6 +633,24 @@ class RocketHunter:
             ("dexscreener_ads", "/ads/latest/v1", "paid_ad")
         ]
         leads = {}
+        # Multi-lane DEX Screener Discovery integration
+        try:
+            from scripts.dexscreener_discovery import DexScreenerDiscoveryEngine
+            ds_engine = DexScreenerDiscoveryEngine(timeout=self.timeout, max_workers=self.workers)
+            leads_dict = ds_engine.discover_promoted_and_fresh_leads()
+            for key, lead in leads_dict.items():
+                chain, addr = lead["chain"], lead["token_address"]
+                lkey = (str(chain).lower(), str(addr).lower())
+                leads.setdefault(lkey, {"chain": chain, "address": addr, "flags": set(), "sources": set()})
+                for f in lead.get("flags", []):
+                    leads[lkey]["flags"].add(f)
+                for s in lead.get("sources", []):
+                    leads[lkey]["sources"].add(s)
+                leads[lkey]["boost_amount"] = max(n(leads[lkey].get("boost_amount")) or 0, n(lead.get("boost_amount")) or 0)
+                leads[lkey]["boost_total"] = max(n(leads[lkey].get("boost_total")) or 0, n(lead.get("boost_total")) or 0)
+        except Exception:
+            pass
+
         for source, path, flag in paths:
             url = DEX_ROOT + path
             payload = self._fetch_json(source, url)
@@ -1166,8 +1184,20 @@ def main(argv=None):
     search_queries = DEFAULT_DEX_SEARCH_QUERIES[:a.dex_search_limit]
     default_networks = list(DEFAULT_NETWORKS)
     extra_networks = [x for x in a.network if x not in default_networks]
+
+    # Integrate DefiLlama Flow Engine for dynamic ecosystem discovery allocation
+    try:
+        from scripts.defillama_flow_engine import DefiLlamaFlowEngine
+        flow_engine = DefiLlamaFlowEngine(timeout=min(6, a.timeout))
+        priority_chains = flow_engine.get_priority_networks(top_n=len(default_networks))
+        reordered = [c for c in priority_chains if c in default_networks]
+        remaining = [c for c in default_networks if c not in reordered]
+        scheduled_networks = reordered + remaining
+    except Exception:
+        scheduled_networks = default_networks
+
     if a.network_sweep_limit > 0:
-        networks = default_networks[:a.network_sweep_limit] + extra_networks
+        networks = scheduled_networks[:a.network_sweep_limit] + extra_networks
     else:
         networks = []
     network_sweep_count = len(networks)

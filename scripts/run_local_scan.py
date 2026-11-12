@@ -195,6 +195,7 @@ def prepare_runtime(runtime_store: Path, deadline: float, log_path: Path) -> Pat
             env = os.environ.copy()
             env["PYTHONUTF8"] = "1"
             env["PYTHONIOENCODING"] = "utf-8"
+            env["ROCKET_HUNTER_USER_DATA_DIR"] = str((ROOT / "rocket-hunter-data").resolve())
             installers = (
                 [sys.executable, "-m", "scripts.v419_upgrade", "--install", "--repo-root", str(staging)],
                 [sys.executable, "-m", "scripts.v423_provider_expansion", "--install", "--repo-root", str(staging)],
@@ -479,8 +480,10 @@ def main(argv: list[str] | None = None) -> int:
         p.error("--max-runtime-minutes must be between 1 and 180")
     if not 1 <= args.gecko_pages <= 3:
         p.error("--gecko-pages must be between 1 and 3 for a bounded local scan")
-    if not 0 <= args.network_sweep_limit <= 24:
-        p.error("--network-sweep-limit must be between 0 and 24")
+    from scripts.unified_network_registry import CANONICAL_NETWORKS
+    max_network_limit = max(64, len(CANONICAL_NETWORKS))
+    if not 0 <= args.network_sweep_limit <= max_network_limit:
+        p.error(f"--network-sweep-limit must be between 0 and {max_network_limit}")
     if not 1 <= args.workers <= 12 or not 1 <= args.preflight_workers <= 12:
         p.error("--workers and --preflight-workers must be between 1 and 12")
     outdir, memory_dir = args.outdir.resolve(), args.memory_dir.resolve()
@@ -540,17 +543,22 @@ def main(argv: list[str] | None = None) -> int:
         env["SCANNER_MEMORY_DIR"] = str(snapshot)
         env["ROCKET_HUNTER_SHARED_MEMORY_DIR"] = str(memory_dir)
         env["ROCKET_HUNTER_RUN_ID"] = run_id
+        env["ROCKET_HUNTER_USER_DATA_DIR"] = str((ROOT / "rocket-hunter-data").resolve())
         base_budget = max(1.0, min(150.0, args.max_runtime_minutes * 0.72))
         cmds = [build_scan_command(args, outdir, base_budget)]
 
-        budget_mgr.start_phase("global_multichain_discovery")
+        disc_allowance = budget_mgr.start_phase("global_multichain_discovery")
+        # Discovery must leave at least 25 minutes for enrichment, verification, and finalization
+        disc_deadline = min(deadline - (25.0 * 60.0), time.monotonic() + disc_allowance)
         state["unified_budget"] = budget_mgr.get_summary()
         status_path.write_text(json.dumps(state, indent=2) + "\n", encoding="utf-8")
 
-        _run_required(cmds[0], deadline, env, log_path, runtime_root,
+        _run_required(cmds[0], disc_deadline, env, log_path, runtime_root,
                       "bounded discovery/preflight/report stage failed")
+        budget_mgr.end_phase("global_multichain_discovery")
 
-        budget_mgr.start_phase("candidate_enrichment")
+        enrich_allowance = budget_mgr.start_phase("candidate_enrichment")
+        enrich_deadline = min(deadline - (20.0 * 60.0), time.monotonic() + enrich_allowance)
         state["unified_budget"] = budget_mgr.get_summary()
         status_path.write_text(json.dumps(state, indent=2) + "\n", encoding="utf-8")
 
@@ -565,10 +573,12 @@ def main(argv: list[str] | None = None) -> int:
              "--security-limit", "24", "--router-limit", "24"],
         ]
         for cmd in stages:
-            _run_required(cmd, deadline, env, log_path, runtime_root,
+            _run_required(cmd, enrich_deadline, env, log_path, runtime_root,
                           "quality, memory, or safety-audit stage failed")
+        budget_mgr.end_phase("candidate_enrichment")
 
-        budget_mgr.start_phase("deep_verification_safety")
+        deep_allowance = budget_mgr.start_phase("deep_verification_safety")
+        deep_deadline = min(deadline - (12.0 * 60.0), time.monotonic() + deep_allowance)
         state["unified_budget"] = budget_mgr.get_summary()
         status_path.write_text(json.dumps(state, indent=2) + "\n", encoding="utf-8")
 
@@ -576,8 +586,9 @@ def main(argv: list[str] | None = None) -> int:
                    "--markdown", str(outdir / "forward-24h-rocket.md"), "--out", str(outdir / "forward-24h-rocket.json"),
                    "--dex-limit", "140", "--cex-limit", "25", "--timeout", "8", "--gecko-interval", "12.0"]
         (outdir / "forward-24h-rocket.md").write_text("", encoding="utf-8")
-        _run_required(forward, deadline, env, log_path, runtime_root,
+        _run_required(forward, deep_deadline, env, log_path, runtime_root,
                       "forward report generation failed")
+        budget_mgr.end_phase("deep_verification_safety")
 
         budget_mgr.start_phase("finalization_and_reports")
         state["unified_budget"] = budget_mgr.get_summary()

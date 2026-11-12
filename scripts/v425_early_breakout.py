@@ -21,7 +21,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
-VERSION = "4.28.0"
+VERSION = "4.29.0"
 EARLY_BREAKOUT_SIGNAL_VERSION = "v4.25-early-breakout.v1"
 EARLY_BREAKOUT_MODEL_ID = "v4.25-early-breakout"
 API_ROOT = "https://api.dexpaprika.com"
@@ -46,7 +46,7 @@ GECKO_POSITION_ALIASES = {
 MAX_SEARCH_ROWS = 100
 OHLCV_INTERVAL = "1h"
 OHLCV_LIMIT = 30
-USER_AGENT = "crypto-prebreakout-research/v4.28.0 (read-only research)"
+USER_AGENT = "crypto-prebreakout-research/v4.29.0 (read-only research)"
 EARLY_FIELDS = (
     "early_breakout_score", "early_breakout_tier", "early_breakout_components",
     "early_breakout_risk_flags", "early_breakout_signal_version",

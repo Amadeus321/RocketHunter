@@ -198,7 +198,7 @@ jobs:
             --timeout 8 \
             --workers 8 \
             --gecko-pages "${{ inputs.gecko_pages || '3' }}" \
-            --network-sweep-limit 32 \
+            --network-sweep-limit 24 \
             --gecko-request-interval 12 \
             --retries 2 \
             --dex-search-limit 12 \

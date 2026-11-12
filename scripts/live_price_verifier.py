@@ -665,11 +665,40 @@ def refresh_and_filter_candidates(
         # Scale upside potential: reward assets with realistic explosive gains
         upside_component = min(50.0, (pot / 8.0))
 
-        w_momentum = aura_weights.get("momentum_acceleration", aura_weights.get("volume_breakout_momentum", 0.90))
-        w_vol = aura_weights.get("volume_intelligence", 0.90)
-        w_mult = aura_weights.get("breakout_explosiveness_multiplier", 1.15)
-        w_cvd = aura_weights.get("buy_sell_pressure", 0.85)
-        w_liq = aura_weights.get("liquidity_depth", 0.85)
+        engs = c.get("engine_scores") or c.get("engines") or {}
+        feat_momentum = float(engs.get("engine_1_momentum_acceleration", early or confl))
+        feat_volume = float(engs.get("engine_2_volume_intelligence", min(100.0, turnover_score * 4.0)))
+        feat_cvd = float(engs.get("engine_3_buy_sell_pressure", 50.0))
+        feat_liq = float(engs.get("engine_4_liquidity_depth", engs.get("engine_4_liquidity_intelligence", 50.0)))
+        feat_accum = float(engs.get("engine_5_accumulation_detection", 50.0))
+        feat_smart = float(engs.get("engine_6_smart_money", 50.0))
+        feat_breakout = float(engs.get("engine_7_breakout_prediction", early or 50.0))
+        feat_eco = float(engs.get("engine_8_ecosystem_flow", 50.0))
+        feat_risk = float(engs.get("engine_9_risk_safety", 85.0))
+
+        w_momentum = float(aura_weights.get("momentum_acceleration", 0.90))
+        w_vol = float(aura_weights.get("volume_intelligence", 0.90))
+        w_cvd = float(aura_weights.get("buy_sell_pressure", 0.85))
+        w_liq = float(aura_weights.get("liquidity_depth", aura_weights.get("liquidity_intelligence", 0.85)))
+        w_accum = float(aura_weights.get("accumulation_detection", 0.80))
+        w_smart = float(aura_weights.get("smart_money", 0.75))
+        w_breakout = float(aura_weights.get("breakout_prediction", 0.90))
+        w_eco = float(aura_weights.get("ecosystem_flow", 0.78))
+        w_risk = float(aura_weights.get("risk_safety", 0.98))
+        w_mult = float(aura_weights.get("breakout_explosiveness_multiplier", 1.15))
+
+        # Direct 1-to-1 feature-to-weight score mapping
+        engine_weighted_score = (
+            (feat_momentum * 0.20 * w_momentum)
+            + (feat_volume * 0.15 * w_vol)
+            + (feat_cvd * 0.15 * w_cvd)
+            + (feat_liq * 0.15 * w_liq)
+            + (feat_accum * 0.10 * w_accum)
+            + (feat_smart * 0.05 * w_smart)
+            + (feat_breakout * 0.10 * w_breakout)
+            + (feat_eco * 0.05 * w_eco)
+            + (feat_risk * 0.05 * w_risk)
+        )
 
         # Apply frontrun buffer to ensure targets don't fail just below resistance (FAIR/SOL lesson)
         if pot >= 40.0:
@@ -677,13 +706,15 @@ def refresh_and_filter_candidates(
 
         if opp_rank > 0:
             total_score = (
-                (opp_rank * 0.35 * w_mult)
-                + (confl * 0.30 * w_momentum)
-                + (upside_component * 0.20 * w_vol)
-                + (turnover_score * 0.15 * w_cvd)
+                (opp_rank * 0.40 * w_mult)
+                + (engine_weighted_score * 0.40)
+                + (upside_component * 0.20)
             )
         else:
-            total_score = (early * 0.40 * w_momentum) + (upside_component * 0.45 * w_mult) + (turnover_score * 0.15 * w_vol)
+            total_score = (
+                (engine_weighted_score * 0.60)
+                + (upside_component * 0.40 * w_mult)
+            )
         return total_score
 
     # Sort strictly by AURA explosive rocket power score

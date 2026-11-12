@@ -332,10 +332,14 @@ class UnifiedNetworkRegistry:
                 "family": meta["family"],
                 "provider_ids": copy.deepcopy(meta["provider_ids"]),
                 "providers": {
-                    "dexscreener": {"supported": True, "status": "PENDING", "pools_count": 0, "error": None},
-                    "defillama": {"supported": True, "status": "PENDING", "pools_count": 0, "error": None},
-                    "geckoterminal": {"supported": True, "status": "PENDING", "pools_count": 0, "error": None},
-                    "dexpaprika": {"supported": True, "status": "PENDING", "pools_count": 0, "error": None},
+                    p: {
+                        "supported": (p in meta["provider_ids"]),
+                        "status": "SUPPORTED" if (p in meta["provider_ids"]) else "REGISTERED",
+                        "state": "SUPPORTED" if (p in meta["provider_ids"]) else "REGISTERED",
+                        "pools_count": 0,
+                        "error": None,
+                    }
+                    for p in ("dexscreener", "defillama", "geckoterminal", "dexpaprika")
                 },
                 "ecosystem_flow_score": 1.0,
                 "discovery_budget_weight": 1.0,
@@ -373,10 +377,23 @@ class UnifiedNetworkRegistry:
             }
 
         net = self.networks[canon]
-        prov_entry = net["providers"].setdefault(provider, {"supported": True, "status": "PENDING", "pools_count": 0, "error": None})
-        prov_entry["status"] = status
+        prov_entry = net["providers"].setdefault(provider, {"supported": True, "status": "PENDING", "state": "REGISTERED", "pools_count": 0, "error": None})
         prov_entry["pools_count"] = max(prov_entry.get("pools_count", 0), pools_count)
         prov_entry["error"] = error
+        
+        # Classify into canonical 5-state lifecycle: REGISTERED, SUPPORTED, ATTEMPTED, SUCCESSFUL, UNAVAILABLE
+        if status in ("OK", "SUCCESSFUL") and pools_count > 0:
+            prov_entry["status"] = "SUCCESSFUL"
+            prov_entry["state"] = "SUCCESSFUL"
+        elif status in ("OK", "SUCCESSFUL") and pools_count == 0:
+            prov_entry["status"] = "ATTEMPTED"
+            prov_entry["state"] = "ATTEMPTED"
+        elif status in ("FAILED", "RATE_LIMITED", "ERROR", "UNAVAILABLE"):
+            prov_entry["status"] = "UNAVAILABLE"
+            prov_entry["state"] = "UNAVAILABLE"
+        else:
+            prov_entry["status"] = status
+            prov_entry["state"] = "ATTEMPTED"
         net["last_queried_utc"] = datetime.now(timezone.utc).isoformat()
         net["total_usable_pools"] = sum(p.get("pools_count", 0) for p in net["providers"].values())
 

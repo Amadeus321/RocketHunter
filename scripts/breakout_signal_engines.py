@@ -17,7 +17,7 @@ from __future__ import annotations
 import math
 from typing import Any
 
-BREAKOUT_SYSTEM_VERSION = "4.28.0"
+BREAKOUT_SYSTEM_VERSION = "4.29.0"
 
 
 def _num(val: Any) -> float | None:
@@ -168,19 +168,50 @@ class BreakoutSignalEngines:
     @staticmethod
     def engine_6_smart_money_research(row: dict[str, Any]) -> tuple[float, dict[str, Any]]:
         """Engine 6: Relevant wallet activity and holder distribution."""
+        wallet_ev = row.get("wallet_evidence") or row.get("smart_money_wallets") or row.get("top_holders") or row.get("onchain_evidence")
         txns = _num(row.get("txns_24h")) or (_num(row.get("buys_24h")) or 0.0) + (_num(row.get("sells_24h")) or 0.0)
         promo_flags = row.get("extra", {}).get("promo_flags") or row.get("promo_flags") or []
 
-        score = 50.0
-        if txns >= 1500:
-            score += 30.0
-        elif txns >= 400:
-            score += 15.0
+        if isinstance(wallet_ev, dict) and wallet_ev:
+            # VERIFIED onchain wallet and holder intelligence
+            smart_wallets = _num(wallet_ev.get("smart_trader_count")) or 0.0
+            top10_share = _num(wallet_ev.get("top_10_holders_share_pct")) or 50.0
+            score = 60.0
+            if smart_wallets >= 5:
+                score += 25.0
+            elif smart_wallets >= 2:
+                score += 15.0
+            if top10_share < 35.0:
+                score += 15.0  # Well distributed
+            elif top10_share > 75.0:
+                score -= 20.0  # Highly concentrated risk
+            return round(min(100.0, max(0.0, score)), 2), {
+                "evidence_status": "VERIFIED",
+                "smart_traders_tracked": smart_wallets,
+                "top_10_share_pct": top10_share,
+            }
 
-        if "community_takeover" in promo_flags:
-            score += 10.0  # Organic decentralized community drive
+        # If only transaction counts are present: mark as PARTIAL proxy activity, NOT verified smart money
+        if txns > 0:
+            score = 50.0
+            if txns >= 1500:
+                score += 20.0
+            elif txns >= 400:
+                score += 10.0
+            if "community_takeover" in promo_flags:
+                score += 10.0
+            return round(min(80.0, score), 2), {
+                "evidence_status": "PARTIAL",
+                "estimated_transactions": txns,
+                "note": "Transaction activity proxy only; no verified wallet tracking",
+            }
 
-        return round(min(100.0, score), 2), {"estimated_transactions": txns}
+        # Missing measurements must not silently become neutral or positive scores
+        return 0.0, {
+            "evidence_status": "UNAVAILABLE",
+            "unmeasured": True,
+            "note": "Zero wallet or transaction evidence measured",
+        }
 
     @staticmethod
     def engine_7_breakout_prediction(row: dict[str, Any]) -> tuple[float, dict[str, Any]]:
@@ -304,7 +335,7 @@ class BreakoutSignalEngines:
             "engine_1_momentum_acceleration": e1,
             "engine_2_volume_intelligence": e2,
             "engine_3_buy_sell_pressure": e3,
-            "engine_4_liquidity_intelligence": e4,
+            "engine_4_liquidity_depth": e4,
             "engine_5_accumulation_detection": e5,
             "engine_6_smart_money": e6,
             "engine_7_breakout_prediction": e7,

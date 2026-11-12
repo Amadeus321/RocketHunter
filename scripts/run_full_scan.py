@@ -120,7 +120,7 @@ def _mark_scan_state(outdir, status, started_utc, started_mono, run_id=None):
         path.write_text(json.dumps(document, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
 
-def main(argv=None):
+def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--outdir", default="rocket-run", help="directory for preflight, JSON/Markdown, logs and checkpoints")
     p.add_argument("--venue", action="append", choices=DEFAULT_VENUES, help="CEX spot venue; repeatable (default: all seven)")
@@ -143,6 +143,11 @@ def main(argv=None):
                    help="leave status IN_PROGRESS for a workflow that has additional final pipeline stages")
     p.add_argument("--mark-complete", action="store_true",
                    help="mark an already-finished workflow scan completed after all downstream stages succeeded")
+    return p
+
+
+def main(argv=None):
+    p = build_parser()
     args = p.parse_args(argv)
     if args.mark_complete:
         outdir = Path(args.outdir).resolve()
@@ -177,8 +182,10 @@ def main(argv=None):
     deadline = started_mono + args.max_runtime_minutes * 60.0
     if not 1 <= args.gecko_pages <= 10:
         p.error("--gecko-pages must be between 1 and 10")
-    if not 0 <= args.network_sweep_limit <= 24:
-        p.error("--network-sweep-limit must be between 0 and 24")
+    from scripts.unified_network_registry import CANONICAL_NETWORKS
+    max_network_limit = max(64, len(CANONICAL_NETWORKS))
+    if not 0 <= args.network_sweep_limit <= max_network_limit:
+        p.error(f"--network-sweep-limit must be between 0 and {max_network_limit}")
     if args.preflight_timeout <= 0 or args.timeout <= 0 or args.workers <= 0 or args.preflight_workers <= 0:
         p.error("timeouts and worker counts must be positive")
     if args.gecko_request_interval < 0:

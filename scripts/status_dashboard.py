@@ -1138,9 +1138,7 @@ pre {{
       <h2 style="margin-bottom:4px;">3. User Position Journal &amp; AI Follow-Up (Real Trades) — AURA Learning Engine</h2>
       <p class="meta" style="margin-bottom:0;">AURA (Adaptive Universal Rocket Algorithm) trains continuously and strictly from positions you confirm taking. Software version is recorded automatically with every trade. Record your final P/L, trade status, and notes to guide future opportunity discovery and scoring.</p>
     </div>
-    <div style="display:flex;gap:8px;">
-      <button type="button" class="btn-sm btn-reset" onclick="resetAiMemory()">🔄 Reset Past AI Records</button>
-    </div>
+    <div></div>
   </div>
 
   <div class="grid" style="grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); margin: 12px 0;">
@@ -1501,7 +1499,7 @@ async function savePosition(id, isAutoSave = false) {{
 }}
 
 async function deletePosition(id) {{
-  if (!confirm('Are you sure you want to remove this position from your journal?')) {{
+  if (!confirm('Are you sure you want to archive this position? (Historical learning data will be safely preserved)')) {{
     return;
   }}
   try {{
@@ -1512,11 +1510,11 @@ async function deletePosition(id) {{
     }});
     const data = await res.json();
     if (data.status === 'OK') {{
-      showJournalMsg('Position removed from journal.');
+      showJournalMsg('Position archived (preserved in history).');
       await loadJournalData();
     }}
   }} catch (e) {{
-    showJournalMsg('Failed to delete position.', true);
+    showJournalMsg('Failed to archive position.', true);
   }}
 }}
 
