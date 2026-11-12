@@ -206,9 +206,13 @@ class ProductionIntegrationV429Tests(unittest.TestCase):
                 "engine_9_risk_safety": 90.0,
             }
         }
-        # Run filter and sort
-        actionable, _ = refresh_and_filter_candidates([candidate], min_potential_pct=40.0)
-        self.assertEqual(len(actionable), 1)
+        # Run filter and sort with mocked clean security check to isolate feature weight ranking
+        with patch("scripts.live_price_verifier.run_comprehensive_security_check", return_value=(False, "PASSED")), \
+             patch("scripts.live_price_verifier.verify_live_dexscreener_prices", return_value={
+                 "5tYFviFWQRKV9BJSTHGitbdqEYC1BGUgRUDnSADUXqJP": {"price_usd": 1.0, "liquidity": {"usd": 50000.0}}
+             }):
+            actionable, _ = refresh_and_filter_candidates([candidate], min_potential_pct=40.0)
+            self.assertEqual(len(actionable), 1)
 
     def test_expected_return_engine_no_invented_defaults(self):
         """Verifies ExpectedReturnEngine returns None for missing TP without defaulting to +40%."""

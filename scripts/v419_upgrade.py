@@ -750,7 +750,12 @@ def _replace_required_text(path: Path, replacements: list[tuple[str, str]]) -> N
         if old in content:
             content = content.replace(old, new, 1)
             changed = True
-        elif new not in content:
+        elif old == "networks = default_networks[:a.network_sweep_limit] + extra_networks" and "networks = scheduled_networks[:a.network_sweep_limit] + extra_networks" in content:
+            content = content.replace("networks = scheduled_networks[:a.network_sweep_limit] + extra_networks", new, 1)
+            changed = True
+        elif ("max_network_limit" in content and ("network_sweep_limit" in old or "network-sweep-limit" in old)) or new in content:
+            continue
+        else:
             raise RuntimeError(f"expected upgrade marker was not found in {path}: {old!r}")
     if changed:
         path.write_text(content, encoding="utf-8")

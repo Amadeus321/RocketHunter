@@ -1192,12 +1192,12 @@ def main(argv=None):
         priority_chains = flow_engine.get_priority_networks(top_n=len(default_networks))
         reordered = [c for c in priority_chains if c in default_networks]
         remaining = [c for c in default_networks if c not in reordered]
-        scheduled_networks = reordered + remaining
+        default_networks = reordered + remaining
     except Exception:
-        scheduled_networks = default_networks
+        pass
 
     if a.network_sweep_limit > 0:
-        networks = scheduled_networks[:a.network_sweep_limit] + extra_networks
+        networks = default_networks[:a.network_sweep_limit] + extra_networks
     else:
         networks = []
     network_sweep_count = len(networks)
