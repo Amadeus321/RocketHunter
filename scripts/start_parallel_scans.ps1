@@ -2,17 +2,33 @@
 param(
     [string]$PythonPath,
 
-    [Parameter(Mandatory = $true)]
+    [Parameter(Mandatory = $false)]
     [ValidateScript({ $_ -ge 1 })]
-    [int]$Count,
+    [int]$Count = 1,
 
     [ValidateRange(1, 180)]
     [int]$MaxRuntimeMinutes = 170,
 
     [switch]$PromptForApiKeys,
 
-    [switch]$Birdeye
+    [switch]$Birdeye,
+
+    [switch]$Force
 )
+
+# Memory-aware concurrency guard for local workstation (e.g. 16 GB RAM)
+try {
+    $os = Get-CimInstance Win32_OperatingSystem -ErrorAction SilentlyContinue
+    if ($os -and $os.TotalVisibleMemorySizeInKB) {
+        $totalRamGb = [math]::Round($os.TotalVisibleMemorySizeInKB / 1024 / 1024, 1)
+        if ($Count -gt 1 -and $totalRamGb -le 24.0 -and -not $Force) {
+            Write-Warning "RESOURCE SAFETY GUARD: System detected with ~$totalRamGb GB RAM. Running $Count full scans simultaneously risks RAM exhaustion, swap thrashing, and provider rate-limit penalties. Clamping concurrency to 1 full scan. (Pass -Force to override)."
+            $Count = 1
+        }
+    }
+} catch {
+    # Non-blocking fallback
+}
 
 $secretNames = @(
     'BIRDEYE_API_KEY',

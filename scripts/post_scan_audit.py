@@ -179,7 +179,7 @@ def _parse_security(raw):
 def _select_dex_candidates(report, limit):
     rows = []
     seen = set()
-    for board in ("execution_candidate_shortlist", "most_actionable_liquidity_screen", "top_24h_movers", "new_pools_under_24h"):
+    for board in ("verified_actionable_opportunities", "unverified_research_watchlist", "top_opportunities", "execution_candidate_shortlist", "early_breakout_leaders", "most_actionable_liquidity_screen", "top_24h_movers", "new_pools_under_24h"):
         for row in report.get(board, []) or []:
             if not isinstance(row, dict) or row.get("market_type") != "dex_pool":
                 continue
@@ -192,6 +192,9 @@ def _select_dex_candidates(report, limit):
             rows.append(row)
     rows.sort(key=lambda x: (
         (x.get("quality_gate") or {}).get("status") == "FOLLOW_UP_SCREEN_PASSED_NOT_EXECUTION_READY",
+        _num(x.get("realistic_opportunity_rank")) or 0,
+        _num(x.get("breakout_confluence_score")) or 0,
+        _num(x.get("early_breakout_score")) or 0,
         _num(x.get("rank_score")) or 0,
         _num(x.get("liquidity_usd")) or 0,
         _num(x.get("volume_24h_usd")) or 0), reverse=True)
@@ -307,11 +310,22 @@ def audit_gecko_spot_cvd(report, limit=8, timeout=10, interval_seconds=12.0):
                 item[field] = item[field].strftime("%Y-%m-%dT%H:%M:%SZ")
         audited.append(item)
     successful = sum(1 for item in audited if item.get("status") == "SAMPLED_CVD_AVAILABLE")
+    failed = len(audited) - successful
     status = "COMPLETED_WITH_GAPS" if successful != len(audited) else "COMPLETED_SAMPLED_REVIEW_REQUIRED"
-    return {"provider": "GeckoTerminal public on-chain trades", "status": status,
-            "audited": audited, "audit_log": logs, "candidate_count": len(candidates),
-            "successful_pools": successful, "request_interval_seconds": interval_seconds,
-            "note": "Buy/sell USD delta from the sampled recent trades endpoint. The endpoint returns at most 300 trades per selected pool in this scan; it is not a full tape or proof of future price direction."}
+    return {
+        "provider": "GeckoTerminal public on-chain trades",
+        "status": status,
+        "timestamped_snapshot_utc": utc_now(),
+        "requested_count": len(candidates),
+        "successful_count": successful,
+        "failed_count": failed,
+        "audited": audited,
+        "audit_log": logs,
+        "candidate_count": len(candidates),
+        "successful_pools": successful,
+        "request_interval_seconds": interval_seconds,
+        "note": "Buy/sell USD delta from the sampled recent trades endpoint. The endpoint returns at most 300 trades per selected pool in this scan; it is not a full tape or proof of future price direction.",
+    }
 
 
 def audit_goplus(report, limit=12, timeout=10):
@@ -610,11 +624,18 @@ def audit_cex_books(report, limit=10, notional_usd=100.0, depth=100, timeout=8, 
         audit_status = "NO_CANDIDATES"
     else:
         audit_status = "COMPLETED_WITH_GAPS" if any(x.get("status") != "FULL_ROUND_TRIP_DEPTH_AVAILABLE" for x in audits) else "COMPLETED_REVIEW_REQUIRED"
-    return {"status": audit_status,
-            "requested_candidates": len(rows), "book_snapshots": audits,
-            "full_depth_round_trips": ok, "notional_usd": float(notional_usd),
-            "fee_bps_each_side_assumed": float(fee_bps),
-            "note": "Order-book depth is cancellable and snapshot-based; fees default to zero unless configured and immediate round trips are not future exit forecasts."}
+    return {
+        "status": audit_status,
+        "timestamped_snapshot_utc": utc_now(),
+        "requested_candidates": len(rows),
+        "successful_count": ok,
+        "failed_count": len(audits) - ok,
+        "book_snapshots": audits,
+        "full_depth_round_trips": ok,
+        "notional_usd": float(notional_usd),
+        "fee_bps_each_side_assumed": float(fee_bps),
+        "note": "Order-book depth is cancellable and snapshot-based; fees default to zero unless configured and immediate round trips are not future exit forecasts.",
+    }
 
 
 def audit_dex_loss_guard(report, audit, limit=12, timeout=8):

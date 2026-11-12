@@ -216,5 +216,112 @@ class TestAnalyzeMissedOpportunities(unittest.TestCase):
         self.assertEqual(report["bounded_lag_24h_outcomes"], 0)
 
 
+    def test_taxonomy_breakdown_and_source_network_accounting(self):
+        forecast_ts = "2026-11-06T10:00:00Z"
+        observed_ts = "2026-11-07T10:30:00Z"
+
+        forecasts = [
+            # 1. Rejected by TP < 40%
+            {
+                "forecast_id": "f_tp_low",
+                "snapshot_utc": forecast_ts,
+                "identity": "dex:base:mint1",
+                "market_key": "dex:base:pool1",
+                "discovery_lanes": ["dexscreener_boosts"],
+                "feature_snapshot": {
+                    "chain": "base",
+                    "pool_address": "pool1",
+                    "contract_address": "mint1",
+                    "potential_pct": 28.5,  # < 40.0%
+                },
+            },
+            # 2. Rejected by security (honeypot)
+            {
+                "forecast_id": "f_security",
+                "snapshot_utc": forecast_ts,
+                "identity": "dex:bsc:mint2",
+                "market_key": "dex:bsc:pool2",
+                "discovery_lanes": ["dexpaprika_momentum"],
+                "feature_snapshot": {
+                    "chain": "bsc",
+                    "pool_address": "pool2",
+                    "contract_address": "mint2",
+                    "potential_pct": 55.0,
+                    "security_status": "FAIL",
+                    "security_flags": ["HONEYPOT_DETECTED"],
+                },
+            },
+            # 3. Rejected by late chase
+            {
+                "forecast_id": "f_late_chase",
+                "snapshot_utc": forecast_ts,
+                "identity": "dex:solana:mint3",
+                "market_key": "dex:solana:pool3",
+                "discovery_lanes": ["geckoterminal_new_pools"],
+                "feature_snapshot": {
+                    "chain": "solana",
+                    "pool_address": "pool3",
+                    "contract_address": "mint3",
+                    "change_5m_pct": 32.0,  # > 25% late chase
+                    "potential_pct": 60.0,
+                },
+            },
+        ]
+        outcomes = [
+            {
+                "forecast_id": "f_tp_low",
+                "market_key": "dex:base:pool1",
+                "horizon_hours": 24,
+                "status": "OBSERVED_MARK_NOT_EXECUTABLE_FILL",
+                "observed_utc": observed_ts,
+                "base_price_usd": 1.0,
+                "observed_price_usd": 1.5,
+                "mark_return_pct": 50.0,
+            },
+            {
+                "forecast_id": "f_security",
+                "market_key": "dex:bsc:pool2",
+                "horizon_hours": 24,
+                "status": "OBSERVED_MARK_NOT_EXECUTABLE_FILL",
+                "observed_utc": observed_ts,
+                "base_price_usd": 1.0,
+                "observed_price_usd": 2.0,
+                "mark_return_pct": 100.0,
+            },
+            {
+                "forecast_id": "f_late_chase",
+                "market_key": "dex:solana:pool3",
+                "horizon_hours": 24,
+                "status": "OBSERVED_MARK_NOT_EXECUTABLE_FILL",
+                "observed_utc": observed_ts,
+                "base_price_usd": 1.0,
+                "observed_price_usd": 1.8,
+                "mark_return_pct": 80.0,
+            },
+        ]
+
+        _write_jsonl_gz(self.memory_dir / "forecasts" / "2026-11-06.jsonl.gz", forecasts)
+        _write_jsonl_gz(self.memory_dir / "outcomes" / "2026-11-06.jsonl.gz", outcomes)
+
+        report = amo.analyze_missed_opportunities(self.memory_dir, self.output_root)
+        self.assertEqual(report["total_movers_40pct_plus"], 3)
+        self.assertEqual(report["missed_count"], 3)
+
+        breakdown = report["miss_category_breakdown"]
+        self.assertEqual(breakdown["REJECTED_TP_UNDER_40"]["count"], 1)
+        self.assertEqual(breakdown["REJECTED_TOKEN_SECURITY"]["count"], 1)
+        self.assertEqual(breakdown["REJECTED_LATE_CHASE"]["count"], 1)
+
+        sources = report["discovery_source_breakdown"]
+        self.assertIn("dexscreener_boosts", sources)
+        self.assertIn("dexpaprika_momentum", sources)
+        self.assertIn("geckoterminal_new_pools", sources)
+
+        networks = report["network_breakdown"]
+        self.assertIn("base", networks)
+        self.assertIn("bsc", networks)
+        self.assertIn("solana", networks)
+
+
 if __name__ == "__main__":
     unittest.main()

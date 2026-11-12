@@ -465,6 +465,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--preflight-workers", type=int, default=4,
                    help="maximum parallel preflight probes (1-12; local default 4)")
     p.add_argument("--birdeye", action="store_true")
+    p.add_argument("--gecko-cvd-limit", type=int, default=4,
+                   help="number of top priority DEX candidates to sample for on-chain CVD (default 4)")
+    p.add_argument("--book-limit", type=int, default=4,
+                   help="number of top priority CEX candidates to sample for order-book depth (default 4)")
     return p
 
 
@@ -555,7 +559,10 @@ def main(argv: list[str] | None = None) -> int:
             [sys.executable, "-m", "scripts.v418_forward_guard", "--outdir", str(outdir), "--memory-dir", str(snapshot), "--run-id", run_id],
             [sys.executable, "-m", "scripts.v419_upgrade", "--outdir", str(outdir), "--memory-dir", str(snapshot), "--run-id", run_id],
             [sys.executable, "scripts/post_scan_audit.py", "--report", str(outdir / "rocket-hunt.json"),
-             "--markdown", str(outdir / "rocket-hunt.md"), "--timeout", "8", "--gecko-cvd-limit", "0", "--book-limit", "0", "--security-limit", "24", "--router-limit", "24"],
+             "--markdown", str(outdir / "rocket-hunt.md"), "--timeout", "8",
+             "--gecko-cvd-limit", str(max(0, getattr(args, "gecko_cvd_limit", 4))),
+             "--book-limit", str(max(0, getattr(args, "book_limit", 4))),
+             "--security-limit", "24", "--router-limit", "24"],
         ]
         for cmd in stages:
             _run_required(cmd, deadline, env, log_path, runtime_root,

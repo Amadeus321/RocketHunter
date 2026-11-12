@@ -228,7 +228,7 @@ jobs:
           python scripts/post_scan_audit.py \
             --report rocket-run/rocket-hunt.json \
             --markdown rocket-run/rocket-hunt.md \
-            --timeout 8 --gecko-cvd-limit 0 --book-limit 0 \
+            --timeout 8 --gecko-cvd-limit 4 --book-limit 4 \
             --security-limit 24 --router-limit 24
       - name: Rebuild the forward watchlist from the expanded full-universe rows
         env:

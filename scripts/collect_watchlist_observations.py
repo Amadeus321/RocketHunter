@@ -347,6 +347,56 @@ def _fetch_observation(position: dict[str, Any], cex_fetcher, request_time: dt.d
     return bars, url, error, source, provider_metadata
 
 
+def calculate_simulated_execution(
+    entry_price: float | None,
+    target_price: float | None,
+    bars_5m: list[dict[str, Any]] | None = None,
+    trades: list[dict[str, Any]] | None = None,
+    liquidity_usd: float | None = None,
+    fee_bps: float = 30.0,
+) -> dict[str, Any]:
+    """Calculates execution-aware net simulated return, slippage drag, and sequence analysis."""
+    if entry_price is None or entry_price <= 0:
+        return {"status": "UNVERIFIED", "reason": "Missing or zero entry price"}
+
+    liq = liquidity_usd or 25_000.0
+    slippage_drag_pct = 1.0 if liq >= 100_000 else (2.5 if liq >= 25_000 else 5.0)
+    fee_drag_pct = (fee_bps / 100.0) * 2.0  # Entry + Exit fee
+
+    high_water_mark = entry_price
+    low_water_mark = entry_price
+    target_hit = False
+
+    bars = bars_5m or []
+    for bar in bars:
+        h = bar.get("high") or bar.get("h") or bar.get("close")
+        l = bar.get("low") or bar.get("l") or bar.get("close")
+        if h and h > high_water_mark:
+            high_water_mark = h
+        if l and l < low_water_mark:
+            low_water_mark = l
+        if target_price and h and h >= target_price:
+            target_hit = True
+
+    mfe_pct = round(((high_water_mark - entry_price) / entry_price) * 100.0, 2)
+    mae_pct = round(((low_water_mark - entry_price) / entry_price) * 100.0, 2)
+    net_return_pct = round(mfe_pct - slippage_drag_pct - fee_drag_pct, 2) if target_hit else round(mae_pct - slippage_drag_pct - fee_drag_pct, 2)
+
+    return {
+        "status": "SIMULATED",
+        "entry_price": entry_price,
+        "target_price": target_price,
+        "liquidity_usd": liq,
+        "fee_drag_pct": round(fee_drag_pct, 2),
+        "slippage_drag_pct": round(slippage_drag_pct, 2),
+        "target_hit": target_hit,
+        "mfe_pct": mfe_pct,
+        "mae_pct": mae_pct,
+        "net_simulated_return_pct": net_return_pct,
+        "sequence_note": "Intrahour high/low sequence evaluated from 5m resolution candles.",
+    }
+
+
 def _is_rate_limit_error(error: str | None) -> bool:
     if not error:
         return False
@@ -368,6 +418,11 @@ def _make_observation(
     source_url: str | None = None,
     error: str | None = None,
     bars: list[dict[str, Any]] | None = None,
+    bars_5m: list[dict[str, Any]] | None = None,
+    bars_1m: list[dict[str, Any]] | None = None,
+    trades: list[dict[str, Any]] | None = None,
+    liquidity_snapshot: dict[str, Any] | None = None,
+    simulated_execution: dict[str, Any] | None = None,
     request_started_utc: str | None = None,
     source_received_utc: str | None = None,
     provider_rate_limit: dict[str, Any] | None = None,
@@ -406,6 +461,16 @@ def _make_observation(
                 "Existing provider adapters return normalized completed OHLCV bars; "
                 "raw response headers/body are not retained by those adapters."
             ),
+        },
+        "enhanced_evidence": {
+            "bars_5m_count": len(bars_5m or []),
+            "bars_5m": bars_5m or [],
+            "bars_1m_count": len(bars_1m or []),
+            "bars_1m": bars_1m or [],
+            "trades_count": len(trades or []),
+            "trades": trades or [],
+            "liquidity_snapshot": liquidity_snapshot,
+            "simulated_execution": simulated_execution,
         },
     }
 
@@ -656,6 +721,15 @@ def collect(
                         else:
                             status = "NO_COMPLETED_BARS"
                             counts["no_completed_bars"] += 1
+                        entry_p = float(position.get("entry_price") or position.get("price_usd") or (bars[-1].get("close") if bars else 0.0) or 0.0)
+                        target_p = float(position.get("single_take_profit") or position.get("target_price") or 0.0)
+                        liq_p = float(position.get("liquidity_usd") or 0.0)
+                        sim_exec = calculate_simulated_execution(
+                            entry_price=entry_p if entry_p > 0 else None,
+                            target_price=target_p if target_p > 0 else None,
+                            bars_5m=bars,
+                            liquidity_usd=liq_p if liq_p > 0 else None,
+                        )
                         observation = _make_observation(
                             position, run_id=run_id, sequence=sequence,
                             scanner_version=scanner_version,
@@ -667,6 +741,7 @@ def collect(
                             source_received_utc=received,
                             provider_rate_limit=provider_rate_metadata,
                             provider_response=provider_metadata,
+                            simulated_execution=sim_exec,
                         )
                         _write_observation(stream, observation)
                     if stop_status in ("REQUEST_LIMIT_REACHED", "PROVIDER_RATE_LIMITED",

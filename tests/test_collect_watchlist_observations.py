@@ -546,5 +546,26 @@ class WatchlistObservationCollectorTests(unittest.TestCase):
         ))
 
 
+    def test_calculate_simulated_execution_metrics(self):
+        bars = [
+            {"open": 1.0, "high": 1.2, "low": 0.95, "close": 1.15},
+            {"open": 1.15, "high": 1.48, "low": 1.10, "close": 1.42},
+        ]
+        res = collector.calculate_simulated_execution(
+            entry_price=1.0,
+            target_price=1.40,
+            bars_5m=bars,
+            liquidity_usd=120_000.0,
+            fee_bps=30.0,
+        )
+        self.assertEqual(res["status"], "SIMULATED")
+        self.assertTrue(res["target_hit"])
+        self.assertGreaterEqual(res["mfe_pct"], 48.0)
+        self.assertLess(res["mae_pct"], 0.0)
+        self.assertGreater(res["net_simulated_return_pct"], 40.0)
+        self.assertIn("slippage_drag_pct", res)
+        self.assertIn("fee_drag_pct", res)
+
+
 if __name__ == "__main__":
     unittest.main()

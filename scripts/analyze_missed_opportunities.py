@@ -152,16 +152,19 @@ def _load_watchlist_identities(memory_dir: Path) -> set[str]:
 
 
 def _classify_miss_reason(
-    forecast: dict[str, Any],
+    forecast: dict[str, Any] | None,
     is_actionable: bool,
 ) -> tuple[str, str]:
     if is_actionable:
         return "ACTIONABLE_QUALIFIED", "Captured in active/completed watchlist"
 
+    if not forecast:
+        return "NEVER_DISCOVERED", "Never discovered by any provider feed during scanner operation"
+
     market_type = str(forecast.get("market_type") or (forecast.get("feature_snapshot") or {}).get("market_type") or "").lower()
     identity = str(forecast.get("identity") or "").strip().lower()
     feature = forecast.get("feature_snapshot") or {}
-    pool = str(feature.get("pool_address") or "").strip()
+    pool = str(feature.get("pool_address") or feature.get("pair_address") or "").strip()
     contract = str(feature.get("contract_address") or feature.get("token_mint") or "").strip()
     raw_score = _finite_number(forecast.get("raw_score"))
 
@@ -177,10 +180,71 @@ def _classify_miss_reason(
             "Missing exact DEX pool address or token contract mint at forecast detection",
         )
 
+    # Check for insufficient price data (< 20 hourly bars)
+    candles = feature.get("candle_count") or feature.get("candles_count") or feature.get("ohlcv_bars_count")
+    if candles is not None and candles < 20:
+        return (
+            "INSUFFICIENT_PRICE_DATA",
+            f"Fewer than 20 completed hourly bars available ({candles} bars) to establish verifiable resistance",
+        )
+
+    # Check for token security failure
+    sec_status = str(feature.get("security_status") or feature.get("safety_status") or "").upper()
+    sec_flags = str(feature.get("security_flags") or feature.get("risk_flags") or [])
+    if sec_status in ("FAIL", "BLOCKED") or any(f in sec_flags for f in ("HONEYPOT", "MINTABLE", "BLACKLIST", "LOSS_PATTERN")):
+        return (
+            "REJECTED_TOKEN_SECURITY",
+            "Failed token safety or loss-guard gate (honeypot, mintable supply, or high malicious tax)",
+        )
+
+    # Check for liquidity or execution failure
+    liq = _finite_number(feature.get("liquidity_usd"))
+    if liq is not None and liq < 15_000.0:
+        return (
+            "REJECTED_LIQUIDITY_EXECUTION",
+            f"Pool liquidity (${liq:,.0f}) below minimum safety floor ($15,000)",
+        )
+    if feature.get("two_way_quote_verified") is False:
+        return (
+            "REJECTED_LIQUIDITY_EXECUTION",
+            "Two-way router quote test failed; insufficient exit depth or extreme execution slippage",
+        )
+
+    # Check for late-chase rejection
+    p5 = _finite_number(feature.get("change_5m_pct"))
+    p1 = _finite_number(feature.get("change_1h_pct"))
+    p24 = _finite_number(feature.get("change_24h_pct"))
+    risk_flags = str(feature.get("risk_flags") or feature.get("early_breakout_risk_flags") or [])
+    if (p5 and p5 > 25.0) or (p1 and p1 > 75.0) or (p24 and p24 > 150.0) or "AT_24H_LOCAL_HIGH" in risk_flags or "LATE_CHASE" in risk_flags:
+        return (
+            "REJECTED_LATE_CHASE",
+            "Late-chase exhaustion risk: asset already moved >25% in 5m, >75% in 1h, or >150% in 24h",
+        )
+
+    # Check for TP requirement (< +40.00%)
+    tp_pot = _finite_number(feature.get("potential_pct") or feature.get("tp_upside_pct") or feature.get("target_upside_pct"))
+    if tp_pot is not None and tp_pot < 40.0:
+        return (
+            "REJECTED_TP_UNDER_40",
+            f"Target potential (+{tp_pot:.2f}%) did not meet mandatory single-TP threshold (+40.00%)",
+        )
+
+    # Check for low heuristic score (< 40.0)
     if raw_score is not None and raw_score < 40.0:
         return (
             "LOW_HEURISTIC_SCORE",
             f"Model raw heuristic score ({raw_score:.1f}) was below the qualification threshold",
+        )
+
+    # Qualified technically, but ranked below the top actionable cutoff
+    if (
+        feature.get("technically_qualified") is True
+        or str(feature.get("verification_status") or "").upper() == "QUALIFIED"
+        or (tp_pot is not None and tp_pot >= 40.0 and feature.get("two_way_quote_verified") is True and sec_status == "PASS")
+    ):
+        return (
+            "QUALIFIED_RANKED_LOW",
+            "Met technical requirements (+40% TP, valid identity, passed safety), but ranked below published shortlist cutoff",
         )
 
     return (
@@ -317,6 +381,21 @@ def analyze_missed_opportunities(
     category_counts = collections.Counter(m["miss_category"] for m in missed_movers)
     category_breakdown = {k: {"count": v, "pct": round(v / len(missed_movers) * 100, 2)} for k, v in category_counts.most_common()} if missed_movers else {}
 
+    # Discovery source breakdown
+    source_counts = collections.Counter()
+    for m in missed_movers:
+        lanes = m.get("discovery_lanes") or []
+        if lanes:
+            for lane in lanes:
+                source_counts[lane] += 1
+        else:
+            source_counts[m.get("venue") or "unknown_source"] += 1
+    discovery_source_breakdown = {k: {"count": v, "pct": round(v / len(missed_movers) * 100, 2)} for k, v in source_counts.most_common(12)} if missed_movers else {}
+
+    # Blockchain network breakdown
+    network_counts = collections.Counter((m.get("chain") or m.get("venue") or "unknown").lower() for m in missed_movers)
+    network_breakdown = {k: {"count": v, "pct": round(v / len(missed_movers) * 100, 2)} for k, v in network_counts.most_common(12)} if missed_movers else {}
+
     # Score stats of missed movers
     scores = [m["raw_score"] for m in missed_movers if m["raw_score"] is not None]
     score_stats = {
@@ -341,6 +420,8 @@ def analyze_missed_opportunities(
         "overall_miss_rate": round(len(missed_movers) / len(movers), 4) if movers else 0.0,
         "tier_summary": tier_counts,
         "miss_category_breakdown": category_breakdown,
+        "discovery_source_breakdown": discovery_source_breakdown,
+        "network_breakdown": network_breakdown,
         "missed_score_statistics": score_stats,
         "top_missed_opportunities": movers[:25],
         "generated_utc": dt.datetime.now(dt.timezone.utc).isoformat().replace("+00:00", "Z"),
@@ -369,20 +450,47 @@ def analyze_missed_opportunities(
 
     md_lines.extend([
         "",
-        "## Why Promising Opportunities Were Missed",
+        "## Missed Opportunity Root-Cause Breakdown (Taxonomy)",
         "",
-        "| Miss Category | Count | Percentage | Description |",
+        "| Rejection / Miss Category | Count | Percentage | Description |",
         "|---|---:|---:|---|",
     ])
     category_descriptions = {
-        "CEX_SPOT_RESEARCH_ONLY": "CEX spot pair; scanner requires verified DEX pool for actionable trading",
+        "NEVER_DISCOVERED": "Asset was never observed by any discovery provider during scan runs",
         "INSUFFICIENT_EXACT_DEX_IDENTITY": "Missing exact pool address or token contract address at forecast time",
+        "INSUFFICIENT_PRICE_DATA": "Fewer than 20 completed hourly bars available to establish verifiable resistance",
+        "REJECTED_TP_UNDER_40": "Target potential did not meet mandatory single-TP threshold (+40.00%)",
+        "REJECTED_TOKEN_SECURITY": "Failed token safety or loss-guard gate (honeypot, mintable supply, or high malicious tax)",
+        "REJECTED_LIQUIDITY_EXECUTION": "Pool liquidity below minimum safety floor ($15,000) or two-way router quotes failed",
+        "REJECTED_LATE_CHASE": "Late-chase exhaustion risk (>25% in 5m, >75% in 1h, >150% in 24h, or at 24h peak)",
+        "QUALIFIED_RANKED_LOW": "Met technical requirements (+40% TP, valid identity, passed safety), but ranked below shortlist cutoff",
+        "CEX_SPOT_RESEARCH_ONLY": "CEX spot pair; scanner requires verified DEX pool for actionable trading",
         "LOW_HEURISTIC_SCORE": "Candidate score was below qualification cutoff (< 40.0)",
         "DISCOVERY_FILTERED_BEFORE_QUALIFICATION": "Filtered by liquidity floor (< $100k), security audit, or quote check",
     }
     for cat, info in category_breakdown.items():
         desc = category_descriptions.get(cat, "Filtered during scanning")
         md_lines.append(f"| `{cat}` | {info['count']:,} | {info['pct']}% | {desc} |")
+
+    md_lines.extend([
+        "",
+        "## Discovery Sources Accountable for Misses",
+        "",
+        "| Discovery Source / Feed | Missed Count | Share % |",
+        "|---|---:|---:|",
+    ])
+    for src, info in discovery_source_breakdown.items():
+        md_lines.append(f"| `{src}` | {info['count']:,} | {info['pct']}% |")
+
+    md_lines.extend([
+        "",
+        "## Blockchain Networks Accountable for Misses",
+        "",
+        "| Blockchain Network | Missed Count | Share % |",
+        "|---|---:|---:|",
+    ])
+    for net, info in network_breakdown.items():
+        md_lines.append(f"| `{net}` | {info['count']:,} | {info['pct']}% |")
 
     md_lines.extend([
         "",
