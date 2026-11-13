@@ -589,6 +589,34 @@ def process_snapshot(main_path: Path, forward_path: Path | None, outdir: Path, m
     seen_ids = {r.get("forecast_id") for r in existing_current}
     append = [r for r in forecasts if r["forecast_id"] not in seen_ids]
     append_jsonl_gz(forecast_path, append)
+
+    try:
+        try:
+            from scripts.prospective_opportunity_dataset import ProspectiveOpportunityDataset
+        except ImportError:
+            from prospective_opportunity_dataset import ProspectiveOpportunityDataset
+
+        prospective_snapshots = [
+            ProspectiveOpportunityDataset.create_snapshot(
+                candidate=v,
+                run_id=str(run_id),
+                scanner_version=str(provenance.get("scanner_version") or PIPELINE_VERSION),
+                configuration_fingerprint=str(provenance.get("configuration_fingerprint") or "default"),
+                qualification_status=str(v.get("opportunity_status") or v.get("entry_decision") or "DISCOVERY_LEAD"),
+                rejection_reasons=v.get("qualification_blockers") or v.get("actionable_blockers") or [],
+                snapshot_time=snapshot,
+            )
+            for k, v in sorted(rows.items())
+        ]
+        ProspectiveOpportunityDataset.append_snapshots(
+            memory_dir,
+            prospective_snapshots,
+            partition_date=f"{snapshot:%Y%m%d}",
+        )
+    except Exception as exc:
+        # Prospective snapshot capture failure must not silently crash memory pipeline
+        pass
+
     grading = grade_outcomes(memory_dir, snapshot, rows, run_id)
 
     summary = {

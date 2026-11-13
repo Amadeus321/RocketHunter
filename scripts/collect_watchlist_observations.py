@@ -366,17 +366,21 @@ def calculate_simulated_execution(
     high_water_mark = entry_price
     low_water_mark = entry_price
     target_hit = False
+    first_target_touch_utc = None
 
     bars = bars_5m or []
     for bar in bars:
         h = bar.get("high") or bar.get("h") or bar.get("close")
         l = bar.get("low") or bar.get("l") or bar.get("close")
+        t = bar.get("time_open") or bar.get("time") or bar.get("timestamp")
         if h and h > high_water_mark:
             high_water_mark = h
         if l and l < low_water_mark:
             low_water_mark = l
         if target_price and h and h >= target_price:
             target_hit = True
+            if first_target_touch_utc is None and t:
+                first_target_touch_utc = str(t)
 
     mfe_pct = round(((high_water_mark - entry_price) / entry_price) * 100.0, 2)
     mae_pct = round(((low_water_mark - entry_price) / entry_price) * 100.0, 2)
@@ -384,8 +388,11 @@ def calculate_simulated_execution(
 
     return {
         "status": "SIMULATED",
+        "outcome_classification": "TARGET_REACHED" if target_hit else ("TARGET_NOT_REACHED" if bars else "INCOMPLETE_OBSERVATION"),
+        "execution_status": "EXECUTION_UNVERIFIED",
         "entry_price": entry_price,
         "target_price": target_price,
+        "first_observed_target_touch_utc": first_target_touch_utc,
         "liquidity_usd": liq,
         "fee_drag_pct": round(fee_drag_pct, 2),
         "slippage_drag_pct": round(slippage_drag_pct, 2),
@@ -393,7 +400,7 @@ def calculate_simulated_execution(
         "mfe_pct": mfe_pct,
         "mae_pct": mae_pct,
         "net_simulated_return_pct": net_return_pct,
-        "sequence_note": "Intrahour high/low sequence evaluated from 5m resolution candles.",
+        "sequence_note": "Intrahour high/low sequence evaluated from sub-hourly resolution candles. Market price observation only; not an executed trade.",
     }
 
 
