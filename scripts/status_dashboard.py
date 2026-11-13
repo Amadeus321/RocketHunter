@@ -1135,8 +1135,8 @@ pre {{
 <section id="user-trade-journal-section">
   <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:12px;margin-bottom:12px;">
     <div>
-      <h2 style="margin-bottom:4px;">3. User Position Journal &amp; AI Follow-Up (Real Trades) — AURA Learning Engine (AURA-v4.29.0 · Software v4.29.0)</h2>
-      <p class="meta" style="margin-bottom:0;">AURA (Adaptive Universal Rocket Algorithm) trains continuously and strictly from positions you confirm taking. Software version (v4.29.0) and AURA version (AURA-v4.29.0) are tracked with every trade to distinguish version history. Record your final P/L, trade status, and notes to guide future opportunity discovery and scoring.</p>
+      <h2 style="margin-bottom:4px;">3. User Position Journal &amp; AI Follow-Up (Real Trades) — AURA Learning Engine (AURA-v4.30.0 · Software v4.30.0)</h2>
+      <p class="meta" style="margin-bottom:0;">AURA (Adaptive Universal Rocket Algorithm) trains continuously and strictly from positions you confirm taking. Software version (v4.30.0) and AURA version (AURA-v4.30.0) are tracked with every trade to distinguish version history. Record your final P/L, trade status, and notes to guide future opportunity discovery and scoring.</p>
     </div>
     <div></div>
   </div>

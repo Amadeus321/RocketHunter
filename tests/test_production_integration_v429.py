@@ -317,8 +317,9 @@ class ProductionIntegrationV429Tests(unittest.TestCase):
         """Verifies AURA model versioning, SHA256 hashing, and truthful provenance reporting."""
         utl.get_journal()
         prov = utl.get_aura_provenance()
-        self.assertTrue(prov["aura_version"].startswith("AURA-v4.29.0"))
-        self.assertEqual(prov["software_version"], "v4.29.0")
+        sw_ver = utl.get_software_version()
+        self.assertTrue(prov["aura_version"].startswith(f"AURA-{sw_ver}"))
+        self.assertEqual(prov["software_version"], sw_ver)
         self.assertNotEqual(prov["model_sha256"], "UNAVAILABLE")
         self.assertIn("personal_learning_loaded", prov)
 

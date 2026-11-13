@@ -21,7 +21,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
-VERSION = "4.29.0"
+VERSION = "4.30.0"
 EARLY_BREAKOUT_SIGNAL_VERSION = "v4.25-early-breakout.v1"
 EARLY_BREAKOUT_MODEL_ID = "v4.25-early-breakout"
 API_ROOT = "https://api.dexpaprika.com"

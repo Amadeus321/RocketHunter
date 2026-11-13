@@ -91,7 +91,8 @@ jobs:
           PY
       - name: Run all deterministic tests and CLI smoke checks
         run: |
-          python -m unittest discover -s tests -p 'test_*.py' -v
+          pip install pytest pytest-subtests
+          python -m pytest tests/ -v
           python -m compileall -q scripts tests
           python scripts/rocket_hunt.py --help >/dev/null
           python scripts/run_full_scan.py --help >/dev/null

@@ -17,7 +17,7 @@ from __future__ import annotations
 import math
 from typing import Any
 
-BREAKOUT_SYSTEM_VERSION = "4.29.0"
+BREAKOUT_SYSTEM_VERSION = "4.30.0"
 
 
 def _num(val: Any) -> float | None:
