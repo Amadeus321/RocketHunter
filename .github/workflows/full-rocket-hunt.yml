@@ -178,8 +178,12 @@ jobs:
             rocket-hunt-checkpoints-
       - name: Restore persistent scanner memory branch
         run: |
-          git fetch origin scanner-memory:refs/remotes/origin/scanner-memory
-          git worktree add /tmp/scanner-memory refs/remotes/origin/scanner-memory
+          if git fetch origin +scanner-memory:refs/remotes/origin/scanner-memory 2>/dev/null; then
+            git worktree add -B scanner-memory /tmp/scanner-memory refs/remotes/origin/scanner-memory 2>/dev/null || git worktree add /tmp/scanner-memory refs/remotes/origin/scanner-memory
+          else
+            echo "scanner-memory branch not found on remote; initializing fresh branch."
+            git worktree add -B scanner-memory /tmp/scanner-memory
+          fi
       - name: Run bounded preflight, DEX-first discovery and seven-venue CEX pass
         env:
           COINGECKO_DEMO_API_KEY: ${{ secrets.COINGECKO_DEMO_API_KEY }}
@@ -253,6 +257,7 @@ jobs:
           git -C /tmp/scanner-memory add discovery forecasts outcomes provider-registries provider-network-state.json memory-manifest.json network-rotation-state.json calibration-state.json hyperliquid-market-state.json birdeye-rotation-state.json birdeye-cu-ledger.json dexpaprika-request-ledger.json active-24h-watchlist.json completed-24h-watchlist.json
           if ! git -C /tmp/scanner-memory diff --cached --quiet; then
             git -C /tmp/scanner-memory -c user.name="github-actions[bot]" -c user.email="41898282+github-actions[bot]@users.noreply.github.com" commit -m "Persist scanner memory for run ${GITHUB_RUN_ID}"
+            git -C /tmp/scanner-memory pull --rebase origin scanner-memory 2>/dev/null || true
             git -C /tmp/scanner-memory push origin HEAD:refs/heads/scanner-memory
           else
             echo "No memory changes to persist."

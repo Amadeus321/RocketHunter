@@ -39,7 +39,12 @@ class ForwardReportContractTests(unittest.TestCase):
             "data_fresh": True, "market_verified": True,
             "tracked_token_orientation_verified": True,
             "entry_decision": "TOP ROCKET — EXECUTION UNVERIFIED",
-            "pool_address": "0xpair123", "contract_address": "0xtoken123", "trade_plan": {"single_take_profit": 0.0175},
+            "pool_address": "0xpair123", "contract_address": "0xtoken123",
+            "initial_stop_price": 0.011, "trailing_stop_price": 0.012,
+            "trade_plan": {
+                "single_take_profit": 0.0175, "stop_loss_price": 0.011,
+                "trailing_stop_price": 0.012, "take_profit_2": 0.02,
+            },
         }
         meta = {
             "final_price_verified": True, "final_pool_address": "0xpair123",
@@ -60,6 +65,11 @@ class ForwardReportContractTests(unittest.TestCase):
         self.assertEqual(pick["trade_plan"]["tp_upside_pct"], 40.0)
         self.assertEqual(pick["pair_address"], "0xpair123")
         self.assertEqual(pick["trade_plan"]["pair_address"], "0xpair123")
+        self.assertNotIn("initial_stop_price", pick)
+        self.assertNotIn("trailing_stop_price", pick)
+        self.assertNotIn("stop_loss_price", pick["trade_plan"])
+        self.assertNotIn("trailing_stop_price", pick["trade_plan"])
+        self.assertNotIn("take_profit_2", pick["trade_plan"])
         self.assertIn("NOT A FIRM ROUTER", pick["entry_price_basis"])
 
     def test_incomplete_dex_pick_is_rejected_not_published(self):

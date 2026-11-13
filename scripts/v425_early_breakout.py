@@ -34,6 +34,19 @@ REGISTRY_TTL_SECONDS = 7 * 24 * 60 * 60
 SCANNER_ROLLING_REQUEST_CEILING = 7000
 MAX_MONITORED_POSITIONS = 12
 MAX_NEW_POSITIONS_PER_SCAN = 1
+LEGACY_STOP_FIELDS = (
+    "initial_stop_price", "stop_loss_pct", "stop_method", "trailing_stop_price",
+    "trailing_stop_armed", "first_protective_stop_touch_candle_utc",
+    "possible_protective_stop_touch_candle_utc", "protective_exit_type",
+    "protective_exit_reference_price", "intrahour_exit_order_ambiguous",
+    "scenario_reward_risk_ratio", "scenario_reward_risk_penalty",
+    "latest_scenario_reward_risk_ratio",
+)
+LEGACY_EXTRA_TARGET_FIELDS = (
+    "take_profit_1", "take_profit_2", "take_profit_3",
+    "target_1", "target_2", "target_3",
+    "tp1", "tp2", "tp3", "tp1_price", "tp2_price", "tp3_price",
+)
 REQUEST_INTERVAL_SECONDS = 4.2
 GECKO_POSITION_ROOT = "https://api.geckoterminal.com/api/v2"
 GECKO_POSITION_INTERVAL_SECONDS = 6.2
@@ -1256,6 +1269,12 @@ def apply_forward_opportunity_ranking(forward: dict[str, Any],
             continue
 
         item = copy.deepcopy(candidate)
+        for field in LEGACY_STOP_FIELDS + LEGACY_EXTRA_TARGET_FIELDS:
+            item.pop(field, None)
+        trade_plan = item.get("trade_plan")
+        if isinstance(trade_plan, dict):
+            for field in LEGACY_STOP_FIELDS + LEGACY_EXTRA_TARGET_FIELDS:
+                trade_plan.pop(field, None)
         key = str(item.get("identity") or "").strip()
         meta = index.get(key, {})
         for field in EARLY_FIELDS:
@@ -1320,8 +1339,6 @@ def apply_forward_opportunity_ranking(forward: dict[str, Any],
             late_penalty += 12.0
         if "CURRENT_PRICE_UNVERIFIED" in risk_flags:
             late_penalty += 8.0
-        scenario_reward_risk_penalty = _num(item.get("scenario_reward_risk_penalty")) or 0.0
-        late_penalty += max(0.0, min(8.0, scenario_reward_risk_penalty))
         projected_upside = _num(item.get("projected_24h_upside_pct"))
         projection_score = (
             100.0 * min(1.0, math.log1p(max(0.0, projected_upside)) / math.log1p(250.0))
@@ -1366,8 +1383,6 @@ def apply_forward_opportunity_ranking(forward: dict[str, Any],
             "upside_projection_pct": projected_upside,
             "upside_projection_score": round(projection_score, 2) if projection_score is not None else None,
             "upside_projection_contribution": round(projection_contribution, 2),
-            "scenario_reward_risk_ratio": _num(item.get("scenario_reward_risk_ratio")),
-            "scenario_reward_risk_penalty": round(scenario_reward_risk_penalty, 2),
             "late_chase_penalty": round(late_penalty, 2),
             "score_is_probability": False,
         }
@@ -1471,32 +1486,23 @@ def _expected_hour_opens(entry_ts: datetime | None, end_ts: datetime | None) -> 
 
 def _update_position(position: dict[str, Any], bars: list[dict[str, Any]],
                      now: datetime) -> dict[str, Any]:
-    """Manage a 24h research reference with ATR protection and a trailing runner.
-
-    Candle highs/lows do not reveal intrabar ordering. A target and stop in the
-    same hourly candle is therefore an ambiguous exit, not an assumed profit.
-    """
+    """Track one TP touch and price excursions for a 24-hour research window."""
     entry_ts = parse_time(position.get("entry_timestamp_utc"))
     end_ts = parse_time(position.get("time_stop_utc"))
     entry = _num(position.get("entry_price"))
     target = _num(position.get("single_take_profit"))
-    initial_stop = _num(position.get("initial_stop_price"))
-    atr = _num(position.get("atr_1h_usd"))
-    trailing_stop = _num(position.get("trailing_stop_price"))
     best = _num(position.get("max_price_since_entry"))
     worst = _num(position.get("min_price_since_entry"))
     first_hit = parse_time(position.get("first_tp_touch_candle_utc"))
     possible_hit = parse_time(position.get("possible_tp_touch_candle_utc"))
-    first_stop_hit = parse_time(position.get("first_protective_stop_touch_candle_utc"))
-    stop_type = position.get("protective_exit_type")
-    stop_exit_price = _num(position.get("protective_exit_reference_price"))
     full_bars = 0
     ambiguous_partial_hit = False
-    possible_stop_hit = parse_time(position.get("possible_protective_stop_touch_candle_utc"))
-    ambiguous_exit = False
     latest = _num(position.get("latest_price"))
     latest_ts = parse_time(position.get("latest_price_timestamp_utc"))
     observed_opens = set(position.get("observed_candle_open_times") or [])
+
+    for legacy_field in LEGACY_STOP_FIELDS:
+        position.pop(legacy_field, None)
 
     for bar in sorted(bars, key=lambda item: str(item.get("time_open") or "")):
         opened = _bar_time(bar, "time_open")
@@ -1517,30 +1523,12 @@ def _update_position(position: dict[str, Any], bars: list[dict[str, Any]],
                     ambiguous_partial_hit = True
                     if possible_hit is None or opened < possible_hit:
                         possible_hit = opened
-                active_edge_stop = trailing_stop if trailing_stop is not None else initial_stop
-                if active_edge_stop is not None and low <= active_edge_stop:
-                    if possible_stop_hit is None or opened < possible_stop_hit:
-                        possible_stop_hit = opened
                 continue
 
         full_bars += 1
         observed_opens.add(opened.replace(minute=0, second=0, microsecond=0).isoformat().replace("+00:00", "Z"))
-        active_stop = trailing_stop if trailing_stop is not None else initial_stop
-        stop_touched = active_stop is not None and low <= active_stop
         new_target_touch = target is not None and first_hit is None and high >= target
 
-        if stop_touched and new_target_touch:
-            # Do not assume the candle's high came before its low.
-            first_stop_hit = opened
-            stop_type = "INTRAHOUR_STOP_TP_ORDER_AMBIGUOUS"
-            stop_exit_price = active_stop
-            ambiguous_exit = True
-            break
-        if stop_touched:
-            first_stop_hit = opened
-            stop_type = "TRAILING_STOP" if trailing_stop is not None else "INITIAL_PROTECTIVE_STOP"
-            stop_exit_price = active_stop
-            break
         if new_target_touch:
             first_hit = opened
 
@@ -1550,26 +1538,13 @@ def _update_position(position: dict[str, Any], bars: list[dict[str, Any]],
             latest = close
             latest_ts = closed
 
-        # Arm/update the trailing stop only after this candle has closed. It
-        # becomes active on the next candle, avoiding same-candle look-ahead.
-        if initial_stop is not None and entry is not None:
-            risk_distance = entry - initial_stop
-            trail_armed = first_hit is not None or (
-                risk_distance > 0 and best is not None and best >= entry + risk_distance
-            )
-            if trail_armed:
-                trail_distance = max(1.5 * atr if atr is not None and atr > 0 else 0.0,
-                                     entry * 0.005)
-                next_trail = max(entry, initial_stop, best - trail_distance)
-                if trailing_stop is None or next_trail > trailing_stop:
-                    trailing_stop = next_trail
-
     if entry is not None and entry > 0:
         mfe = ((best / entry) - 1.0) * 100.0 if best is not None else None
+        mae = ((worst / entry) - 1.0) * 100.0 if worst is not None else None
         latest_return = ((latest / entry) - 1.0) * 100.0 if latest is not None else None
         retracement = ((latest / best) - 1.0) * 100.0 if latest is not None and best and best > 0 else None
     else:
-        mfe = latest_return = retracement = None
+        mfe = mae = latest_return = retracement = None
     hit = first_hit is not None
     expected_opens = _expected_hour_opens(entry_ts, end_ts)
     missing_opens = [stamp for stamp in expected_opens if stamp not in observed_opens]
@@ -1585,6 +1560,7 @@ def _update_position(position: dict[str, Any], bars: list[dict[str, Any]],
         "latest_price": latest,
         "latest_price_timestamp_utc": latest_ts.isoformat().replace("+00:00", "Z") if latest_ts else position.get("latest_price_timestamp_utc"),
         "max_favorable_excursion_pct": round(mfe, 4) if mfe is not None else None,
+        "max_adverse_excursion_pct": round(mae, 4) if mae is not None else None,
         "latest_return_from_entry_pct": round(latest_return, 4) if latest_return is not None else None,
         "retracement_from_peak_pct": round(retracement, 4) if retracement is not None else None,
         "candles_observed_this_check": full_bars,
@@ -1592,56 +1568,20 @@ def _update_position(position: dict[str, Any], bars: list[dict[str, Any]],
         "take_profit_hit": bool(hit or position.get("take_profit_hit")),
         "first_tp_touch_candle_utc": first_hit.isoformat().replace("+00:00", "Z") if first_hit else position.get("first_tp_touch_candle_utc"),
         "possible_tp_touch_candle_utc": possible_hit.isoformat().replace("+00:00", "Z") if possible_hit else position.get("possible_tp_touch_candle_utc"),
-        "first_protective_stop_touch_candle_utc": first_stop_hit.isoformat().replace("+00:00", "Z") if first_stop_hit else position.get("first_protective_stop_touch_candle_utc"),
-        "possible_protective_stop_touch_candle_utc": possible_stop_hit.isoformat().replace("+00:00", "Z") if possible_stop_hit else position.get("possible_protective_stop_touch_candle_utc"),
-        "trailing_stop_price": round(trailing_stop, 12) if trailing_stop is not None else position.get("trailing_stop_price"),
-        "trailing_stop_armed": trailing_stop is not None,
-        "protective_exit_type": stop_type,
-        "protective_exit_reference_price": stop_exit_price,
-        "intrahour_exit_order_ambiguous": ambiguous_exit,
         "ohlcv_resolution": "1h",
     })
-
-    if first_stop_hit is not None:
-        position["exit_timestamp_utc"] = first_stop_hit.isoformat().replace("+00:00", "Z")
-        position["exit_reference_price"] = stop_exit_price
-        position["realized_reference_return_pct"] = (
-            round((stop_exit_price / entry - 1.0) * 100.0, 4)
-            if entry and stop_exit_price is not None else None
-        )
-        position["window_status"] = "CLOSED_EARLY"
-        if ambiguous_exit:
-            position["position_status"] = "EXIT AMBIGUOUS — TARGET AND STOP WITHIN SAME HOURLY CANDLE"
-            position["result_status"] = "INTRAHOUR_EXIT_ORDER_AMBIGUOUS"
-        else:
-            position["position_status"] = (
-                "TRAILING STOP HIT — RUNNER EXITED" if stop_type == "TRAILING_STOP"
-                else "INITIAL PROTECTIVE STOP HIT — POSITION EXITED"
-            )
-            position["result_status"] = (
-                "TRAILING_STOP_EXIT_WITHIN_24H" if stop_type == "TRAILING_STOP"
-                else "INITIAL_STOP_EXIT_WITHIN_24H"
-            )
-        return position
 
     if entry_ts and end_ts and now >= end_ts:
         position["window_status"] = "CLOSED_24H"
         position["exit_timestamp_utc"] = end_ts.isoformat().replace("+00:00", "Z")
         position["exit_reference_price"] = latest
         position["realized_reference_return_pct"] = latest_return
-        if ambiguous_partial_hit or possible_stop_hit is not None:
-            position["result_status"] = (
-                "TP_TOUCH_UNCONFIRMED" if ambiguous_partial_hit and possible_stop_hit is None
-                else "WINDOW_EDGE_EXIT_TOUCH_UNCONFIRMED"
-            )
-            position["position_status"] = (
-                "24H WINDOW CLOSED — POSSIBLE TP TOUCH"
-                if ambiguous_partial_hit and possible_stop_hit is None
-                else "24H WINDOW CLOSED — EXIT TOUCH UNCONFIRMED"
-            )
+        if ambiguous_partial_hit:
+            position["result_status"] = "TP_TOUCH_UNCONFIRMED"
+            position["position_status"] = "24H WINDOW CLOSED — POSSIBLE TP TOUCH"
         elif hit:
-            position["result_status"] = "TIME_STOP_EXIT_AFTER_TP_TRAILING"
-            position["position_status"] = "24H WINDOW CLOSED — TP MILESTONE HIT; RUNNER EXITED AT TIME STOP"
+            position["result_status"] = "TAKE_PROFIT_REACHED_WITHIN_24H"
+            position["position_status"] = "24H WINDOW CLOSED — SINGLE TP TOUCH OBSERVED"
         elif target is None:
             position["result_status"] = "TARGET_UNVERIFIED"
             position["position_status"] = "24H WINDOW CLOSED — TARGET UNVERIFIED"
@@ -1653,29 +1593,20 @@ def _update_position(position: dict[str, Any], bars: list[dict[str, Any]],
             )
     else:
         position["window_status"] = "OPEN"
-        if ambiguous_partial_hit or possible_stop_hit is not None:
-            target_only = ambiguous_partial_hit and possible_stop_hit is None
-            position["position_status"] = (
-                "POSSIBLE TP TOUCH — HOURLY CANDLE OVERLAPS WINDOW EDGE"
-                if target_only else
-                "POSSIBLE EXIT TOUCH — HOURLY CANDLE OVERLAPS WINDOW EDGE"
-            )
-            position["result_status"] = "TP_TOUCH_UNCONFIRMED" if target_only else "EXIT_TOUCH_UNCONFIRMED"
+        if ambiguous_partial_hit:
+            position["position_status"] = "POSSIBLE TP TOUCH — HOURLY CANDLE OVERLAPS WINDOW EDGE"
+            position["result_status"] = "TP_TOUCH_UNCONFIRMED"
         elif hit:
             position["position_status"] = (
-                "TP REACHED — TRAILING RUNNER OPEN" if initial_stop is not None
-                else "TP HIT — STILL AT/ABOVE TARGET" if latest is not None and latest >= target
-                else "TP HIT — PULLBACK"
+                "TP TOUCH OBSERVED — STILL AT/ABOVE TARGET" if latest is not None and latest >= target
+                else "TP TOUCH OBSERVED — PULLBACK"
             )
-            position["result_status"] = (
-                "TAKE_PROFIT_REACHED_TRAILING_RUNNER_OPEN" if initial_stop is not None
-                else "TAKE_PROFIT_REACHED_WITHIN_24H"
-            )
+            position["result_status"] = "TAKE_PROFIT_REACHED_WITHIN_24H"
         elif target is None:
             position["position_status"] = "TARGET FORMING — MFE TRACKED"
             position["result_status"] = "NO_VERIFIED_TARGET"
         else:
-            position["position_status"] = "OPEN — TARGET / PROTECTIVE STOP NOT YET OBSERVED"
+            position["position_status"] = "OPEN — SINGLE TP NOT YET OBSERVED"
             position["result_status"] = "OPEN"
     return position
 
@@ -1894,8 +1825,10 @@ def update_position_monitor(outdir: Path, memory_dir: Path, run_id: str) -> dict
     networks, registry_meta = _load_registry(client)
     try:
         from scripts import venues as venue_adapters
+        from scripts.tp_gate import canonical_tp_upside
     except ImportError:
         import venues as venue_adapters
+        from tp_gate import canonical_tp_upside
     cex_fx = venue_adapters.Fetcher(timeout=8, retries=2, pause=0)
 
     state_path = memory_dir / "active-24h-watchlist.json"
@@ -1919,6 +1852,8 @@ def update_position_monitor(outdir: Path, memory_dir: Path, run_id: str) -> dict
                           -(_num(item.get("early_breakout_score")) or 0.0)),
     )
     for position in monitor_rows:
+        for legacy_field in LEGACY_STOP_FIELDS:
+            position.pop(legacy_field, None)
         start_ts = parse_time(position.get("entry_timestamp_utc"))
         end_ts = parse_time(position.get("time_stop_utc"))
         if start_ts is None or end_ts is None:
@@ -1951,9 +1886,7 @@ def update_position_monitor(outdir: Path, memory_dir: Path, run_id: str) -> dict
             updated.append(position)
 
     by_key = {_position_key(item): item for item in updated}
-    # Prevent immediate re-entry after a protective exit. A fresh scan may rank
-    # the same asset again, but do not reopen the same reference for four hours
-    # after a stop; this avoids repeated entries into a signal that just failed.
+    # Avoid duplicating a recently completed 24-hour observation window.
     reentry_cooldown = timedelta(hours=4)
     recent_closed_by_key = {}
     for item in completed:
@@ -1972,7 +1905,6 @@ def update_position_monitor(outdir: Path, memory_dir: Path, run_id: str) -> dict
             existing["latest_early_breakout_score"] = candidate.get("early_breakout_score")
             existing["latest_forecast_rank"] = candidate.get("forecast_rank")
             existing["latest_forward_opportunity_rank"] = candidate.get("forward_opportunity_rank")
-            existing["latest_scenario_reward_risk_ratio"] = candidate.get("scenario_reward_risk_ratio")
             continue
         if len(by_key) >= MAX_MONITORED_POSITIONS or new_positions >= MAX_NEW_POSITIONS_PER_SCAN:
             break
@@ -2017,7 +1949,9 @@ def update_position_monitor(outdir: Path, memory_dir: Path, run_id: str) -> dict
         target = _num(plan.get("single_take_profit"))
         if target is None:
             target = _num(candidate.get("target_price"))
-        initial_stop = _num(candidate.get("initial_stop_price"))
+        tp_upside = canonical_tp_upside(entry, target)
+        if tp_upside is None or tp_upside < 40.0:
+            continue
         end = stamp + timedelta(hours=24)
         record = {
             "identity": key,
@@ -2037,16 +1971,10 @@ def update_position_monitor(outdir: Path, memory_dir: Path, run_id: str) -> dict
             "entry_timestamp_utc": stamp.isoformat().replace("+00:00", "Z"),
             "single_take_profit": target,
             "target_method": candidate.get("target_price_source"),
-            "initial_stop_price": initial_stop,
-            "stop_loss_pct": _num(candidate.get("stop_loss_pct")),
-            "stop_method": candidate.get("stop_method"),
-            "atr_1h_usd": _num(candidate.get("atr_1h_usd")),
-            "trailing_stop_price": None,
             "time_stop_utc": end.isoformat().replace("+00:00", "Z"),
             "early_breakout_score": candidate.get("early_breakout_score"),
             "early_breakout_tier": candidate.get("early_breakout_tier"),
             "forward_opportunity_rank": candidate.get("forward_opportunity_rank"),
-            "scenario_reward_risk_ratio": candidate.get("scenario_reward_risk_ratio"),
             "latest_forecast_rank": candidate.get("forecast_rank"),
             "max_price_since_entry": entry,
             "min_price_since_entry": entry,
@@ -2055,8 +1983,6 @@ def update_position_monitor(outdir: Path, memory_dir: Path, run_id: str) -> dict
             "take_profit_hit": False,
             "possible_tp_touch_candle_utc": None,
             "first_tp_touch_candle_utc": None,
-            "first_protective_stop_touch_candle_utc": None,
-            "possible_protective_stop_touch_candle_utc": None,
             "window_status": "OPEN",
             "position_status": "OPEN — INITIAL REFERENCE",
             "research_only": True,
@@ -2081,7 +2007,7 @@ def update_position_monitor(outdir: Path, memory_dir: Path, run_id: str) -> dict
         "max_new_positions_per_scan": MAX_NEW_POSITIONS_PER_SCAN,
         "position_count": len(updated),
         "positions": updated,
-        "policy": "Research-only 24h reference management: monitor DEX exact-token USD candles and CEX venue candles; take-profit is a milestone, ATR stop protects downside, and trailing stop retains upside; no actual wallet trades or fills are known.",
+        "policy": "Research-only 24h reference monitoring: exactly one single take-profit of at least +40.00%; no stop loss or trailing stop; no actual wallet trades or fills are known.",
     }
     _write_json(state_path, state_out)
     _write_json(memory_dir / "completed-24h-watchlist.json", completed)
@@ -2091,10 +2017,11 @@ def update_position_monitor(outdir: Path, memory_dir: Path, run_id: str) -> dict
         "ohlcv_resolution": "1h; full candles only; DEX USD denomination is selected by exact token contract/mint",
         "management_policy": {
             "max_reference_window_hours": 24,
-            "initial_stop": "1.8x 1h ATR, with a 1% minimum buffer and 25% maximum reference risk, where candles allow calculation",
-            "trailing_stop": "arms after first target milestone or one initial-risk distance in favorable movement; trails 1.5x 1h ATR or 0.5%, whichever is wider",
-            "ambiguous_hour": "target and protective stop touched within same hourly candle is marked ambiguous; no assumed event order",
-            "time_stop": "close reference at 24h if no protective stop has already closed it",
+            "take_profit_count": 1,
+            "take_profit_minimum_upside_pct": 40.0,
+            "stop_loss": "NONE",
+            "trailing_stop": "NONE",
+            "window_close": "close the research observation window at 24h; this is not a stop-loss or an executable order",
         },
         "max_open_reference_positions": MAX_MONITORED_POSITIONS,
         "new_reference_positions_per_scan": MAX_NEW_POSITIONS_PER_SCAN,

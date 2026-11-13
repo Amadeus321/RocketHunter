@@ -182,10 +182,10 @@ class EarlyBreakoutTests(unittest.TestCase):
         self.assertAlmostEqual(leader["forward_opportunity_score_breakdown"]["upside_projection_contribution"], 25.0)
         self.assertEqual(leader["target_price"], 0.0102)
         self.assertEqual(leader["projected_24h_upside_pct"], 250.0)
-        self.assertEqual(leader["scenario_reward_risk_ratio"], 0.8)
-        self.assertEqual(leader["scenario_reward_risk_penalty"], 4.0)
-        self.assertEqual(leader["late_chase_penalty"], 4.0)
-        self.assertAlmostEqual(leader["forward_opportunity_score"], 69.0)
+        self.assertNotIn("scenario_reward_risk_ratio", leader)
+        self.assertNotIn("scenario_reward_risk_penalty", leader)
+        self.assertEqual(leader["late_chase_penalty"], 0.0)
+        self.assertAlmostEqual(leader["forward_opportunity_score"], 73.0)
         self.assertIn("25% volatility/momentum upside projection", leader["forward_opportunity_ranking_model"])
         self.assertIsNone(result["top_rocket_pick"])
         self.assertEqual(result["top_opportunities"], [])
@@ -244,7 +244,7 @@ class EarlyBreakoutTests(unittest.TestCase):
         ]
         updated = v425._update_position(position, bars, datetime(2026, 11, 5, 3, tzinfo=timezone.utc))
         self.assertTrue(updated["take_profit_hit"])
-        self.assertEqual(updated["position_status"], "TP HIT — PULLBACK")
+        self.assertEqual(updated["position_status"], "TP TOUCH OBSERVED — PULLBACK")
         self.assertEqual(updated["first_tp_touch_candle_utc"], "2026-11-05T01:00:00Z")
         self.assertAlmostEqual(updated["max_favorable_excursion_pct"], 25.0)
         self.assertAlmostEqual(updated["latest_return_from_entry_pct"], 5.0)
@@ -294,7 +294,7 @@ class EarlyBreakoutTests(unittest.TestCase):
         self.assertEqual(updated["observed_candle_open_count"], 24)
 
 
-    def test_atr_initial_stop_closes_reference_early(self):
+    def test_low_below_legacy_stop_does_not_close_reference(self):
         position = {
             "market_type": "cex_spot", "entry_price": 100.0,
             "entry_timestamp_utc": "2026-11-05T00:00:00Z",
@@ -311,12 +311,14 @@ class EarlyBreakoutTests(unittest.TestCase):
 
         updated = v425._update_position(position, bars, datetime(2026, 11, 5, 3, tzinfo=timezone.utc))
 
-        self.assertEqual(updated["window_status"], "CLOSED_EARLY")
-        self.assertEqual(updated["result_status"], "INITIAL_STOP_EXIT_WITHIN_24H")
-        self.assertEqual(updated["protective_exit_type"], "INITIAL_PROTECTIVE_STOP")
-        self.assertAlmostEqual(updated["realized_reference_return_pct"], -10.0)
+        self.assertEqual(updated["window_status"], "OPEN")
+        self.assertEqual(updated["result_status"], "OPEN")
+        self.assertAlmostEqual(updated["latest_return_from_entry_pct"], -8.0)
+        self.assertAlmostEqual(updated["max_adverse_excursion_pct"], -11.0)
+        self.assertNotIn("initial_stop_price", updated)
+        self.assertNotIn("protective_exit_type", updated)
 
-    def test_take_profit_is_a_milestone_and_trailing_stop_protects_runner(self):
+    def test_single_tp_touch_does_not_arm_or_trigger_a_trailing_stop(self):
         position = {
             "market_type": "cex_spot", "entry_price": 100.0,
             "entry_timestamp_utc": "2026-11-05T00:00:00Z",
@@ -335,13 +337,14 @@ class EarlyBreakoutTests(unittest.TestCase):
 
         updated = v425._update_position(position, bars, datetime(2026, 11, 5, 4, tzinfo=timezone.utc))
 
-        self.assertEqual(updated["result_status"], "TRAILING_STOP_EXIT_WITHIN_24H")
-        self.assertEqual(updated["protective_exit_type"], "TRAILING_STOP")
-        self.assertEqual(updated["window_status"], "CLOSED_EARLY")
+        self.assertEqual(updated["result_status"], "TAKE_PROFIT_REACHED_WITHIN_24H")
+        self.assertEqual(updated["window_status"], "OPEN")
         self.assertEqual(updated["first_tp_touch_candle_utc"], "2026-11-05T01:00:00Z")
-        self.assertAlmostEqual(updated["realized_reference_return_pct"], 7.0)
+        self.assertAlmostEqual(updated["latest_return_from_entry_pct"], 8.0)
+        self.assertNotIn("trailing_stop_price", updated)
+        self.assertNotIn("protective_exit_type", updated)
 
-    def test_target_and_initial_stop_in_same_hour_are_not_assumed_in_profit_order(self):
+    def test_target_touch_and_large_drawdown_in_same_hour_only_record_the_tp_touch(self):
         position = {
             "entry_price": 100.0,
             "entry_timestamp_utc": "2026-11-05T00:00:00Z",
@@ -358,9 +361,10 @@ class EarlyBreakoutTests(unittest.TestCase):
 
         updated = v425._update_position(position, bars, datetime(2026, 11, 5, 3, tzinfo=timezone.utc))
 
-        self.assertEqual(updated["result_status"], "INTRAHOUR_EXIT_ORDER_AMBIGUOUS")
-        self.assertTrue(updated["intrahour_exit_order_ambiguous"])
-        self.assertEqual(updated["window_status"], "CLOSED_EARLY")
+        self.assertEqual(updated["result_status"], "TAKE_PROFIT_REACHED_WITHIN_24H")
+        self.assertTrue(updated["take_profit_hit"])
+        self.assertEqual(updated["window_status"], "OPEN")
+        self.assertAlmostEqual(updated["max_adverse_excursion_pct"], -12.0)
 
     def test_cex_ohlcv_rows_normalize_to_closed_utc_hourly_bars(self):
         now = datetime(2026, 11, 5, 4, tzinfo=timezone.utc)
@@ -438,7 +442,7 @@ class EarlyBreakoutTests(unittest.TestCase):
                     "data_timestamp_utc": stamp,
                     "early_breakout_score": 95.0,
                     "source_forecast_score_pre_age_guard": 30.0,
-                    "target_price": 0.0005,
+                    "target_price": 0.0006,
                     "target_price_source": "7D_SWING_RESISTANCE",
                     "initial_stop_price": 0.00038,
                     "stop_loss_pct": 9.5,
@@ -461,7 +465,45 @@ class EarlyBreakoutTests(unittest.TestCase):
             self.assertEqual(result["active_positions"], 1)
             self.assertEqual(state["positions"][0]["market_type"], "dex_pool")
             self.assertEqual(state["positions"][0]["quote_symbol"], "SOL")
-            self.assertEqual(state["positions"][0]["initial_stop_price"], 0.00038)
+            self.assertNotIn("initial_stop_price", state["positions"][0])
+            self.assertNotIn("stop_loss_pct", state["positions"][0])
+
+    def test_position_monitor_skips_targets_below_single_tp40_threshold(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            outdir = root / "out"
+            memory = root / "memory"
+            outdir.mkdir()
+            memory.mkdir()
+            stamp = v425.utc_now()
+            v425._write_json(outdir / "forward-24h-rocket.json", {
+                "as_of_utc": stamp,
+                "candidates": [{
+                    "identity": "dex:solana:pool-under-tp40",
+                    "asset": "UnderTP40",
+                    "market_type": "dex_pool",
+                    "chain": "solana",
+                    "pool_address": "pool-under-tp40",
+                    "contract_address": "under-tp40-mint",
+                    "price": 0.42,
+                    "data_timestamp_utc": stamp,
+                    "target_price": 0.50,
+                }],
+            })
+            v425._write_json(outdir / "rocket-hunt.json", {})
+
+            class FakeDexClient:
+                request_count = 0
+                def __init__(self, *args, **kwargs):
+                    pass
+
+            with patch.object(v425, "DexPaprikaClient", FakeDexClient), \
+                 patch.object(v425, "_load_registry", return_value=([], {"registry_cached": True})):
+                result = v425.update_position_monitor(outdir, memory, "test-run")
+
+            state = v425._load_json(memory / "active-24h-watchlist.json", {})
+            self.assertEqual(result["active_positions"], 0)
+            self.assertEqual(state["positions"], [])
 
     def test_position_monitor_accepts_cex_spot_reference(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -484,7 +526,7 @@ class EarlyBreakoutTests(unittest.TestCase):
                     "data_timestamp_utc": stamp,
                     "early_breakout_score": 80.0,
                     "source_forecast_score_pre_age_guard": 25.0,
-                    "target_price": 1.5,
+                    "target_price": 1.75,
                     "target_price_source": "7D_SWING_RESISTANCE",
                     "initial_stop_price": 1.1,
                     "stop_loss_pct": 12.0,

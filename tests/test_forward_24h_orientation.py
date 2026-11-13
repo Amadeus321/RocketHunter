@@ -162,7 +162,7 @@ class Forward24hOrientationTests(unittest.TestCase):
         self.assertEqual(context["alt_breadth_pct"], 100.0)
         self.assertEqual(context["btc_source"], "Binance BTCUSDT 1h candles")
 
-    def test_atr_risk_metrics_produce_bounded_initial_stop(self):
+    def test_atr_metrics_do_not_create_a_stop_loss(self):
         candles = []
         for hour in range(30):
             candles.append({
@@ -172,9 +172,9 @@ class Forward24hOrientationTests(unittest.TestCase):
         metrics = derive_risk_metrics(candles, 100.0)
 
         self.assertIsNotNone(metrics["atr_1h_usd"])
-        self.assertLess(metrics["initial_stop_price"], 100.0)
-        self.assertGreaterEqual(metrics["stop_loss_pct"], 1.0)
-        self.assertLessEqual(metrics["stop_loss_pct"], 25.0)
+        self.assertIsNotNone(metrics["atr_1h_pct"])
+        self.assertNotIn("initial_stop_price", metrics)
+        self.assertNotIn("stop_loss_pct", metrics)
 
     def test_exact_tracked_token_is_used_when_it_is_quote(self):
         throttle = _FakeThrottle("So11111111111111111111111111111111111111112", "tracked-mint")

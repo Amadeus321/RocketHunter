@@ -57,7 +57,10 @@ class UnifiedBudgetManager:
         self.completed_phases: dict[str, dict[str, Any]] = {}
 
     def start_phase(self, phase_name: str) -> float:
-        """Mark the beginning of a phase and return its remaining allocated seconds."""
+        """Mark the beginning of a phase and return its remaining allocated seconds.
+        Dynamically rolls unspent budget from earlier completed phases forward into
+        downstream phases while guaranteeing minimum reserve for remaining phases.
+        """
         now = time.monotonic()
         if self.current_phase and self.current_phase_start is not None:
             self.end_phase(self.current_phase)
@@ -65,10 +68,28 @@ class UnifiedBudgetManager:
         self.current_phase = phase_name
         self.current_phase_start = now
 
-        # Compute dynamic allowance considering remaining scan time
+        # Define canonical phases order to compute downstream required reserves
+        phases_order = [
+            "preflight_and_registries",
+            "global_multichain_discovery",
+            "candidate_enrichment",
+            "deep_verification_safety",
+            "finalization_and_reports",
+        ]
+        downstream_reserve = 0.0
+        if phase_name in phases_order:
+            idx = phases_order.index(phase_name)
+            downstream_phases = phases_order[idx + 1:]
+            downstream_reserve = sum(self.phase_budgets.get(p, 10.0) for p in downstream_phases) * 60.0
+
         remaining_whole_scan = max(0.0, self.usable_deadline - now)
+        # Usable allowance for this phase is all remaining scan time minus downstream reserve
+        max_possible_allowance = max(0.0, remaining_whole_scan - downstream_reserve)
         base_allowance = self.phase_budgets.get(phase_name, 10.0) * 60.0
-        allocated_seconds = min(base_allowance, remaining_whole_scan)
+
+        # Allow this phase to use its base budget plus saved/unspent time from prior phases
+        allocated_seconds = max(base_allowance, max_possible_allowance)
+        allocated_seconds = min(allocated_seconds, remaining_whole_scan)
         return max(1.0, allocated_seconds)
 
     def end_phase(self, phase_name: str) -> dict[str, Any]:

@@ -324,13 +324,10 @@ def project_24h_upside(candles, current_price, stats=None, as_of_timestamp=None)
 
 
 def derive_risk_metrics(candles, current_price, as_of_timestamp=None):
-    """Derive a volatility-based 24h invalidation level from completed hourly candles."""
+    """Derive hourly volatility context without creating a stop-loss level."""
     bars, _ = _hourly_bars(candles, as_of_timestamp)
     if current_price is None or current_price <= 0 or len(bars) < 20:
-        return {
-            "atr_1h_usd": None, "atr_1h_pct": None, "initial_stop_price": None,
-            "stop_loss_pct": None, "stop_method": "UNVERIFIED_INSUFFICIENT_HOURLY_CANDLES",
-        }
+        return {"atr_1h_usd": None, "atr_1h_pct": None}
     true_ranges = []
     for previous, current in zip(bars[:-1], bars[1:]):
         true_ranges.append(max(
@@ -340,20 +337,11 @@ def derive_risk_metrics(candles, current_price, as_of_timestamp=None):
         ))
     atr = statistics_median(true_ranges[-14:])
     if atr <= 0:
-        return {
-            "atr_1h_usd": None, "atr_1h_pct": None, "initial_stop_price": None,
-            "stop_loss_pct": None, "stop_method": "UNVERIFIED_ZERO_HOURLY_ATR",
-        }
+        return {"atr_1h_usd": None, "atr_1h_pct": None}
     atr_pct = atr / current_price * 100.0
-    # 1.8x ATR, with a 1% minimum noise buffer and 25% maximum reference risk.
-    risk_distance = min(current_price * 0.25, max(current_price * 0.01, 1.8 * atr))
-    stop = current_price - risk_distance
     return {
         "atr_1h_usd": round(atr, 12),
         "atr_1h_pct": round(atr_pct, 4),
-        "initial_stop_price": round(stop, 12),
-        "stop_loss_pct": round((risk_distance / current_price) * 100.0, 4),
-        "stop_method": "1.8X_1H_ATR_MIN_1PCT_MAX_25PCT_REFERENCE_RISK",
     }
 
 
@@ -1118,6 +1106,31 @@ def make_candidate(row, scan_ts, cvd_index, books_index, security_index, routes_
 
 
 
+LEGACY_STOP_FIELDS = (
+    "initial_stop_price", "stop_loss", "stop_loss_price", "stop_loss_pct", "stop_method",
+    "trailing_stop", "trailing_stop_price", "trailing_stop_armed",
+    "first_protective_stop_touch_candle_utc", "possible_protective_stop_touch_candle_utc",
+    "protective_exit_type", "protective_exit_reference_price",
+    "scenario_reward_risk_ratio", "scenario_reward_risk_penalty",
+)
+LEGACY_EXTRA_TARGET_FIELDS = (
+    "take_profit_1", "take_profit_2", "take_profit_3",
+    "target_1", "target_2", "target_3",
+    "tp1", "tp2", "tp3", "tp1_price", "tp2_price", "tp3_price",
+)
+
+
+def _strip_noncanonical_trade_fields(candidate):
+    if not isinstance(candidate, dict):
+        return
+    for field in LEGACY_STOP_FIELDS + LEGACY_EXTRA_TARGET_FIELDS:
+        candidate.pop(field, None)
+    trade = candidate.get("trade_plan")
+    if isinstance(trade, dict):
+        for field in LEGACY_STOP_FIELDS + LEGACY_EXTRA_TARGET_FIELDS:
+            trade.pop(field, None)
+
+
 def enforce_required_trade_fields(top, market_meta, forecast_end=None):
     """Require a fresh DEX price, candle-backed TP and exact pool/pair address.
 
@@ -1127,6 +1140,7 @@ def enforce_required_trade_fields(top, market_meta, forecast_end=None):
     """
     if not isinstance(top, dict) or not top:
         return None, ["ranked DEX pick"]
+    _strip_noncanonical_trade_fields(top)
     meta = market_meta if isinstance(market_meta, dict) else {}
     trade = top.get("trade_plan") if isinstance(top.get("trade_plan"), dict) else {}
     pair_address = str(top.get("pool_address") or meta.get("pool_address") or "").strip()
@@ -1266,12 +1280,7 @@ def render_markdown(doc, report):
              "| Projected 24h upside scenario | %s |" % (
                  "UNVERIFIED" if num(top.get("projected_24h_upside_pct")) is None
                  else "%+.2f%% (uncalibrated)" % num(top.get("projected_24h_upside_pct"))),
-             "| Initial ATR stop | %s |" % fmt(top.get("initial_stop_price")),
-             "| ATR downside | %s |" % (
-                 "UNVERIFIED" if num(top.get("stop_loss_pct")) is None else "%.2f%%" % num(top.get("stop_loss_pct"))),
-             "| Scenario reward/risk | %s |" % (
-                 "UNVERIFIED" if num(top.get("scenario_reward_risk_ratio")) is None
-                 else "%.2fx" % num(top.get("scenario_reward_risk_ratio"))),
+             "| Trade-plan policy | Exactly one single TP of at least +40.00%; no stop loss or trailing stop |",
              "| Market regime | %s |" % (doc.get("market_regime") or "UNVERIFIED"),
              "| Hyperliquid context | %s |" % (
                  (doc.get("hyperliquid_derivatives_context") or {}).get("status", "UNVERIFIED")),
@@ -1292,17 +1301,15 @@ def render_markdown(doc, report):
         lines += ["", "**Risk flags:**"]
         lines.extend("- " + x for x in top.get("risk_flags", [])[:12])
     lines += ["", "### Forward-24h ranking (sampled accessible universe)", "",
-              "| Rank | Asset | Market | 1h move | 24h move | Projected 24h upside | ATR downside | Scenario R:R | Status | Pair address | Token contract |",
-              "|---:|---|---|---:|---:|---:|---:|---:|---|---|---|"]
+              "| Rank | Asset | Market | 1h move | 24h move | Projected 24h upside | Status | Pair address | Token contract |",
+              "|---:|---|---|---:|---:|---:|---|---|---|"]
     for item in doc.get("candidates", [])[:25]:
         md = next((m for m in report.get("candidates", []) if m.get("identity") == item.get("identity")), {})
-        lines.append("| %s | %s | %s | %s | %s | %s | %s | %s | %s | `%s` | `%s` |" % (
+        lines.append("| %s | %s | %s | %s | %s | %s | %s | `%s` | `%s` |" % (
             item.get("forecast_rank"), item.get("asset"), item.get("market_type"),
             ("n/a" if num((item.get("returns_pct") or {}).get("1h")) is None else "%+.2f%%" % num((item.get("returns_pct") or {}).get("1h"))),
             ("n/a" if num((item.get("returns_pct") or {}).get("24h")) is None else "%+.2f%%" % num((item.get("returns_pct") or {}).get("24h"))),
             ("n/a" if num(item.get("projected_24h_upside_pct")) is None else "%+.2f%%" % num(item.get("projected_24h_upside_pct"))),
-            ("n/a" if num(item.get("stop_loss_pct")) is None else "%.2f%%" % num(item.get("stop_loss_pct"))),
-            ("n/a" if num(item.get("scenario_reward_risk_ratio")) is None else "%.2fx" % num(item.get("scenario_reward_risk_ratio"))),
             item.get("entry_decision"), md.get("pool_address") or "N/A", md.get("contract_address") or "—"))
     lines += ["", "**Important:** the forecast is a ranking heuristic, not a calibrated probability or a guarantee that this asset will be the actual best gainer. The trailing raw 24h champion and forward forecast are separate. DEX trade CVD remains capped to one pool/300 sampled trades; missing CEX CVD, derivatives and full safety evidence remain unverified.", ""]
     return "\n".join(lines)
@@ -1436,6 +1443,7 @@ def main(argv=None):
         # into a probability. Strong early momentum therefore influences rank
         # without concealing missing safety or execution evidence.
         for ranked in doc.get("candidates", []):
+            _strip_noncanonical_trade_fields(ranked)
             item_meta = meta.get(str(ranked.get("identity")), {})
             early = num(item_meta.get("early_breakout_score"))
             base_score = num(ranked.get("forecast_score")) or 0.0
@@ -1465,9 +1473,7 @@ def main(argv=None):
             ranked["liquidity_usd"] = item_meta.get("liquidity_usd")
             ranked["volume_24h_usd"] = item_meta.get("volume_24h_usd")
             ranked["age_hours"] = item_meta.get("age_hours")
-            for risk_field in ("atr_1h_usd", "atr_1h_pct", "initial_stop_price",
-                               "stop_loss_pct", "stop_method", "scenario_reward_risk_ratio",
-                               "scenario_reward_risk_penalty", "hyperliquid_context_available",
+            for risk_field in ("atr_1h_usd", "atr_1h_pct", "hyperliquid_context_available",
                                "hyperliquid_mark_price_usd", "hyperliquid_price_difference_pct",
                                "hyperliquid_funding_hourly_pct", "hyperliquid_open_interest_usd",
                                "hyperliquid_day_volume_usd", "hyperliquid_match_status",
@@ -1482,35 +1488,23 @@ def main(argv=None):
                 if risk_field in item_meta:
                     ranked[risk_field] = item_meta.get(risk_field)
             projected = num(ranked.get("projected_24h_upside_pct"))
-            stop_risk_pct = num(ranked.get("stop_loss_pct"))
-            scenario_reward_risk = (
-                projected / stop_risk_pct
-                if projected is not None and projected > 0 and stop_risk_pct is not None and stop_risk_pct > 0
-                else None
-            )
-            ranked["scenario_reward_risk_ratio"] = round(scenario_reward_risk, 3) if scenario_reward_risk is not None else None
-            risk_reward_penalty = (
-                min(8.0, max(0.0, 1.0 - scenario_reward_risk) * 8.0)
-                if scenario_reward_risk is not None and scenario_reward_risk < 1.0 else 0.0
-            )
-            ranked["scenario_reward_risk_penalty"] = round(risk_reward_penalty, 2)
             projection_score = (
                 100.0 * min(1.0, math.log1p(max(0.0, projected)) / math.log1p(250.0))
                 if projected is not None and projected > 0 else None
             )
             opp_rank = num(ranked.get("realistic_opportunity_rank"))
             if opp_rank is not None and early is not None:
-                ranked["ranking_score_24h"] = round(max(0.0, 0.45 * opp_rank + 0.35 * early + 0.20 * base_score - risk_reward_penalty), 2)
-                ranked["ranking_model_24h"] = "45% realistic opportunity (win prob + net return) + 35% breakout confluence + 20% base research - downside penalty"
+                ranked["ranking_score_24h"] = round(max(0.0, 0.45 * opp_rank + 0.35 * early + 0.20 * base_score), 2)
+                ranked["ranking_model_24h"] = "45% realistic opportunity (win prob + net return) + 35% breakout confluence + 20% base research"
             elif early is not None and projection_score is not None:
-                ranked["ranking_score_24h"] = round(max(0.0, 0.55 * early + 0.20 * base_score + 0.25 * projection_score - risk_reward_penalty), 2)
-                ranked["ranking_model_24h"] = "55% early-breakout + 20% base research + 25% candle-backed upside scenario - downside/R:R penalty"
+                ranked["ranking_score_24h"] = round(max(0.0, 0.55 * early + 0.20 * base_score + 0.25 * projection_score), 2)
+                ranked["ranking_model_24h"] = "55% early-breakout + 20% base research + 25% candle-backed upside scenario"
             elif early is not None:
-                ranked["ranking_score_24h"] = round(max(0.0, 0.70 * early + 0.30 * base_score - risk_reward_penalty), 2)
-                ranked["ranking_model_24h"] = "70% early-breakout + 30% base research - downside/R:R penalty; candle projection unavailable"
+                ranked["ranking_score_24h"] = round(max(0.0, 0.70 * early + 0.30 * base_score), 2)
+                ranked["ranking_model_24h"] = "70% early-breakout + 30% base research; candle projection unavailable"
             else:
-                ranked["ranking_score_24h"] = round(max(0.0, base_score - risk_reward_penalty), 2)
-                ranked["ranking_model_24h"] = "base research score - downside/R:R penalty; early-breakout provider signal unavailable"
+                ranked["ranking_score_24h"] = round(max(0.0, base_score), 2)
+                ranked["ranking_model_24h"] = "base research score; early-breakout provider signal unavailable"
         doc["candidates"].sort(
             key=lambda row: (num(row.get("ranking_score_24h")) or 0.0,
                              num(row.get("evidence_coverage_pct")) or 0.0),

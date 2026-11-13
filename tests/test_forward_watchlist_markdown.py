@@ -71,7 +71,7 @@ class ForwardWatchlistMarkdownTests(unittest.TestCase):
         self.assertIn("ALPHA/USDC TP: +40.00%", report)
         self.assertIn("Single TP:** `1.4`", report)
 
-    def test_renders_market_regime_downside_reward_risk_and_hyperliquid_context(self):
+    def test_renders_market_regime_volatility_and_hyperliquid_context_without_stops(self):
         document = {
             "status": "NEXT_24H_OPPORTUNITY_RANKED_EXECUTION_UNVERIFIED",
             "as_of_utc": "2026-11-07T15:00:00Z",
@@ -112,16 +112,20 @@ class ForwardWatchlistMarkdownTests(unittest.TestCase):
         }
 
         report = render_report(document)
+        html = render_html(document)
 
         self.assertIn("Market regime:** RISK_ON", report)
         self.assertIn("Hyperliquid derivatives cross-check:** OK", report)
-        self.assertIn("Initial downside", report)
-        self.assertIn("8.00x", report)
-        self.assertIn("Initial protective stop", report)
+        self.assertIn("1h ATR:** 5.50%", report)
+        self.assertIn("no stop loss", report)
+        self.assertNotIn("Initial protective stop", report)
+        self.assertNotIn("8.00x", report)
+        self.assertIn("no stop loss", html)
+        self.assertNotIn("ATR-based reference stop", html)
         self.assertIn("Hyperliquid perp cross-check", report)
         self.assertIn("open-interest change (4h-normalized):** +4.50%", report)
 
-    def test_position_monitor_renders_trailing_stop_and_market_type(self):
+    def test_position_monitor_never_renders_legacy_stop_fields(self):
         document = {
             "status": "WATCHING",
             "candidates": [],
@@ -143,9 +147,11 @@ class ForwardWatchlistMarkdownTests(unittest.TestCase):
 
         report = render_report(document)
 
-        self.assertIn("Protective stop", report)
-        self.assertIn("trail: 0.00108", report)
-        self.assertIn("TP REACHED — TRAILING RUNNER OPEN", report)
+        self.assertIn("ALPHA/SOL", report)
+        self.assertNotIn("Protective stop", report)
+        self.assertNotIn("trail: 0.00108", report)
+        self.assertNotIn("TRAILING RUNNER", report)
+        self.assertIn("no stop loss", report)
 
     def test_does_not_invent_target_when_target_method_is_unverified(self):
         document = {

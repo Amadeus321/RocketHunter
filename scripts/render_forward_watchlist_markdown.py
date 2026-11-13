@@ -239,6 +239,17 @@ def _filter_min_potential(candidates: list[dict[str, Any]], min_potential: float
     return filtered
 
 
+def _monitor_position_status(item: dict[str, Any]) -> str:
+    status = str(item.get("position_status") or "unavailable")
+    if "STOP" in status.upper() or "TRAIL" in status.upper():
+        return (
+            "TP TOUCH OBSERVED — LEGACY STOP DATA IGNORED"
+            if item.get("take_profit_hit") else
+            "LEGACY STOP DATA IGNORED — MONITORING TO 24H"
+        )
+    return status
+
+
 def _render_position_monitor(document: dict[str, Any]) -> list[str]:
     monitor = document.get("position_monitor")
     if not isinstance(monitor, dict):
@@ -255,18 +266,15 @@ def _render_position_monitor(document: dict[str, Any]) -> list[str]:
         f"- **Provider / resolution:** {monitor.get('provider') or 'UNVERIFIED'} / {monitor.get('ohlcv_resolution') or 'UNVERIFIED'}",
         f"- **Active references:** {len(active)} / {monitor.get('max_open_reference_positions', 'unavailable')}",
         "",
-        "| Asset / pair | Market | Pair address | Window closes (UTC) | MFE | Latest return | Protective stop | Status |",
-        "|---|---|---|---|---:|---:|---|---|",
+        "| Asset / pair | Market | Pair address | Window closes (UTC) | MFE | Latest return | Status |",
+        "|---|---|---|---|---:|---:|---|",
     ]
     for item in active:
         mfe = _number(item.get("max_favorable_excursion_pct"))
         latest = _number(item.get("latest_return_from_entry_pct"))
-        stop_price = _number(item.get("trailing_stop_price")) or _number(item.get("initial_stop_price"))
-        stop_kind = "trail" if _number(item.get("trailing_stop_price")) is not None else "initial"
-        stop_text = (f"{stop_kind}: {_price(stop_price)}" if stop_price is not None else "unavailable")
         market = item.get("venue") or item.get("chain") or item.get("market_type") or "—"
         pool_addr = str(item.get("pool_address") or item.get("pair_address") or item.get("address") or "—")
-        lines.append("| %s / %s | %s | `%s` | %s | %s | %s | %s | %s |" % (
+        lines.append("| %s / %s | %s | `%s` | %s | %s | %s | %s |" % (
             item.get("asset") or item.get("symbol") or "Unknown",
             item.get("pair") or "Unknown",
             market,
@@ -274,12 +282,11 @@ def _render_position_monitor(document: dict[str, Any]) -> list[str]:
             item.get("time_stop_utc") or "unavailable",
             ("%+.2f%%" % mfe) if mfe is not None else "unavailable",
             ("%+.2f%%" % latest) if latest is not None else "unavailable",
-            stop_text,
-            item.get("position_status") or "unavailable",
+            _monitor_position_status(item),
         ))
     lines += [
         "",
-        "> A TP touch is a milestone; the trailing runner remains open until its protective trail or the 24h time stop. Initial risk is ATR-based where candle coverage allows it. Hourly candle extrema are observed reference prices, not actual fills. A same-hour target/stop collision is marked ambiguous.",
+        "> Exactly one single TP of at least +40.00% is used; there is no stop loss or trailing stop. This read-only reference window continues until the single TP touch or its 24-hour close. Hourly candle extrema are observations, not executable fills.",
     ]
     return lines
 
@@ -483,7 +490,7 @@ def render_report(document: dict[str, Any]) -> str:
         lines.append("No unverified research candidates met the mandatory +40.00% potential threshold.")
     lines.extend([
         "",
-        "> *The 24h upside scenario is a volatility/momentum scenario from hourly candles, not a predicted return or calibrated probability. Initial downside is an ATR-based reference stop, not a guaranteed max loss. Scenario R:R is upside scenario divided by initial stop distance; it is a heuristic, not realized expectancy.",
+        "> *The 24h upside scenario is a volatility/momentum scenario from hourly candles, not a predicted return or calibrated probability. The trade plan has exactly one single TP (+40.00% minimum), with no stop loss and no trailing stop. Candle excursions are research observations, not executable fills.",
         "",
         "## Unverified research candidate details",
         "",
@@ -545,17 +552,8 @@ def render_report(document: dict[str, Any]) -> str:
         if confl is not None:
             lines.append(f"- **9-Engine Breakout Confluence:** {confl:.2f}/100")
         atr = _number(candidate.get("atr_1h_pct"))
-        stop_price = _number(candidate.get("initial_stop_price"))
-        stop_loss_pct = _number(candidate.get("stop_loss_pct"))
-        reward_risk = _number(candidate.get("scenario_reward_risk_ratio"))
         if atr is not None:
             lines.append(f"- **1h ATR:** {atr:.2f}%")
-        if stop_price is not None:
-            lines.append(f"- **Initial protective stop:** {BT}{_price(stop_price)}{BT} ({stop_loss_pct:.2f}% reference downside; {candidate.get('stop_method') or 'method unavailable'})")
-        else:
-            lines.append("- **Initial protective stop:** unavailable; candle ATR coverage is insufficient")
-        if reward_risk is not None:
-            lines.append(f"- **Scenario reward/risk:** {reward_risk:.2f}x")
         if candidate.get("hyperliquid_context_available"):
             lines.append(f"- **Hyperliquid perp cross-check:** {candidate.get('hyperliquid_match_status')}; mark ${_number(candidate.get('hyperliquid_mark_price_usd')):,.6g}; hourly funding {(_number(candidate.get('hyperliquid_funding_hourly_pct')) or 0):+.4f}%")
             oi_change = _number(candidate.get("oi_change_4h_pct"))
@@ -928,7 +926,6 @@ def render_html(document: dict[str, Any]) -> str:
                     f"<td>24h window active</td>"
                     f'<td class="green">+{pot_val:.2f}% (Target: {target_str})</td>'
                     f'<td class="green">+0.00% (tracking live)</td>'
-                    f"<td>none (Strict Single-TP)</td>"
                     f'<td><span class="badge ok">MONITORED — VERIFIED ACTIONABLE</span></td>'
                     f"</tr>"
                 )
@@ -938,9 +935,9 @@ def render_html(document: dict[str, Any]) -> str:
 <h2>24-Hour Reference-Position Monitoring</h2>
 <p class="meta">Monitoring Verified Actionable Opportunities strictly · Active: {len(m_rows)}</p>
 <div class="table-wrap"><table><thead><tr>
-<th>Asset / Pair</th><th>Market</th><th>Pair Address</th><th>Window Closes</th><th>Target Milestone</th><th>Latest Return</th><th>Protective Stop</th><th>Status</th>
+<th>Asset / Pair</th><th>Market</th><th>Pair Address</th><th>Window Closes</th><th>Single TP</th><th>Latest Return</th><th>Status</th>
 </tr></thead><tbody>{"".join(m_rows)}</tbody></table></div>
-<p class="meta note">Only Verified Actionable Opportunities are added to reference-position monitoring. Single-TP architecture: monitored until target milestone or 24h close.</p>
+<p class="meta note">Only Verified Actionable Opportunities are added to reference-position monitoring. Exactly one single TP (+40.00% minimum); no stop loss or trailing stop. Monitoring ends at the target touch or 24h window close.</p>
 </section>
 """
             else:
@@ -955,9 +952,6 @@ def render_html(document: dict[str, Any]) -> str:
             for item in active:
                 mfe = _number(item.get("max_favorable_excursion_pct"))
                 latest = _number(item.get("latest_return_from_entry_pct"))
-                stop_price = _number(item.get("trailing_stop_price")) or _number(item.get("initial_stop_price"))
-                stop_kind = "trail" if _number(item.get("trailing_stop_price")) is not None else "initial"
-                stop_text = f"{stop_kind}: ${_price(stop_price)}" if stop_price is not None else "unavailable"
                 mfe_text = f"+{mfe:.2f}%" if mfe is not None else "unavailable"
                 latest_text = f"{latest:+.2f}%" if latest is not None else "unavailable"
                 pool_addr = item.get("pool_address") or item.get("pair_address") or item.get("address") or "—"
@@ -969,8 +963,7 @@ def render_html(document: dict[str, Any]) -> str:
                     f"<td>{_esc(item.get('time_stop_utc') or 'unavailable')}</td>"
                     f'<td class="green">{_esc(mfe_text)}</td>'
                     f"<td>{_esc(latest_text)}</td>"
-                    f"<td>{_esc(stop_text)}</td>"
-                    f'<td><span class="badge info">{_esc(item.get("position_status") or "unavailable")}</span></td>'
+                    f'<td><span class="badge info">{_esc(_monitor_position_status(item))}</span></td>'
                     f"</tr>"
                 )
             if m_rows:
@@ -979,9 +972,9 @@ def render_html(document: dict[str, Any]) -> str:
 <h2>24-Hour Reference-Position Monitoring</h2>
 <p class="meta">Status: <code>{_esc(monitor.get('status') or 'UNAVAILABLE')}</code> · Provider: <code>{_esc(monitor.get('provider') or 'UNVERIFIED')}</code> · Active: {len(active)} / {_esc(str(monitor.get('max_open_reference_positions', '—')))}</p>
 <div class="table-wrap"><table><thead><tr>
-<th>Asset / Pair</th><th>Market</th><th>Pair Address</th><th>Window Closes (UTC)</th><th>MFE</th><th>Latest Return</th><th>Protective Stop</th><th>Status</th>
+<th>Asset / Pair</th><th>Market</th><th>Pair Address</th><th>Window Closes (UTC)</th><th>MFE</th><th>Latest Return</th><th>Status</th>
 </tr></thead><tbody>{"".join(m_rows)}</tbody></table></div>
-<p class="meta note">A TP touch is a milestone; positions remain monitored until protective stop or 24h close. Extrema are observed reference prices, not executed fills.</p>
+<p class="meta note">Exactly one single TP of at least +40.00%; no stop loss or trailing stop. The read-only reference window closes at the TP touch or 24h. Extrema are observations, not executable fills.</p>
 </section>
 """
 
@@ -1153,7 +1146,7 @@ a:hover {{ text-decoration: underline; }}
 <h2>2. Unverified Research Watchlist — NOT QUALIFIED</h2>
 <p class="meta">Research rankings and hypothetical upside do not satisfy the technical TP or verification gates. All {len(display_candidates)} mature research candidates meeting the mandatory +40.00% threshold shown.</p>
 {research_html}
-<p class="meta note">*The 24h upside scenario is a volatility/momentum scenario from hourly candles, not a predicted return or calibrated probability. Initial downside is an ATR-based reference stop. Scenario R:R is upside scenario divided by initial stop distance.</p>
+<p class="meta note">*The 24h upside scenario is a volatility/momentum scenario from hourly candles, not a predicted return or calibrated probability. Trade plans use exactly one single TP (+40.00% minimum), with no stop loss or trailing stop; candle excursions are research observations, not executable fills.</p>
 </section>
 
 {discovery_section_html}
