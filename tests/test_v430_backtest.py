@@ -103,3 +103,59 @@ class TestChronologicalBacktest:
         # Performance by liquidity check
         by_liq = report["performance_by_liquidity_tier"]
         assert isinstance(by_liq, dict)
+
+    def test_synthetic_labels_strictly_rejected_without_verified_candle_outcome(self):
+        evaluator = ChronologicalBacktestEvaluator([])
+        # Candidate with change_24h_pct but no verified candle outcome
+        item = {
+            "record_id": "rec_no_outcome",
+            "market_key": "solana:tokenA:poolA",
+            "timestamp_utc": "2026-11-01T12:00:00Z",
+            "detection_price": 1.0,
+            "raw_record": {
+                "change_24h_pct": 80.0,  # Pump happened, but NO verified candle outcome!
+            },
+        }
+        outcome = evaluator._resolve_outcome(item, lookup=None)
+        # Must NEVER synthesize MFE, MAE, TP attainment, or touch hours from change_24h_pct
+        assert outcome["is_evaluated"] is False
+        assert outcome["target_reached"] is None
+        assert outcome["mfe_pct"] is None
+        assert outcome["mae_pct"] is None
+        assert outcome["hours_to_target"] is None
+        assert outcome["outcome_classification"] == "INCOMPLETE_OBSERVATION"
+        assert outcome["resolution_reason"] == "UNRESOLVED_INCOMPLETE_OR_CENSORED"
+
+    def test_incomplete_records_excluded_from_tp40_rate_and_counted(self):
+        evaluator = ChronologicalBacktestEvaluator([])
+        evaluations = [
+            # 2 evaluated winners
+            {"outcome": {"is_evaluated": True, "target_reached": True, "mfe_pct": 50.0, "hours_to_target": 2.0}},
+            {"outcome": {"is_evaluated": True, "target_reached": True, "mfe_pct": 60.0, "hours_to_target": 3.0}},
+            # 1 evaluated loser
+            {"outcome": {"is_evaluated": True, "target_reached": False, "mfe_pct": 10.0, "hours_to_target": None}},
+            # 3 incomplete / unresolved records
+            {"outcome": {"is_evaluated": False, "outcome_classification": "INCOMPLETE_OBSERVATION", "target_reached": None}},
+            {"outcome": {"is_evaluated": False, "outcome_classification": "UNRESOLVED", "target_reached": None}},
+            {"outcome": {"is_evaluated": False, "outcome_classification": "UNKNOWN_DUE_TO_GAP", "target_reached": None}},
+        ]
+        metrics = evaluator._calculate_metrics(evaluations)
+        assert metrics["total_records_considered"] == 6
+        assert metrics["evaluated_records_count"] == 3
+        assert metrics["unresolved_records_count"] == 2
+        assert metrics["incomplete_records_count"] == 2
+        assert metrics["censored_records_count"] == 1
+        # tp40_rate_pct must be computed strictly on 3 evaluated records (2/3 = 66.67%), NOT 2/6 (33.33%)
+        assert metrics["tp40_rate_pct"] == 66.67
+        assert metrics["tp40_hits"] == 2
+
+    def test_all_unresolved_records_returns_no_evaluated_records(self):
+        evaluator = ChronologicalBacktestEvaluator([])
+        evaluations = [
+            {"outcome": {"is_evaluated": False, "outcome_classification": "INCOMPLETE_OBSERVATION", "target_reached": None}},
+            {"outcome": {"is_evaluated": False, "outcome_classification": "UNRESOLVED", "target_reached": None}},
+        ]
+        metrics = evaluator._calculate_metrics(evaluations)
+        assert metrics["status"] == "NO_EVALUATED_RECORDS"
+        assert metrics["evaluated_records_count"] == 0
+        assert metrics["tp40_rate_pct"] is None

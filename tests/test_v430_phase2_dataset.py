@@ -119,6 +119,67 @@ class TestProspectiveOpportunityDataset:
         assert lines[0]["snapshot_id"] == snapshot["snapshot_id"]
         assert lines[0]["is_rejected_candidate"] is True
 
+    def test_append_snapshots_deduplicates_identical_snapshot_ids(self, tmp_path):
+        dest = tmp_path / "scanner-memory"
+        candidate = {
+            "chain": "base",
+            "contract_address": "0x9876543210abcdef9876543210abcdef98765432",
+            "pool_address": "0x1111543210abcdef9876543210abcdef98765432",
+            "price_usd": 1.25,
+        }
+        fixed_time = dt.datetime(2026, 11, 13, 14, 0, 0, tzinfo=dt.timezone.utc)
+        snap1 = ProspectiveOpportunityDataset.create_snapshot(
+            candidate=candidate,
+            run_id="run-dedup-1",
+            scanner_version="v4.30.0",
+            configuration_fingerprint="fp1",
+            qualification_status="QUALIFIED",
+            snapshot_time=fixed_time,
+        )
+
+        details1: dict = {}
+        partition = ProspectiveOpportunityDataset.append_snapshots(dest, [snap1], partition_date="20261113", details_out=details1)
+        assert details1["appended_count"] == 1
+        assert details1["duplicate_count"] == 0
+
+        # Attempt to append the exact same snapshot again
+        details2: dict = {}
+        ProspectiveOpportunityDataset.append_snapshots(dest, [snap1], partition_date="20261113", details_out=details2)
+        assert details2["appended_count"] == 0
+        assert details2["duplicate_count"] == 1
+        assert details2["total_snapshots"] == 1
+
+        # Read back partition and confirm only 1 entry exists
+        with gzip.open(partition, "rt", encoding="utf-8") as handle:
+            lines = [json.loads(line) for line in handle]
+        assert len(lines) == 1
+
+    def test_corrupted_partition_raises_error_and_preserves_file(self, tmp_path):
+        dest = tmp_path / "scanner-memory"
+        dest_dir = dest / "prospective-opportunities"
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        bad_partition = dest_dir / "prospective-20261113.jsonl.gz"
+        bad_partition.write_bytes(b"NOT_A_VALID_GZIP_STREAM")
+
+        candidate = {
+            "chain": "solana",
+            "contract_address": "Token111111111111111111111111111111111111111",
+            "price_usd": 0.5,
+        }
+        snap = ProspectiveOpportunityDataset.create_snapshot(
+            candidate=candidate,
+            run_id="run-bad-1",
+            scanner_version="v4.30.0",
+            configuration_fingerprint="fp1",
+            qualification_status="QUALIFIED",
+        )
+
+        with pytest.raises(IOError, match="Corrupted or unreadable prospective partition"):
+            ProspectiveOpportunityDataset.append_snapshots(dest, [snap], partition_date="20261113")
+
+        # Confirm the bad file was preserved rather than wiped
+        assert bad_partition.read_bytes() == b"NOT_A_VALID_GZIP_STREAM"
+
 
 class TestOutcomeCollectionAndClassification:
     def test_calculate_simulated_execution_target_reached_with_touch_time(self):

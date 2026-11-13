@@ -84,10 +84,15 @@ def test_weight_adaptation_applies_shrinkage_with_sufficient_samples(tmp_path: P
     journal_file.write_text(json.dumps({"positions": sufficient_trades}), encoding="utf-8")
 
     model = train_ai_from_user_journal()
-    assert model["weight_adaptation_applied"] is True
+    # Candidate weights adapt, but PRODUCTION weights remain strictly pinned to baseline
+    assert model["candidate_adaptation_applied"] is True
+    assert model["weight_adaptation_applied"] is False  # Production weights not changed!
     assert model["verified_training_samples"] == 6
-    # Momentum correlates positively with PnL, weight should have shifted upwards within bounds
-    assert model["learned_feature_weights"]["momentum_acceleration"] >= 0.88
+    # Candidate weights shifted based on correlation
+    assert model["candidate_learned_weights"]["momentum_acceleration"] >= 0.88
+    # Production weights strictly remain baseline
+    assert model["learned_feature_weights"]["momentum_acceleration"] == 0.88
+    assert model["production_weights"]["momentum_acceleration"] == 0.88
 
 
 def test_dataset_a_and_b_are_strictly_decoupled(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -132,15 +137,26 @@ def test_shadow_model_evaluation_and_rollback() -> None:
     bad_cand_weights = {"momentum_acceleration": 0.20, "volume_intelligence": 0.20}
     good_cand_weights = {"momentum_acceleration": 0.92, "volume_intelligence": 0.95}
 
-    val_records = [
-        {"pnl": 40.0, "features": {"momentum_acceleration": 90.0, "volume_intelligence": 90.0}},
-        {"pnl": 50.0, "features": {"momentum_acceleration": 95.0, "volume_intelligence": 95.0}},
+    # 1. Insufficient holdout data (< 30) forces rollback to baseline
+    few_val_records = [
+        {"pnl": 40.0, "mfe_pct": 40.0, "outcome_classification": "TARGET_REACHED", "features": {"momentum_acceleration": 90.0, "volume_intelligence": 90.0}}
+        for _ in range(5)
     ]
+    res_insufficient = evaluate_shadow_model(prod_weights, good_cand_weights, few_val_records)
+    assert res_insufficient["promotion_decision"] == "ROLLBACK_TO_PRODUCTION"
+    assert res_insufficient["status"] == "INSUFFICIENT_HOLDOUT_SAMPLES"
+    assert res_insufficient["applied_weights"] == prod_weights
 
+    # 2. 30+ holdout records with regression forces rollback
+    val_records = [
+        {"pnl": 40.0, "mfe_pct": 40.0, "outcome_classification": "TARGET_REACHED", "features": {"momentum_acceleration": 90.0, "volume_intelligence": 90.0}}
+        for _ in range(30)
+    ]
     res_regressed = evaluate_shadow_model(prod_weights, bad_cand_weights, val_records)
     assert res_regressed["promotion_decision"] == "ROLLBACK_TO_PRODUCTION"
     assert res_regressed["applied_weights"] == prod_weights
 
+    # 3. 30+ holdout records with genuine >2% improvement promotes candidate
     res_improved = evaluate_shadow_model(prod_weights, good_cand_weights, val_records)
     assert res_improved["promotion_decision"] == "PROMOTE_CANDIDATE"
     assert res_improved["applied_weights"] == good_cand_weights

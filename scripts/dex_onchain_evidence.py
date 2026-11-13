@@ -598,6 +598,8 @@ def _solana_security(report, summary, retrieved_utc):
                 "has_transfer_hook": has_transfer_hook,
                 "has_confidential_transfers": has_confidential_transfers,
                 "is_default_frozen": is_default_frozen,
+                "token_extensions_verification_method": "RUGCHECK_REPORT_PARSED",
+                "direct_rpc_mint_deserialization": False,
             },
             "metadata_mutable": mutable,
             "metadata_mutability_present": mutable_present,
@@ -794,7 +796,8 @@ def _evm_lp_lock_share(pool, chain, timeout=8):
                 "status": "UNVERIFIED",
                 "lp_model": "CONCENTRATED_LIQUIDITY_NFT",
                 "is_concentrated_liquidity": True,
-                "reason": "Uniswap V3 / concentrated liquidity pool detected; liquidity positions are non-fungible ERC-721 NFTs. Conventional ERC-20 LP token burn check is not applicable. UNKNOWN must remain UNVERIFIED.",
+                "nft_position_ownership_audited": False,
+                "reason": "Uniswap V3 / concentrated liquidity pool detected; liquidity positions are non-fungible ERC-721 NFTs. Conventional ERC-20 LP token burn check is not applicable. Full NFT position manager ownership/lock tracing is not implemented; UNKNOWN must remain UNVERIFIED.",
             }
         return {
             "status": "UNVERIFIED",

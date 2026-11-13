@@ -52,7 +52,8 @@
      22. Qualification status and exact rejection reasons
    - Strictly separates `raw_source_evidence` from `normalized_record`.
    - **Zero Selection Bias:** Preserves rejected assets alongside qualified opportunities.
-   - Integrated into `scripts/v418_pipeline.py` to automatically write compressed partitions into `rocket-hunter-data/scanner-memory/prospective-opportunities/`.
+   - Integrated into `scripts/v418_pipeline.py` with structured diagnostics (creation, append, duplicate counts) to automatically write compressed partitions into `rocket-hunter-data/scanner-memory/prospective-opportunities/`.
+   - **Concurrency Locking & Deduplication:** Partition appending uses `locked_file` cross-process locking, deduplicates incoming snapshot IDs, and safely preserves existing partitions if read errors occur.
 
 2. **Standardized 24-Hour Outcome Classifications (`scripts/analyze_candle_outcomes.py` & `scripts/collect_watchlist_observations.py`):**
    - Enforced 7 explicit outcome classifications:

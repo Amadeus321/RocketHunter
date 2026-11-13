@@ -12,8 +12,15 @@ import gzip
 import hashlib
 import json
 import math
+import os
 from pathlib import Path
+import time
 from typing import Any
+
+try:
+    from scripts.file_lock import locked_file
+except ImportError:
+    from file_lock import locked_file
 
 PROSPECTIVE_DATASET_VERSION = "4.30.0"
 PROSPECTIVE_SCHEMA = "crypto-prebreakout.prospective-opportunity.v1"
@@ -239,17 +246,80 @@ class ProspectiveOpportunityDataset:
         destination_dir: Path,
         snapshots: list[dict[str, Any]],
         partition_date: str | None = None,
+        details_out: dict[str, Any] | None = None,
     ) -> Path:
-        """Atomically append immutable prospective snapshots to gzipped JSONL partition."""
-        if not snapshots:
-            return destination_dir
-        dest_dir = destination_dir / "prospective-opportunities"
+        """Atomically and concurrency-safely append immutable prospective snapshots to gzipped JSONL partition.
+
+        Detects duplicate snapshot IDs to ensure partition idempotency under concurrent or repeated execution.
+        """
+        dest_dir = Path(destination_dir) / "prospective-opportunities"
         dest_dir.mkdir(parents=True, exist_ok=True)
         date_str = partition_date or dt.datetime.now(dt.timezone.utc).strftime("%Y%m%d")
         partition_path = dest_dir / f"prospective-{date_str}.jsonl.gz"
+        lock_path = partition_path.with_suffix(".lock")
 
-        with gzip.open(partition_path, "at", encoding="utf-8", compresslevel=9) as handle:
+        if not snapshots:
+            if details_out is not None:
+                details_out["appended_count"] = 0
+                details_out["duplicate_count"] = 0
+                details_out["total_snapshots"] = 0
+                details_out["partition_path"] = str(partition_path)
+            return partition_path
+
+        with locked_file(lock_path):
+            existing_records: list[str] = []
+            seen_ids: set[str] = set()
+
+            if partition_path.exists() and partition_path.stat().st_size > 0:
+                try:
+                    with gzip.open(partition_path, "rt", encoding="utf-8") as handle:
+                        for line in handle:
+                            stripped = line.strip()
+                            if not stripped:
+                                continue
+                            try:
+                                rec = json.loads(stripped)
+                                if isinstance(rec, dict) and "snapshot_id" in rec:
+                                    seen_ids.add(str(rec["snapshot_id"]))
+                            except Exception:
+                                pass
+                            existing_records.append(stripped)
+                except Exception as read_err:
+                    # If partition exists but cannot be decompressed or read, preserve file and do not overwrite blindly
+                    raise IOError(f"Corrupted or unreadable prospective partition {partition_path}: {read_err}") from read_err
+
+            unique_to_append: list[str] = []
+            duplicate_count = 0
             for snapshot in snapshots:
-                line = json.dumps(snapshot, sort_keys=True, separators=(",", ":"), allow_nan=False) + "\n"
-                handle.write(line)
+                sid = str(snapshot.get("snapshot_id") or "")
+                if sid and sid in seen_ids:
+                    duplicate_count += 1
+                else:
+                    if sid:
+                        seen_ids.add(sid)
+                    line_str = json.dumps(snapshot, sort_keys=True, separators=(",", ":"), allow_nan=False)
+                    unique_to_append.append(line_str)
+
+            if unique_to_append:
+                temp_path = partition_path.with_name(f"{partition_path.name}.{os.getpid()}.{time.time_ns()}.tmp.gz")
+                try:
+                    with gzip.open(temp_path, "wt", encoding="utf-8", compresslevel=9) as handle:
+                        for prev_line in existing_records:
+                            handle.write(prev_line + "\n")
+                        for new_line in unique_to_append:
+                            handle.write(new_line + "\n")
+                    temp_path.replace(partition_path)
+                finally:
+                    if temp_path.exists():
+                        try:
+                            temp_path.unlink()
+                        except OSError:
+                            pass
+
+            if details_out is not None:
+                details_out["appended_count"] = len(unique_to_append)
+                details_out["duplicate_count"] = duplicate_count
+                details_out["total_snapshots"] = len(existing_records) + len(unique_to_append)
+                details_out["partition_path"] = str(partition_path)
+
         return partition_path

@@ -31,15 +31,17 @@
      - `transferHook`: Flagged as a CRITICAL security risk (`TransferHookExtension`).
      - `defaultAccountState (frozen)`: Flagged as a CRITICAL security risk.
      - `transferFee` and `confidentialTransfers`: Tracked in structured metadata.
+     - **Verification Attribution:** Explicitly attributes verification method as `RUGCHECK_REPORT_PARSED` and marks `direct_rpc_mint_deserialization: False`.
 
 2. **Concentrated Liquidity (NFT) Model Recognition (`scripts/dex_onchain_evidence.py`):**
    - In `_evm_lp_lock_share()`, the system probes for Uniswap V3 concentrated liquidity methods (`slot0()`).
    - If a concentrated liquidity pool is detected, it is explicitly classified as `CONCENTRATED_LIQUIDITY_NFT`.
-   - **Fail-Closed Rule:** The system explicitly notes that conventional ERC-20 LP burn checks cannot verify NFT positions. `UNKNOWN` status strictly remains `UNVERIFIED` and never converts to `PASS`.
+   - **Fail-Closed Rule:** The system explicitly records `nft_position_ownership_audited: False` and notes that conventional ERC-20 LP burn checks cannot verify NFT positions. `UNKNOWN` status strictly remains `UNVERIFIED` and never converts to `PASS`.
 
-3. **Systematic Pagination & Safe Rate-Limit Backoff (`scripts/v425_early_breakout.py`):**
+3. **Systematic Pagination & Persistent Shared Cooldown (`scripts/v425_early_breakout.py`):**
    - Added multi-page pagination for DexPaprika search families within rolling quota ceilings.
-   - Handled HTTP 429: if `Retry-After` is missing or 0, enforces a safe minimum backoff of 15 seconds with jitter to protect provider accounts.
+   - **Persistent Shared Cooldown:** When HTTP 429 is encountered, writes state to `.dexpaprika-cooldown.json` under `locked_file` locking.
+   - Enforces a minimum 15-second backoff across all query families and concurrent scanner processes even when `Retry-After: 0`, blocking requests before network calls or request budget reservations.
    - Added full coverage reporting in discovery metadata:
      - `coverage_status: "PARTIAL"`
      - `pages_retrieved`, `records_discovered`, `records_rejected`

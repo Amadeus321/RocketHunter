@@ -25,8 +25,10 @@
 ### Phase 2: Prospective Dataset & Standardized Outcomes
 - **`scripts/prospective_opportunity_dataset.py`**:
   - Created immutable 22-field snapshot capture storing both qualified and rejected candidates in `rocket-hunter-data/scanner-memory/prospective-opportunities/`.
+  - Concurrency-safe partition append using `locked_file` on partition-specific lock files.
+  - Snapshot ID deduplication preventing redundant entries across concurrent or restarted scan runs.
   - Strictly decoupled raw input observations from derived algorithmic scores to eliminate survivorship and selection bias.
-  - Integrated hooks directly into `scripts/v418_pipeline.py`.
+  - Replaced silent error swallows in `scripts/v418_pipeline.py` with structured diagnostics reporting creation, append counts, duplicate counts, and explicit error status.
 - **`scripts/analyze_candle_outcomes.py` & `scripts/collect_watchlist_observations.py`**:
   - Upgraded outcome classification with 7 standardized mutually exclusive states:
     `TARGET_REACHED`, `TARGET_NOT_REACHED`, `INCOMPLETE_OBSERVATION`, `UNKNOWN_DUE_TO_GAP`, `PRICE_SOURCE_CONFLICT`, `EXPIRED`, `EXECUTION_UNVERIFIED`.
@@ -35,33 +37,40 @@
 ### Phase 3: Chronological Walk-Forward Backtest
 - **`scripts/chronological_backtest.py`**:
   - Built out-of-sample chronological backtest engine strictly enforcing zero future-data leakage.
-  - Features frozen at candidate decision time $T_0$.
-  - Measures single-target TP40 attainment at fixed intervals (1h, 3h, 6h, 12h, 24h).
+  - **Zero Synthetic Labels**: Completely removed synthetic outcome estimation from `change_24h_pct` and arbitrary TP touch timestamps. Incomplete or unresolved windows are classified as `INCOMPLETE` / `UNRESOLVED` and excluded from TP40 attainment rates.
+  - Reports explicit record accounting: `total_records_considered`, `evaluated_records_count`, `unresolved_records_count`, `incomplete_records_count`, and `censored_records_count`.
+  - Safely detects and surfaces corrupted partition data as visible incomplete records.
+  - Labeled accurately as `FIXED_RULE_CHRONOLOGICAL_EVALUATOR` (with optional train-split optimization).
   - Calculates Wilson 95% confidence intervals, comparisons against naive momentum/random baselines, and segmentation across chains and liquidity tiers.
 
 ### Phase 4: Read-Only Execution Simulator
 - **`scripts/execution_simulator.py`**:
   - Implemented multi-size liquidity simulation across 4 standard tiers: $\$100, \$500, \$1,000, \$5,000$.
   - Enforced independent two-way routing: buy quotes never prove sellability (`MISSING_SELL_ROUTE`).
-  - Added stale quote rejection ($>300\text{s}$) and non-linear order-book walking with constant-product AMM slippage modeling.
+  - Distinguishes genuine order book depth walks (`ORDER_BOOK_DEPTH_WALK`) from approximate linear liquidity heuristics (`LINEAR_RESERVE_HEURISTIC_APPROXIMATION`).
+  - Does not misrepresent linear approximations as full constant-product AMM curve simulations.
+  - Flags router quotes not bound to the evaluated notional size as `ORDER_SIZE_UNVERIFIED_ESTIMATE`.
+  - Enforces quote freshness verification, rejecting stale quotes ($>300\text{s}$) as `STALE_QUOTE` and missing timestamps as `MISSING_TIMESTAMP_UNVERIFIED`.
+  - Input validation sanitizes non-numeric, negative, or NaN parameters to prevent runtime crashes.
 
 ### Phase 5: Web3 Security & Systematic Discovery
 - **`scripts/dex_onchain_evidence.py`**:
   - Added Solana Token-2022 extension hazard detection (`permanentDelegate`, `transferHook`, `defaultAccountState=frozen`), flagging them as `CRITICAL_RISK`.
-  - Added Uniswap V3 concentrated liquidity NFT position detection (`slot0()`), ensuring unverified positions remain `UNKNOWN` rather than `PASS`.
+  - Accurately attributes Token-2022 verification method to RugCheck report parsing (`direct_rpc_mint_deserialization: False`).
+  - Added Uniswap V3 concentrated liquidity NFT position detection (`slot0()`), explicitly noting `nft_position_ownership_audited: False` and ensuring unverified positions remain `UNVERIFIED`.
 - **`scripts/v425_early_breakout.py`**:
   - Added DexPaprika multi-page pagination with budget tracking.
-  - Implemented HTTP 429 `Retry-After: 0` protection with mandatory 15-second minimum backoff.
+  - Implemented persistent shared cross-process cooldown (`.dexpaprika-cooldown.json` with file locking).
+  - Enforces minimum 15-second backoff across all query families and concurrent processes even when `Retry-After: 0`, blocking requests before network calls or budget reservation.
   - Added transparent `coverage_status: "PARTIAL"` ledger reporting.
 
 ### Phase 6: AURA Research Learning & Market Regimes
 - **`scripts/user_trade_learning.py`**:
-  - Established minimum sample threshold (`MIN_TRAINING_SAMPLES_FOR_WEIGHT_ADAPTATION = 5`) before adapting production weights.
-  - Applied $L_2$ shrinkage regularization toward prior baseline with strict bounding ($[0.50, 1.20]$).
-  - Strictly decoupled Dataset A (real user positions from journal) from Dataset B (prospective scanner predictions).
-  - Implemented `classify_market_regime()` (Bullish, Bearish, Sideways, High volatility, Low liquidity, Risk-off).
-  - Added shadow model evaluation (`evaluate_shadow_model()`) with automated rollback upon regression.
-  - Codified explicit immutable safety veto bounds (`enforce_aura_safety_veto`).
+  - Production ranking weights are strictly pinned to immutable `PRODUCTION_BASELINE_WEIGHTS`.
+  - User position journal entries (Dataset A) are preserved for learning attribution but do not alter active production weights; candidate weights are isolated in `candidate_learned_weights` / `shadow_weights`.
+  - Strictly decoupled Dataset A (post-selection user positions) from Dataset B (unbiased prospective scanner observations).
+  - Promoted model evaluation requires $\ge 30$ mature holdout records from Dataset B and $\ge 2\%$ improvement; otherwise rolls back to baseline.
+  - Absolute AURA safety vetoes (`enforce_aura_safety_veto`) are wired directly into production candidate qualification paths (`qualify_final_actionable_candidates` and `refresh_and_filter_candidates`).
 
 ### Phase 7: Engineering Reliability & CI/CD Hardening
 - **`.github/workflows/full-rocket-hunt.yml`**:
@@ -79,20 +88,20 @@
 
 | Metric | Baseline (Commit `1116631`) | Release v4.30.0 | Delta |
 | :--- | :--- | :--- | :--- |
-| **Total Tests Passed** | 357 | **389** | **+32 new tests** |
-| **Subtests Passed** | 19 | **19** | 0 |
+| **Total Tests Passed** | 357 | **397** | **+40 new tests** |
+| **Subtests Passed** | 19 | **19** (4 subtests in early breakout) | 0 |
 | **Failures / Errors** | 0 | **0** | **0** |
-| **Execution Time** | ~74.84s | **37.72s** | **2x speedup** |
+| **Execution Time** | ~74.84s | **36.39s** | **2x speedup** |
 | **Syntax / Compilation** | Clean | **Clean** (`compileall -q`) | 0 warnings |
 
-### New Test Suites Added:
+### New & Upgraded Test Suites:
 1. `tests/test_rocket_hunt_reversal.py` (5 tests)
 2. `tests/test_v430_engine_diagnostics.py` (5 tests)
-3. `tests/test_v430_phase2_dataset.py` (4 tests)
-4. `tests/test_v430_backtest.py` (3 tests)
-5. `tests/test_execution_simulator.py` (7 tests)
-6. `tests/test_v430_phase5_security_discovery.py` (5 tests)
-7. `tests/test_v430_phase6_aura.py` (6 tests)
+3. `tests/test_v430_phase2_dataset.py` (6 tests - includes deduplication & corrupted partition protection)
+4. `tests/test_v430_backtest.py` (6 tests - includes zero-synthetic label verification & unresolved accounting)
+5. `tests/test_execution_simulator.py` (10 tests - includes input sanitization, heuristic distinction & quote freshness)
+6. `tests/test_v430_phase5_security_discovery.py` (5 tests - includes persistent shared 429 cooldown & Token-2022/NFT evidence checks)
+7. `tests/test_v430_phase6_aura.py` (6 tests - includes baseline weight pinning, shadow evaluation & safety vetoes)
 
 ---
 
@@ -138,6 +147,10 @@ The multi-tier execution simulator (`scripts/execution_simulator.py`) was rigoro
 
 ## 9. Statement of Research Readiness
 RocketHunter v4.30.0 operates strictly as a **read-only analytical research platform**. It does not sign transactions or place live orders.
+
+**Current Research Readiness: NOT READY**
+Research readiness remains strictly `NOT READY` until sufficient prospective, exact-identity, completed 24-hour outcome data has been systematically collected and evaluated via the walk-forward backtest framework without synthetic interpolation.
+
 All candidates must satisfy:
 1. Exact verified identity `(chain, token_address, pool_address)`.
 2. Clean contract security and LP verification `PASS`.

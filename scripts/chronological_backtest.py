@@ -57,16 +57,46 @@ class ChronologicalBacktestEvaluator:
     def from_jsonl_partitions(cls, directory: Path, pattern: str = "*.jsonl.gz") -> "ChronologicalBacktestEvaluator":
         import gzip
         records = []
+        corrupted_partitions = []
         if directory.exists():
             for p in sorted(directory.glob(pattern)):
                 try:
                     with gzip.open(p, "rt", encoding="utf-8") as handle:
-                        for line in handle:
+                        for line_idx, line in enumerate(handle, 1):
                             if line.strip():
-                                records.append(json.loads(line))
-                except Exception:
-                    pass
-        return cls(records)
+                                try:
+                                    records.append(json.loads(line))
+                                except json.JSONDecodeError as exc:
+                                    corrupted_partitions.append({
+                                        "file": str(p),
+                                        "line": line_idx,
+                                        "error": f"JSONDecodeError: {exc}",
+                                    })
+                                    # Make corrupted line visible as incomplete data
+                                    records.append({
+                                        "snapshot_id": f"corrupted_{p.name}_{line_idx}",
+                                        "snapshot_utc": "1970-01-01T00:00:00Z",
+                                        "chain": "unknown",
+                                        "contract_address": "corrupted",
+                                        "price_usd": 1.0,
+                                        "outcome_classification": "INCOMPLETE_CORRUPTED_PARTITION",
+                                    })
+                except Exception as exc:
+                    corrupted_partitions.append({
+                        "file": str(p),
+                        "error": f"{type(exc).__name__}: {exc}",
+                    })
+                    records.append({
+                        "snapshot_id": f"corrupted_partition_{p.name}",
+                        "snapshot_utc": "1970-01-01T00:00:00Z",
+                        "chain": "unknown",
+                        "contract_address": "corrupted",
+                        "price_usd": 1.0,
+                        "outcome_classification": "INCOMPLETE_CORRUPTED_PARTITION",
+                    })
+        evaluator = cls(records)
+        evaluator.corrupted_partitions = corrupted_partitions  # type: ignore[attr-defined]
+        return evaluator
 
     def prepare_chronological_dataset(self) -> list[dict[str, Any]]:
         """Filter ambiguous identities, validate timestamps, and sort chronologically."""
@@ -134,6 +164,7 @@ class ChronologicalBacktestEvaluator:
         step_hours: int = 24,           # 1 day advance
         score_threshold: float = 75.0,  # Model selection threshold
         outcome_lookup: dict[str, dict[str, Any]] | None = None,
+        model_selection_mode: str = "FIXED_RULE",  # "FIXED_RULE" or "OPTIMIZE_ON_TRAIN"
     ) -> dict[str, Any]:
         """Execute walk-forward out-of-sample backtest windows."""
         dataset = self.prepare_chronological_dataset()
@@ -171,37 +202,55 @@ class ChronologicalBacktestEvaluator:
 
         out_of_sample_evaluations: list[dict[str, Any]] = []
         baseline_evaluations: list[dict[str, Any]] = []
-
-        # Deduplication tracker for out-of-sample evaluations
         seen_test_keys: set[str] = set()
 
         for train_slice, test_slice, window_id in windows:
-            # Model rule: score >= score_threshold and not is_rejected
+            # Genuine time-separated model selection: choose threshold strictly on train_slice
+            active_threshold = score_threshold
+            if model_selection_mode == "OPTIMIZE_ON_TRAIN" and train_slice:
+                train_evaluated = []
+                for tr_item in train_slice:
+                    tr_outcome = self._resolve_outcome(tr_item, outcome_lookup)
+                    if tr_outcome.get("is_evaluated") and not tr_item["is_rejected"]:
+                        train_evaluated.append((tr_item["score"], bool(tr_outcome.get("target_reached"))))
+                if len(train_evaluated) >= 10:
+                    best_th = score_threshold
+                    best_prec = -1.0
+                    for candidate_th in [60.0, 65.0, 70.0, 75.0, 80.0, 85.0]:
+                        picks = [hit for sc, hit in train_evaluated if sc >= candidate_th]
+                        if len(picks) >= 3:
+                            prec = sum(1 for h in picks if h) / len(picks)
+                            if prec > best_prec:
+                                best_prec = prec
+                                best_th = candidate_th
+                    active_threshold = best_th
+
+            # Evaluate test_slice strictly using decision-time features
             for item in test_slice:
                 m_key = f"{item['market_key']}_{item['timestamp_utc']}"
                 if m_key in seen_test_keys:
                     continue
                 seen_test_keys.add(m_key)
 
-                # Simulated or real outcome retrieval
                 outcome = self._resolve_outcome(item, outcome_lookup)
 
                 # Candidate model evaluation
-                if item["score"] >= score_threshold and not item["is_rejected"]:
+                if item["score"] >= active_threshold and not item["is_rejected"]:
                     out_of_sample_evaluations.append({
                         "item": item,
                         "window_id": window_id,
                         "outcome": outcome,
                     })
 
-                # Naive Baseline: Top 24h gainer regardless of risk/rejections
-                baseline_evaluations.append({
-                    "item": item,
-                    "window_id": window_id,
-                    "outcome": outcome,
-                })
+                # Naive Baseline: All unrejected candidates
+                if not item["is_rejected"]:
+                    baseline_evaluations.append({
+                        "item": item,
+                        "window_id": window_id,
+                        "outcome": outcome,
+                    })
 
-        # Calculate statistics
+        # Calculate statistics strictly separating evaluated from incomplete records
         model_metrics = self._calculate_metrics(out_of_sample_evaluations)
         baseline_metrics = self._calculate_metrics(baseline_evaluations)
 
@@ -226,6 +275,12 @@ class ChronologicalBacktestEvaluator:
             "backtest_version": BACKTEST_VERSION,
             "status": "COMPLETED",
             "evaluation_policy": "STRICT_CHRONOLOGICAL_WALK_FORWARD; IMMUTABLE_FROZEN_FEATURES",
+            "evaluation_mode": "TIME_SEPARATED_TRAIN_OPTIMIZED_THRESHOLD" if model_selection_mode == "OPTIMIZE_ON_TRAIN" else "FIXED_RULE_CHRONOLOGICAL_EVALUATOR",
+            "model_selection_policy": (
+                "Dynamic threshold selection on training slice only"
+                if model_selection_mode == "OPTIMIZE_ON_TRAIN"
+                else f"Fixed rule (Score >= {score_threshold:.1f}, no model trained)"
+            ),
             "dataset_hash": dataset_hash,
             "config_fingerprint": self.config_fingerprint,
             "total_chronological_records": len(dataset),
@@ -236,46 +291,82 @@ class ChronologicalBacktestEvaluator:
             "performance_by_chain": by_chain,
             "performance_by_liquidity_tier": by_liquidity,
             "scientific_integrity_note": (
-                "Out-of-sample performance metrics reflect historical backtest outcomes; "
-                "past price excursion does not guarantee future execution returns or fills."
+                "Zero synthetic labels permitted. Incomplete or unresolved observation windows are "
+                "strictly counted and excluded from performance percentage denominators."
             ),
         }
 
     def _resolve_outcome(self, item: dict[str, Any], lookup: dict[str, dict[str, Any]] | None) -> dict[str, Any]:
-        """Resolve or simulate 24-hour outcome for backtesting candidate."""
-        if lookup and item["record_id"] in lookup:
-            return lookup[item["record_id"]]
+        """Resolve exact-identity, verified 24-hour outcome without synthetic labels.
 
-        # Fallback to embedded outcome or raw record attributes
+        Never estimates MFE, MAE, TP attainment, or touch times from change_24h_pct.
+        Unresolved or incomplete records are marked is_evaluated=False and excluded from performance rates.
+        """
+        # 1. Lookup match
+        if lookup and item["record_id"] in lookup:
+            rec = lookup[item["record_id"]]
+            status = rec.get("outcome_classification") or ("TARGET_REACHED" if rec.get("target_reached") else "UNRESOLVED")
+            mfe = _clean_num(rec.get("mfe_pct"))
+            mae = _clean_num(rec.get("mae_pct"))
+            touch_time = _clean_num(rec.get("hours_to_target") or rec.get("first_touch_hours"))
+            is_eval = status in {"TARGET_REACHED", "TARGET_NOT_REACHED"} and mfe is not None
+            return {
+                "outcome_classification": status,
+                "target_reached": rec.get("target_reached") if is_eval else None,
+                "mfe_pct": mfe if is_eval else None,
+                "mae_pct": mae if is_eval else None,
+                "hours_to_target": touch_time if is_eval else None,
+                "is_evaluated": is_eval,
+                "resolution_reason": "MATCHED_EXACT_IDENTITY_OUTCOME_LOOKUP" if is_eval else "UNRESOLVED_LOOKUP",
+                "execution_status": rec.get("execution_status", "EXECUTION_UNVERIFIED"),
+            }
+
+        # 2. Raw record attributes
         raw = item["raw_record"]
-        tp40 = _clean_num(raw.get("target_price")) or (item["detection_price"] * 1.40)
+        outcome_status = raw.get("outcome_classification")
         mfe_pct = _clean_num(raw.get("mfe_pct"))
         mae_pct = _clean_num(raw.get("mae_pct"))
-        outcome_status = raw.get("outcome_classification")
+        touch_time = _clean_num(raw.get("hours_to_target") or raw.get("first_touch_hours") or raw.get("target_touch_time_hours"))
 
-        if mfe_pct is None:
-            # Heuristic simulation from change metrics if historical candle trace absent
-            chg24 = _clean_num(raw.get("change_24h_pct")) or 0.0
-            mfe_pct = max(0.0, chg24 * 0.8)
-            mae_pct = -abs(min(15.0, chg24 * 0.2))
+        # Exact verified candle trace: only consider evaluated if verified status and real MFE are present
+        if outcome_status in {"TARGET_REACHED", "TARGET_NOT_REACHED"} and mfe_pct is not None:
+            hit_tp = bool(outcome_status == "TARGET_REACHED" or mfe_pct >= MANDATORY_TARGET_PCT)
+            return {
+                "outcome_classification": outcome_status,
+                "target_reached": hit_tp,
+                "mfe_pct": mfe_pct,
+                "mae_pct": mae_pct,
+                "hours_to_target": touch_time if hit_tp else None,
+                "is_evaluated": True,
+                "resolution_reason": "EMBEDDED_VERIFIED_OUTCOME",
+                "execution_status": raw.get("execution_status", "EXECUTION_UNVERIFIED"),
+            }
 
-        hit_tp = bool(mfe_pct is not None and mfe_pct >= MANDATORY_TARGET_PCT)
-        hours_to_target = 4.5 if hit_tp else None
-
+        # 3. If exact-identity verified 24h outcome is unavailable, classify as INCOMPLETE / UNRESOLVED
+        censored = bool(raw.get("censored") or outcome_status in {"UNKNOWN_DUE_TO_GAP", "PRICE_SOURCE_CONFLICT", "EXPIRED"})
+        classification = outcome_status or ("CENSORED" if censored else "INCOMPLETE_OBSERVATION")
         return {
-            "outcome_classification": outcome_status or ("TARGET_REACHED" if hit_tp else "TARGET_NOT_REACHED"),
-            "target_reached": hit_tp,
-            "mfe_pct": mfe_pct,
-            "mae_pct": mae_pct,
-            "hours_to_target": hours_to_target,
+            "outcome_classification": classification,
+            "target_reached": None,
+            "mfe_pct": None,
+            "mae_pct": None,
+            "hours_to_target": None,
+            "is_evaluated": False,
+            "resolution_reason": "UNRESOLVED_INCOMPLETE_OR_CENSORED",
             "execution_status": "EXECUTION_UNVERIFIED",
         }
 
     def _calculate_metrics(self, evaluations: list[dict[str, Any]]) -> dict[str, Any]:
-        n = len(evaluations)
-        if n == 0:
+        """Calculates performance statistics strictly on evaluated records, reporting incomplete counts."""
+        total_n = len(evaluations)
+        if total_n == 0:
             return {
                 "sample_size": 0,
+                "total_records_considered": 0,
+                "evaluated_records_count": 0,
+                "unresolved_records_count": 0,
+                "incomplete_records_count": 0,
+                "censored_records_count": 0,
                 "tp40_rate_pct": None,
                 "false_positive_rate_pct": None,
                 "mean_mfe_pct": None,
@@ -285,13 +376,37 @@ class ChronologicalBacktestEvaluator:
                 "wilson_95_ci_pct": None,
             }
 
-        hits = sum(1 for e in evaluations if e["outcome"].get("target_reached") is True)
-        tp40_rate = (hits / n) * 100.0
-        fp_rate = ((n - hits) / n) * 100.0
+        evaluated = [e for e in evaluations if e["outcome"].get("is_evaluated") is True]
+        unresolved = [e for e in evaluations if e["outcome"].get("outcome_classification") in {"UNRESOLVED", "INCOMPLETE_OBSERVATION", "INCOMPLETE", "INCOMPLETE_CORRUPTED_PARTITION"}]
+        censored = [e for e in evaluations if e["outcome"].get("outcome_classification") in {"CENSORED", "UNKNOWN_DUE_TO_GAP", "EXPIRED", "PRICE_SOURCE_CONFLICT"}]
+        n_eval = len(evaluated)
 
-        mfes = [e["outcome"].get("mfe_pct") for e in evaluations if e["outcome"].get("mfe_pct") is not None]
-        maes = [e["outcome"].get("mae_pct") for e in evaluations if e["outcome"].get("mae_pct") is not None]
-        times = [e["outcome"].get("hours_to_target") for e in evaluations if e["outcome"].get("hours_to_target") is not None]
+        if n_eval == 0:
+            return {
+                "status": "NO_EVALUATED_RECORDS",
+                "sample_size": total_n,
+                "total_records_considered": total_n,
+                "evaluated_records_count": 0,
+                "unresolved_records_count": len(unresolved),
+                "incomplete_records_count": len(unresolved),
+                "censored_records_count": len(censored),
+                "tp40_rate_pct": None,
+                "false_positive_rate_pct": None,
+                "mean_mfe_pct": None,
+                "mean_mae_pct": None,
+                "median_mfe_pct": None,
+                "average_hours_to_target": None,
+                "wilson_95_ci_pct": None,
+                "milestone_attainment_pct": None,
+            }
+
+        hits = sum(1 for e in evaluated if e["outcome"].get("target_reached") is True)
+        tp40_rate = (hits / n_eval) * 100.0
+        fp_rate = ((n_eval - hits) / n_eval) * 100.0
+
+        mfes = [e["outcome"].get("mfe_pct") for e in evaluated if e["outcome"].get("mfe_pct") is not None]
+        maes = [e["outcome"].get("mae_pct") for e in evaluated if e["outcome"].get("mae_pct") is not None]
+        times = [e["outcome"].get("hours_to_target") for e in evaluated if e["outcome"].get("hours_to_target") is not None]
 
         mean_mfe = round(sum(mfes) / len(mfes), 2) if mfes else None
         mean_mae = round(sum(maes) / len(maes), 2) if maes else None
@@ -299,31 +414,37 @@ class ChronologicalBacktestEvaluator:
         median_mfe = round(sorted_mfes[len(sorted_mfes) // 2], 2) if sorted_mfes else None
         avg_time = round(sum(times) / len(times), 2) if times else None
 
-        # Wilson 95% confidence interval for proportion
-        p = hits / n
+        # Wilson 95% confidence interval for proportion on evaluated records
+        p = hits / n_eval
         z = 1.96
-        denom = 1.0 + (z**2) / n
-        center = (p + (z**2) / (2 * n)) / denom
-        margin = (z * math.sqrt((p * (1 - p) + (z**2) / (4 * n)) / n)) / denom
+        denom = 1.0 + (z**2) / n_eval
+        center = (p + (z**2) / (2 * n_eval)) / denom
+        margin = (z * math.sqrt((p * (1 - p) + (z**2) / (4 * n_eval)) / n_eval)) / denom
         ci_lower = max(0.0, round((center - margin) * 100.0, 2))
         ci_upper = min(100.0, round((center + margin) * 100.0, 2))
 
         # Milestone attainment rates
-        hit_1h = sum(1 for e in evaluations if (e["outcome"].get("hours_to_target") or 999) <= 1.0)
-        hit_3h = sum(1 for e in evaluations if (e["outcome"].get("hours_to_target") or 999) <= 3.0)
-        hit_6h = sum(1 for e in evaluations if (e["outcome"].get("hours_to_target") or 999) <= 6.0)
-        hit_12h = sum(1 for e in evaluations if (e["outcome"].get("hours_to_target") or 999) <= 12.0)
+        hit_1h = sum(1 for e in evaluated if (e["outcome"].get("hours_to_target") or 999) <= 1.0)
+        hit_3h = sum(1 for e in evaluated if (e["outcome"].get("hours_to_target") or 999) <= 3.0)
+        hit_6h = sum(1 for e in evaluated if (e["outcome"].get("hours_to_target") or 999) <= 6.0)
+        hit_12h = sum(1 for e in evaluated if (e["outcome"].get("hours_to_target") or 999) <= 12.0)
 
         return {
-            "sample_size": n,
+            "status": "EVALUATED",
+            "sample_size": n_eval,
+            "total_records_considered": total_n,
+            "evaluated_records_count": n_eval,
+            "unresolved_records_count": len(unresolved),
+            "incomplete_records_count": len(unresolved),
+            "censored_records_count": len(censored),
             "tp40_hits": hits,
             "tp40_rate_pct": round(tp40_rate, 2),
             "false_positive_rate_pct": round(fp_rate, 2),
             "milestone_attainment_pct": {
-                "within_1h": round((hit_1h / n) * 100.0, 2),
-                "within_3h": round((hit_3h / n) * 100.0, 2),
-                "within_6h": round((hit_6h / n) * 100.0, 2),
-                "within_12h": round((hit_12h / n) * 100.0, 2),
+                "within_1h": round((hit_1h / n_eval) * 100.0, 2),
+                "within_3h": round((hit_3h / n_eval) * 100.0, 2),
+                "within_6h": round((hit_6h / n_eval) * 100.0, 2),
+                "within_12h": round((hit_12h / n_eval) * 100.0, 2),
                 "within_24h": round(tp40_rate, 2),
             },
             "mean_mfe_pct": mean_mfe,

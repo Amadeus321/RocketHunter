@@ -145,6 +145,16 @@ def simulate(book, buy_notional_usd, fee_bps=0.0):
 DEFAULT_RESEARCH_NOTIONAL_SIZES_USD = (100.0, 500.0, 1000.0, 5000.0)
 
 
+def _clean_numeric(val: Any) -> float | None:
+    if val is None or val == "":
+        return None
+    try:
+        f = float(val)
+        return f if math.isfinite(f) else None
+    except (ValueError, TypeError):
+        return None
+
+
 def simulate_multi_size(
     source: dict[str, Any],
     *,
@@ -157,18 +167,41 @@ def simulate_multi_size(
 ) -> dict[str, Any]:
     """Evaluate multi-size read-only execution scenarios ($100, $500, $1k, $5k).
 
+    Distinguishes actual order book depth walks from approximate linear liquidity heuristics.
     Never assumes the same token has identical execution cost across sizes.
     Never assumes a buy quote proves a sell route is possible.
+    Enforces quote freshness verification and size-bound quote validation.
     """
+    # Sanitize and validate inputs to prevent malformed/negative crashes
+    fee_bps_clean = _clean_numeric(fee_bps)
+    fee_bps = max(0.0, fee_bps_clean) if fee_bps_clean is not None else 30.0
+
+    gas_usd_clean = _clean_numeric(gas_usd)
+    gas_usd = max(0.0, gas_usd_clean) if gas_usd_clean is not None else None
+
+    target_upside_clean = _clean_numeric(target_upside_pct)
+    target_upside_pct = target_upside_clean
+
+    max_age_clean = _clean_numeric(max_quote_age_seconds)
+    max_quote_age_seconds = max(1.0, max_age_clean) if max_age_clean is not None else 300.0
+
+    clean_sizes: list[float] = []
+    raw_sizes = sizes_usd if isinstance(sizes_usd, (list, tuple, set)) else DEFAULT_RESEARCH_NOTIONAL_SIZES_USD
+    for s in raw_sizes:
+        num = _clean_numeric(s)
+        if num is not None and num > 0:
+            clean_sizes.append(num)
+    if not clean_sizes:
+        clean_sizes = list(DEFAULT_RESEARCH_NOTIONAL_SIZES_USD)
+
     now = None
     if as_of_utc:
         try:
-            now = dt_parse = None
             import datetime as _dt
-            if as_of_utc.endswith("Z"):
-                now = _dt.datetime.fromisoformat(as_of_utc.replace("Z", "+00:00"))
+            if str(as_of_utc).endswith("Z"):
+                now = _dt.datetime.fromisoformat(str(as_of_utc).replace("Z", "+00:00"))
             else:
-                now = _dt.datetime.fromisoformat(as_of_utc)
+                now = _dt.datetime.fromisoformat(str(as_of_utc))
         except Exception:
             now = None
 
@@ -180,11 +213,7 @@ def simulate_multi_size(
     size_evaluations: dict[str, Any] = {}
     liquidity_usd = None
     if isinstance(source, dict):
-        liquidity_usd = (
-            float(source.get("liquidity_usd"))
-            if source.get("liquidity_usd") is not None and math.isfinite(float(source.get("liquidity_usd")))
-            else None
-        )
+        liquidity_usd = _clean_numeric(source.get("liquidity_usd"))
 
     # Check timestamp freshness if available
     quote_stamp = None
@@ -207,15 +236,20 @@ def simulate_multi_size(
             quote_age_seconds = None
 
     is_stale = quote_age_seconds is not None and quote_age_seconds > max_quote_age_seconds
+    is_missing_timestamp = (now is not None and raw_stamp is None)
 
-    for size in sizes_usd:
+    for size in clean_sizes:
         size_key = f"${int(size) if size.is_integer() else size}"
+
         if is_stale:
             size_evaluations[size_key] = {
                 "size_usd": size,
                 "status": "STALE_QUOTE",
                 "route_available": False,
                 "quote_freshness": "STALE",
+                "simulation_method": "STALE_QUOTE_REJECTED",
+                "quote_verified_for_size": False,
+                "size_verification_status": "ORDER_SIZE_UNVERIFIED_ESTIMATE",
                 "quote_age_seconds": round(quote_age_seconds, 1) if quote_age_seconds else None,
                 "buy": {"status": "UNAVAILABLE", "reason": "Quote older than maximum allowed age"},
                 "sell": {"status": "UNAVAILABLE", "reason": "Quote older than maximum allowed age"},
@@ -224,8 +258,25 @@ def simulate_multi_size(
             }
             continue
 
+        if is_missing_timestamp:
+            size_evaluations[size_key] = {
+                "size_usd": size,
+                "status": "UNVERIFIED_TIMESTAMP",
+                "route_available": False,
+                "quote_freshness": "MISSING_TIMESTAMP_UNVERIFIED",
+                "simulation_method": "UNVERIFIED_TIMESTAMP_REJECTED",
+                "quote_verified_for_size": False,
+                "size_verification_status": "ORDER_SIZE_UNVERIFIED_ESTIMATE",
+                "quote_age_seconds": None,
+                "buy": {"status": "UNAVAILABLE", "reason": "Missing quote timestamp; cannot verify freshness"},
+                "sell": {"status": "UNAVAILABLE", "reason": "Missing quote timestamp; cannot verify freshness"},
+                "estimated_round_trip_cost_pct": None,
+                "execution_adjusted_return_pct": None,
+            }
+            continue
+
         if book:
-            # Order book depth simulation
+            # Order book depth simulation: genuine depth walk consuming limit orders
             try:
                 sim = simulate(book, buy_notional_usd=size, fee_bps=fee_bps)
                 buy_complete = sim["buy"]["complete"]
@@ -248,6 +299,10 @@ def simulate_multi_size(
                 size_evaluations[size_key] = {
                     "size_usd": size,
                     "status": status,
+                    "simulation_method": "ORDER_BOOK_DEPTH_WALK",
+                    "is_depth_walk": True,
+                    "quote_verified_for_size": True,
+                    "size_verification_status": "SIZE_BOUND_ORDER_BOOK_WALK",
                     "route_available": buy_complete and sell_complete,
                     "quote_freshness": "FRESH" if quote_age_seconds is not None else "UNVERIFIED_TIMESTAMP",
                     "quote_age_seconds": round(quote_age_seconds, 1) if quote_age_seconds else None,
@@ -278,6 +333,10 @@ def simulate_multi_size(
                 size_evaluations[size_key] = {
                     "size_usd": size,
                     "status": "UNAVAILABLE",
+                    "simulation_method": "ORDER_BOOK_DEPTH_WALK",
+                    "is_depth_walk": True,
+                    "quote_verified_for_size": False,
+                    "size_verification_status": "ORDER_SIZE_UNVERIFIED_ESTIMATE",
                     "route_available": False,
                     "reason": str(e),
                     "buy": {"status": "UNAVAILABLE"},
@@ -290,6 +349,14 @@ def simulate_multi_size(
             has_buy = isinstance(buy_q, dict) and bool(buy_q)
             has_sell = isinstance(sell_q, dict) and bool(sell_q)
 
+            # Check if router quote was explicitly requested and bound for this specific notional size
+            quoted_size = (
+                _clean_numeric((buy_q or {}).get("notional_size_usd") if isinstance(buy_q, dict) else None) or
+                _clean_numeric(quotes.get("notional_size_usd")) or
+                _clean_numeric(quotes.get("quote_size_usd"))
+            )
+            size_bound = (quoted_size is not None and abs(quoted_size - size) / max(1.0, size) <= 0.05)
+
             if not has_buy:
                 status = "MISSING_BUY_ROUTE"
             elif not has_sell:
@@ -300,10 +367,10 @@ def simulate_multi_size(
             else:
                 status = "EXECUTABLE_ROUTE_AVAILABLE"
 
-            # Estimate AMM constant product impact for size relative to pool liquidity if modeled
+            # Linear liquidity heuristic approximation (trade_size / half_liquidity).
+            # This is an approximation heuristic, NOT a full constant-product AMM curve integration or depth walk.
             impact_bps = None
             if liquidity_usd and liquidity_usd > 0:
-                # In x*y=k pool, price impact ~= trade_size / (pool_liquidity / 2)
                 impact_pct = (size / (liquidity_usd / 2.0)) * 100.0
                 impact_bps = round(impact_pct * 100.0, 1)
 
@@ -316,6 +383,13 @@ def simulate_multi_size(
             size_evaluations[size_key] = {
                 "size_usd": size,
                 "status": status,
+                "simulation_method": "APPROXIMATE_LIQUIDITY_HEURISTIC",
+                "is_depth_walk": False,
+                "impact_model": "LINEAR_RESERVE_HEURISTIC_APPROXIMATION",
+                "impact_model_disclaimer": "Linear liquidity estimate (trade_size / half_liquidity); not a constant-product AMM simulation or order book depth walk.",
+                "quote_verified_for_size": size_bound,
+                "size_verification_status": "SIZE_BOUND_QUOTE_VERIFIED" if size_bound else "ORDER_SIZE_UNVERIFIED_ESTIMATE",
+                "size_warning": None if size_bound else f"Router quote evidence not independently size-bound to ${size:.0f}; using approximate liquidity heuristic.",
                 "route_available": bool(has_buy and has_sell and status != "INSUFFICIENT_LIQUIDITY"),
                 "quote_freshness": "FRESH" if quote_age_seconds is not None else "UNVERIFIED_TIMESTAMP",
                 "quote_age_seconds": round(quote_age_seconds, 1) if quote_age_seconds else None,
@@ -341,6 +415,10 @@ def simulate_multi_size(
             size_evaluations[size_key] = {
                 "size_usd": size,
                 "status": "NO_QUOTE_OR_BOOK_DATA",
+                "simulation_method": "NO_DEPTH_DATA",
+                "is_depth_walk": False,
+                "quote_verified_for_size": False,
+                "size_verification_status": "ORDER_SIZE_UNVERIFIED_ESTIMATE",
                 "route_available": False,
                 "buy": {"status": "UNAVAILABLE", "reason": "No order book depth or route quotes provided"},
                 "sell": {"status": "UNAVAILABLE", "reason": "No order book depth or route quotes provided"},

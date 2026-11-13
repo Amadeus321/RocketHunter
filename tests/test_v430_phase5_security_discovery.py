@@ -18,6 +18,8 @@ class TestPhase5SecurityAndDiscovery:
         res = _solana_security(report, {}, "2026-11-13T12:00:00Z")
         sec = res["solana_security"]
         assert sec["token_extensions"]["has_permanent_delegate"] is True
+        assert sec["token_extensions"]["token_extensions_verification_method"] == "RUGCHECK_REPORT_PARSED"
+        assert sec["token_extensions"]["direct_rpc_mint_deserialization"] is False
         # Critical risks must include the permanent delegate risk
         critical_names = [r["name"] for r in sec["critical_risks"]]
         assert "PermanentDelegateExtension" in critical_names
@@ -34,6 +36,8 @@ class TestPhase5SecurityAndDiscovery:
         res = _solana_security(report, {}, "2026-11-13T12:00:00Z")
         sec = res["solana_security"]
         assert sec["token_extensions"]["has_transfer_hook"] is True
+        assert sec["token_extensions"]["token_extensions_verification_method"] == "RUGCHECK_REPORT_PARSED"
+        assert sec["token_extensions"]["direct_rpc_mint_deserialization"] is False
         critical_names = [r["name"] for r in sec["critical_risks"]]
         assert "TransferHookExtension" in critical_names
 
@@ -51,26 +55,46 @@ class TestPhase5SecurityAndDiscovery:
             assert lp_res["status"] == "UNVERIFIED"
             assert lp_res["lp_model"] == "CONCENTRATED_LIQUIDITY_NFT"
             assert lp_res["is_concentrated_liquidity"] is True
+            assert lp_res["nft_position_ownership_audited"] is False
             assert "Uniswap V3" in lp_res["reason"]
 
     def test_http_429_retry_after_zero_enforces_minimum_backoff(self, tmp_path):
         client = v425.DexPaprikaClient(tmp_path)
         # Verify that Retry-After: 0 does not permit immediate repeat
         headers_zero = {"retry-after": "0"}
-        headers_positive = {"retry-after": "45"}
-        headers_none = {}
 
         # Mock urllib to raise HTTPError 429
         import urllib.error
         import io
+        import json
+        import time
         err_zero = urllib.error.HTTPError("http://test", 429, "Too Many Requests", headers_zero, io.BytesIO(b"rate limited"))
 
         with patch("urllib.request.urlopen", side_effect=err_zero), \
-             patch("scripts.v425_early_breakout._reserve_request", return_value=(True, 1)):
-            _, _, error_msg = client.get("/pools/search")
+             patch("scripts.v425_early_breakout._reserve_request", return_value=(True, 1)) as mock_reserve:
+            _, _, error_msg = client.get("/pools/search", family="search")
             assert "HTTP 429 Rate limited" in error_msg
-            # Enforces at least 15s backoff, not 0s
             assert "15" in error_msg
+            assert mock_reserve.call_count == 1
+
+        # Verify persistent shared cooldown was recorded to disk
+        cooldown_file = tmp_path / ".dexpaprika-cooldown.json"
+        assert cooldown_file.exists()
+        cooldown_data = json.loads(cooldown_file.read_text(encoding="utf-8"))
+        assert cooldown_data["cooldown_duration_seconds"] >= 15.0
+        assert cooldown_data["cooldown_until_epoch"] >= time.time() + 14.0
+
+        # Now test that a subsequent call across ANY query family or client instance is blocked
+        # BEFORE making any network call or reserving any requests
+        client2 = v425.DexPaprikaClient(tmp_path)
+        with patch("urllib.request.urlopen") as mock_urlopen, \
+             patch("scripts.v425_early_breakout._reserve_request") as mock_reserve2:
+            payload, headers, error2 = client2.get("/tokens/trending", family="trending")
+            assert payload is None
+            assert "provider cooldown active across processes" in error2
+            # Crucial verification: zero network calls and zero request budget consumed
+            mock_urlopen.assert_not_called()
+            mock_reserve2.assert_not_called()
 
     def test_dexpaprika_discovery_reports_partial_coverage(self, tmp_path):
         hunter = MagicMock()

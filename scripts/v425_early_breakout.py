@@ -213,6 +213,50 @@ def _reserve_request(memory: Path, family: str) -> tuple[bool, int]:
         return True, len(ledger["requests"])
 
 
+def _get_shared_cooldown(shared_dir: Path) -> float:
+    """Return remaining cooldown seconds if an active provider backoff is in effect across processes."""
+    cooldown_path = shared_dir / ".dexpaprika-cooldown.json"
+    if not cooldown_path.exists():
+        return 0.0
+    try:
+        from scripts.file_lock import locked_file
+    except ImportError:
+        from file_lock import locked_file
+    try:
+        with locked_file(cooldown_path.with_suffix(".lock")):
+            data = json.loads(cooldown_path.read_text(encoding="utf-8"))
+            until = float(data.get("cooldown_until_epoch", 0.0))
+            now = time.time()
+            remaining = max(0.0, until - now)
+            return remaining
+    except Exception:
+        return 0.0
+
+
+def _set_shared_cooldown(shared_dir: Path, retry_seconds: float) -> float:
+    """Record persistent shared provider cooldown across query families and concurrent scanner processes."""
+    cooldown_path = shared_dir / ".dexpaprika-cooldown.json"
+    shared_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        from scripts.file_lock import locked_file
+    except ImportError:
+        from file_lock import locked_file
+    enforced_seconds = max(15.0, float(retry_seconds))
+    now = time.time()
+    cooldown_until = now + enforced_seconds
+    data = {
+        "cooldown_until_epoch": cooldown_until,
+        "cooldown_until_utc": datetime.fromtimestamp(cooldown_until, tz=timezone.utc).isoformat(),
+        "cooldown_duration_seconds": enforced_seconds,
+        "triggered_at_utc": datetime.fromtimestamp(now, tz=timezone.utc).isoformat(),
+    }
+    with locked_file(cooldown_path.with_suffix(".lock")):
+        temp = cooldown_path.with_suffix(".tmp")
+        temp.write_text(json.dumps(data, indent=2), encoding="utf-8")
+        temp.replace(cooldown_path)
+    return enforced_seconds
+
+
 def _store_quota_headers(memory: Path, headers: dict[str, str]) -> None:
     remaining = _num(headers.get("x-credits-remaining"))
     if remaining is None:
@@ -245,6 +289,14 @@ class DexPaprikaClient:
 
     def get(self, path: str, params: dict[str, Any] | None = None,
             family: str = "unspecified") -> tuple[Any, dict[str, str], str | None]:
+        shared = Path(os.environ.get("ROCKET_HUNTER_SHARED_MEMORY_DIR") or self.memory).resolve()
+        remaining_cooldown = _get_shared_cooldown(shared)
+        if remaining_cooldown > 0.0:
+            return None, {}, (
+                f"HTTP 429 provider cooldown active across processes "
+                f"({remaining_cooldown:.1f}s remaining after previous rate limit)"
+            )
+
         allowed, reserved = _reserve_request(self.memory, family)
         if not allowed:
             return None, {}, "scanner rolling request ceiling reached (%s/%s)" % (
@@ -253,7 +305,6 @@ class DexPaprikaClient:
             from scripts.file_lock import shared_rate_limit
         except ImportError:
             from file_lock import shared_rate_limit
-        shared = Path(os.environ.get("ROCKET_HUNTER_SHARED_MEMORY_DIR") or self.memory).resolve()
         shared_rate_limit(shared / ".dexpaprika-request-rate.json", self.interval)
         wait = self.interval - (time.monotonic() - self.last_request)
         if self.last_request and wait > 0:
@@ -287,9 +338,12 @@ class DexPaprikaClient:
                     retry_seconds = float(retry_after_raw.strip()) if retry_after_raw else 30.0
                     if retry_seconds <= 0.0:
                         retry_seconds = 15.0  # Enforce minimum 15s backoff
+                    else:
+                        retry_seconds = max(15.0, retry_seconds)
                 except (ValueError, TypeError):
                     retry_seconds = 30.0
-                return None, headers, "HTTP 429 Rate limited (Retry-After: %ss backoff enforced): %s" % (retry_seconds, detail)
+                _set_shared_cooldown(shared, retry_seconds)
+                return None, headers, "HTTP 429 Rate limited (Retry-After: %ss backoff enforced across processes): %s" % (retry_seconds, detail)
             return None, headers, "HTTP %s %s" % (exc.code, detail)
         except Exception as exc:
             return None, {}, "%s: %s" % (type(exc).__name__, exc)
@@ -1828,6 +1882,18 @@ def qualify_final_actionable_candidates(candidates: list[dict[str, Any]], now: d
         blockers = []
         if software_failure:
             blockers.append("signal engine software execution failed or threw an exception")
+        try:
+            from scripts.user_trade_learning import enforce_aura_safety_veto
+        except ImportError:
+            try:
+                from user_trade_learning import enforce_aura_safety_veto
+            except ImportError:
+                enforce_aura_safety_veto = None
+        if enforce_aura_safety_veto:
+            is_vetoed, veto_reason = enforce_aura_safety_veto(candidate)
+            if is_vetoed:
+                blockers.append(veto_reason)
+                complete = False
         if str(candidate.get("market_type") or "").lower() != "dex_pool":
             blockers.append("only exact-identity DEX pools can enter the qualified lane")
         if not observed_target:

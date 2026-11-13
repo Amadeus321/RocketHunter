@@ -590,6 +590,13 @@ def process_snapshot(main_path: Path, forward_path: Path | None, outdir: Path, m
     append = [r for r in forecasts if r["forecast_id"] not in seen_ids]
     append_jsonl_gz(forecast_path, append)
 
+    prospective_diagnostics: dict[str, Any] = {
+        "status": "NOT_EXECUTED",
+        "snapshots_created": 0,
+        "snapshots_appended": 0,
+        "duplicate_count": 0,
+        "error": None,
+    }
     try:
         try:
             from scripts.prospective_opportunity_dataset import ProspectiveOpportunityDataset
@@ -608,14 +615,22 @@ def process_snapshot(main_path: Path, forward_path: Path | None, outdir: Path, m
             )
             for k, v in sorted(rows.items())
         ]
-        ProspectiveOpportunityDataset.append_snapshots(
+        prospective_diagnostics["snapshots_created"] = len(prospective_snapshots)
+        append_details: dict[str, Any] = {}
+        partition_path = ProspectiveOpportunityDataset.append_snapshots(
             memory_dir,
             prospective_snapshots,
             partition_date=f"{snapshot:%Y%m%d}",
+            details_out=append_details,
         )
+        prospective_diagnostics["snapshots_appended"] = append_details.get("appended_count", len(prospective_snapshots))
+        prospective_diagnostics["duplicate_count"] = append_details.get("duplicate_count", 0)
+        prospective_diagnostics["partition_path"] = str(partition_path)
+        prospective_diagnostics["status"] = "SUCCESS"
     except Exception as exc:
-        # Prospective snapshot capture failure must not silently crash memory pipeline
-        pass
+        prospective_diagnostics["status"] = "FAILED"
+        prospective_diagnostics["error"] = f"{type(exc).__name__}: {exc}"
+        sys.stderr.write(f"[WARNING] Prospective opportunity snapshot capture or persistence failed: {type(exc).__name__}: {exc}\n")
 
     grading = grade_outcomes(memory_dir, snapshot, rows, run_id)
 
@@ -628,6 +643,7 @@ def process_snapshot(main_path: Path, forward_path: Path | None, outdir: Path, m
         "retained_report_rows_deduplicated": len(rows),
         "reported_source_unique_asset_rows": (main.get("coverage") or {}).get("unique_asset_rows"),
         "forecast_snapshots_new": len(append),
+        "prospective_dataset": prospective_diagnostics,
         "return_window_counts": {
             status: sum(1 for row in rows.values() if row.get("return_window_status") == status)
             for status in ("INSUFFICIENT_24H_HISTORY", "UNKNOWN_POOL_AGE_NOT_COMPARABLE", "SOURCE_REPORTED_24H_POOL_AGE_GE_24H", "EXCHANGE_OR_AGGREGATOR_24H_FIELD")

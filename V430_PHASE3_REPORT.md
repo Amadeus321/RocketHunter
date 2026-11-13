@@ -26,6 +26,9 @@
    - Implemented `ChronologicalBacktestEvaluator` which strictly enforces time-separated walk-forward evaluation:
      - Partitions datasets chronologically across train, test, and step intervals.
      - Guarantees zero future-data leakage: models are developed only on earlier windows and evaluated strictly on subsequent unseen windows.
+     - **Zero Synthetic Labels:** Incomplete or unresolved windows are strictly excluded from TP40 attainment percentages and classified as `INCOMPLETE` / `UNRESOLVED`. No estimation from 24h change and no invented target touch times.
+     - **Record Accounting:** Explicitly reports `total_records_considered`, `evaluated_records_count`, `unresolved_records_count`, `incomplete_records_count`, and `censored_records_count`.
+     - **Corrupted Partition Detection:** Safely catches unreadable/corrupted partition files and injects visible incomplete records.
      - Freezes decision-time features at the exact moment of detection.
      - Automatically excludes ambiguous identities (missing chain, token, or pool).
      - Deduplicates repeated pools and overlapping signals.

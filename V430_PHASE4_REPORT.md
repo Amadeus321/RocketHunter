@@ -34,10 +34,13 @@
    - For every size tier, the simulator evaluates:
      - Buy quote availability, filled notional, and price impact (in basis points).
      - Sell quote availability, filled notional, and price impact.
+     - **Order Book Depth Walk vs Linear Approximation:** Distinguishes genuine depth walks (`ORDER_BOOK_DEPTH_WALK`) consuming book levels from approximate linear liquidity heuristics (`LINEAR_RESERVE_HEURISTIC_APPROXIMATION`). Does not misrepresent linear approximations as full constant-product AMM curve integrations.
+     - **Quote Size Verification:** If router quotes were not specifically quoted for the evaluated notional size, records `quote_verified_for_size: False` and `size_verification_status: "ORDER_SIZE_UNVERIFIED_ESTIMATE"`.
      - **Independent Sell Route Verification:** If a buy quote exists but a sell quote is missing, status is explicitly marked `"MISSING_SELL_ROUTE"` and execution readiness is blocked.
      - Trading fees (basis points) and network gas (USD).
      - Non-linear price impact scaling: larger orders consume deeper book levels or AMM reserves.
-     - Quote freshness: automatically tags quotes older than 300 seconds as `"STALE_QUOTE"`.
+     - **Quote Freshness & Timestamps:** Automatically tags quotes older than 300 seconds as `"STALE_QUOTE"` and missing timestamps as `"MISSING_TIMESTAMP_UNVERIFIED"`.
+     - **Input Validation:** Sanitizes negative, non-numeric, or NaN values cleanly to prevent crashes.
      - Execution-adjusted return: computes net return after round-trip slippage, fees, and gas drag.
 
 ---
