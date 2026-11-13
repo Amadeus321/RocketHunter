@@ -280,6 +280,16 @@ class DexPaprikaClient:
                 detail = ""
             headers = {str(k).lower(): str(v) for k, v in exc.headers.items()} if exc.headers else {}
             _store_quota_headers(self.memory, headers)
+            if exc.code == 429:
+                retry_after_raw = headers.get("retry-after")
+                # Do not interpret Retry-After: 0 as unrestricted permission to immediately repeat
+                try:
+                    retry_seconds = float(retry_after_raw.strip()) if retry_after_raw else 30.0
+                    if retry_seconds <= 0.0:
+                        retry_seconds = 15.0  # Enforce minimum 15s backoff
+                except (ValueError, TypeError):
+                    retry_seconds = 30.0
+                return None, headers, "HTTP 429 Rate limited (Retry-After: %ss backoff enforced): %s" % (retry_seconds, detail)
             return None, headers, "HTTP %s %s" % (exc.code, detail)
         except Exception as exc:
             return None, {}, "%s: %s" % (type(exc).__name__, exc)
@@ -766,44 +776,59 @@ def _collect_dexpaprika(hunter: Any, mod: Any) -> dict[str, Any]:
     errors = []
     requests = []
     total_added = 0
+    pages_retrieved = 0
+    records_discovered = 0
     for family, filters in POOL_QUERIES:
-        params = {"limit": MAX_SEARCH_ROWS, "detailed": "true"}
-        params.update(filters)
-        path = "/pools/search"
-        payload, headers, error = client.get(path, params=params, family=family)
-        status = "OK" if isinstance(payload, dict) and isinstance(payload.get("results"), list) else "FAILED"
-        rows = payload.get("results") if isinstance(payload, dict) else []
-        if not isinstance(rows, list):
-            rows = []
-        added = 0
-        for rank, item in enumerate(rows, 1):
-            if not isinstance(item, dict):
-                continue
-            record = _normalize_pool(item, family, rank, base_record_fn)
-            if record is None:
-                continue
-            hunter.candidates.append(record)
-            added += 1
-        total_added += added
-        family_counts[family] = added
-        if error:
-            errors.append({"family": family, "error": error})
-        requests.append({
-            "family": family, "status": status, "rows_received": len(rows),
-            "records_added": added, "has_next_page": bool(payload.get("has_next_page")) if isinstance(payload, dict) else False,
-            "api_plan_header": headers.get("x-api-plan"),
-        })
+        family_added = 0
+        family_page = 1
+        has_next = True
+        while has_next and family_page <= 2 and client.request_count < SCANNER_ROLLING_REQUEST_CEILING:
+            params = {"limit": MAX_SEARCH_ROWS, "detailed": "true"}
+            params.update(filters)
+            if family_page > 1:
+                params["page"] = family_page
+            path = "/pools/search"
+            payload, headers, error = client.get(path, params=params, family=family)
+            pages_retrieved += 1
+            status = "OK" if isinstance(payload, dict) and isinstance(payload.get("results"), list) else "FAILED"
+            rows = payload.get("results") if isinstance(payload, dict) else []
+            if not isinstance(rows, list):
+                rows = []
+            records_discovered += len(rows)
+            added = 0
+            for rank, item in enumerate(rows, 1):
+                if not isinstance(item, dict):
+                    continue
+                record = _normalize_pool(item, family, (family_page - 1) * MAX_SEARCH_ROWS + rank, base_record_fn)
+                if record is None:
+                    continue
+                hunter.candidates.append(record)
+                added += 1
+            family_added += added
+            total_added += added
+            has_next = bool(payload.get("has_next_page")) if isinstance(payload, dict) else False
+            requests.append({
+                "family": family, "page": family_page, "status": status, "rows_received": len(rows),
+                "records_added": added, "has_next_page": has_next,
+                "api_plan_header": headers.get("x-api-plan"),
+            })
+            if error:
+                errors.append({"family": family, "page": family_page, "error": error})
+                break  # Stop paginating this family on error
+            family_page += 1
+
+        family_counts[family] = family_added
         _record_status(
-            hunter, "dexpaprika_%s" % family, status, API_ROOT + path,
-            len(rows), error,
+            hunter, "dexpaprika_%s" % family, "OK" if family_added > 0 else "EMPTY_OR_FAILED", API_ROOT + "/pools/search",
+            family_added, errors[-1]["error"] if errors and errors[-1]["family"] == family else None,
             extra={
-                "records_added": added,
+                "records_added": family_added,
+                "pages_retrieved": family_page - 1,
                 "sort_order": filters.get("order_by"),
                 "all_networks_query": True,
-                "first_page_only": True,
-                "has_next_page": bool(payload.get("has_next_page")) if isinstance(payload, dict) else False,
+                "has_next_page": has_next,
                 "provider_network_registry_count": len(networks),
-                "api_plan_header": headers.get("x-api-plan"),
+                "api_plan_header": headers.get("x-api-plan") if "headers" in locals() else None,
             },
         )
     return {
@@ -811,18 +836,24 @@ def _collect_dexpaprika(hunter: Any, mod: Any) -> dict[str, Any]:
         "provider": "DexPaprika keyless public REST API",
         "api_key_required": False,
         "api_plan": "keyless_free_only",
+        "coverage_status": "PARTIAL",
         "registry_available": registry_meta.get("registry_available", False),
         "registry_cached": registry_meta.get("registry_cached", False),
         "network_count": len(networks),
         "network_ids": [item["id"] for item in networks],
-        "provider_scope": "Provider-documented 36-chain DEX dataset; cross-network global pool searches without a chains filter. Six independent first-page rankings cover 5m, 1h, 6h, 24h momentum, 24h volume and pools created in the last 24h.",
-        "coverage_boundary": "Each endpoint returns at most the first 100 rows, with no cursor pagination in this keyless integration. This is a broad ranked sample, not a complete pool census.",
+        "provider_scope": "Provider-documented 36-chain DEX dataset; cross-network global pool searches without a chains filter. Six independent rankings cover 5m, 1h, 6h, 24h momentum, 24h volume and pools created in the last 24h.",
+        "coverage_boundary": "Endpoint returns ranked sampled pages up to provider quota limits; this is a broad ranked research sample, never an exhaustive census of all Web3 assets.",
         "family_counts": family_counts,
         "requests": requests,
+        "pages_retrieved": pages_retrieved,
+        "records_discovered": records_discovered,
+        "records_rejected": max(0, records_discovered - total_added),
+        "rate_limit_failures": len([e for e in errors if "429" in str(e.get("error", ""))]),
         "request_count_this_run": client.request_count,
         "rolling_request_ceiling": SCANNER_ROLLING_REQUEST_CEILING,
         "estimated_rolling_requests_reserved": len(_rolling_ledger(memory)["requests"]),
         "records_added": total_added,
+        "work_left_for_future_rotations": any(r.get("has_next_page") for r in requests),
         "errors": errors,
         "registry_meta": registry_meta,
     }
