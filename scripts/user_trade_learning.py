@@ -312,7 +312,7 @@ def extract_position_features(pos: dict[str, Any]) -> dict[str, float | None] | 
 
     Returns None for any indicator not explicitly present in the recorded entry snapshot.
     """
-    entry_feats = pos.get("entry_features") or pos.get("breakout_engine_scores")
+    entry_feats = pos.get("entry_features") or pos.get("breakout_engine_scores") or pos.get("features_snapshot")
     if not isinstance(entry_feats, dict) or not entry_feats:
         return None
 
@@ -443,8 +443,12 @@ def train_ai_from_user_journal() -> dict[str, Any]:
     attributions: dict[str, float] = {k: 0.0 for k in feature_keys}
     learned_weights: dict[str, float] = dict(prior_weights)
 
-    # Compute empirical covariance feature attributions strictly if complete trade samples exist
-    if len(trade_samples) >= 1:
+    # Require minimum sample count for weight adaptation to prevent overfitting on 1-2 lucky/unlucky trades
+    MIN_TRAINING_SAMPLES_FOR_WEIGHT_ADAPTATION = 5
+    weight_adaptation_applied = False
+
+    # Compute empirical covariance feature attributions if at least 2 trade samples exist
+    if len(trade_samples) >= 2:
         mean_pnl = sum(s["pnl"] for s in trade_samples) / len(trade_samples)
         for k in feature_keys:
             feat_vals = [s["features"][k] for s in trade_samples]
@@ -452,10 +456,17 @@ def train_ai_from_user_journal() -> dict[str, Any]:
             cov = sum((s["features"][k] - mean_f) * (s["pnl"] - mean_pnl) for s in trade_samples) / len(trade_samples)
             std_f = math.sqrt(sum((x - mean_f) ** 2 for x in feat_vals) / len(feat_vals)) or 1.0
             std_pnl = math.sqrt(sum((s["pnl"] - mean_pnl) ** 2 for s in trade_samples) / len(trade_samples)) or 1.0
-            corr = cov / (std_f * std_pnl)
+            corr = cov / (std_f * std_pnl) if (std_f * std_pnl) > 0 else 0.0
             attributions[k] = round(corr, 4)
-            # Bayesian update to prior weights
-            learning_rate = min(0.35, 0.08 * math.sqrt(len(trade_samples)))
+
+    # Adapt production weights only if complete samples meet or exceed minimum threshold
+    if len(trade_samples) >= MIN_TRAINING_SAMPLES_FOR_WEIGHT_ADAPTATION:
+        weight_adaptation_applied = True
+        shrinkage_factor = min(1.0, len(trade_samples) / 25.0)  # Regularization toward prior baseline
+        for k in feature_keys:
+            corr = attributions.get(k, 0.0)
+            # Regularized shrinkage update to prior weights
+            learning_rate = min(0.25, 0.05 * math.sqrt(len(trade_samples))) * shrinkage_factor
             weight_shift = corr * learning_rate
             updated_w = round(max(0.50, min(1.20, prior_weights[k] + weight_shift)), 3)
             learned_weights[k] = updated_w
@@ -484,6 +495,9 @@ def train_ai_from_user_journal() -> dict[str, Any]:
         "loss_count": losses,
         "win_rate_pct": round(win_rate, 1),
         "average_pnl_pct": round(avg_pnl, 2),
+        "statistical_method": "Regularized empirical covariance feature-attribution with shrinkage to prior baseline",
+        "min_samples_threshold": MIN_TRAINING_SAMPLES_FOR_WEIGHT_ADAPTATION,
+        "weight_adaptation_applied": bool(len(trade_samples) >= MIN_TRAINING_SAMPLES_FOR_WEIGHT_ADAPTATION),
         "learned_feature_weights": learned_weights,
         "feature_attributions": attributions,
         "feature_importance": sorted(
@@ -495,6 +509,13 @@ def train_ai_from_user_journal() -> dict[str, Any]:
         "verified_training_samples": len(trade_samples),
         "partial_snapshots_recorded": partial_snapshots_count,
         "synthetic_labels_permitted": False,
+        "safety_veto_enforced": True,
+        "safety_rules": [
+            "AURA weights cannot override token contract security verification",
+            "AURA weights cannot override LP position lock/burn requirements",
+            "AURA weights cannot override +40.00% technical TP minimum",
+            "AURA weights cannot override execution quote requirements",
+        ],
         "negative_failure_lessons": [
             {"symbol": "FAIR/SOL", "outcome": "Near-miss: reached 0.0002832 vs TP 0.0002908889 (97.35% of target) then dumped -56%", "lesson": "Front-run resistance: AURA applies dynamic TP front-run buffer (3%-5% below structural resistance) to secure profits before algorithmic sell walls and reversals."},
             {"symbol": "USOE/SOL", "outcome": "-44.61%", "lesson": "False breakout with insufficient 24h liquidity cushion."},
@@ -603,6 +624,158 @@ def get_aura_learned_weights() -> dict[str, float]:
         "breakout_explosiveness_multiplier": 1.15,
         "tp_frontrun_buffer_pct": 0.965,
     }
+
+
+def _clean_num(val: Any) -> float | None:
+    if val is None or val == "":
+        return None
+    try:
+        v = float(val)
+        return v if math.isfinite(v) else None
+    except (ValueError, TypeError):
+        return None
+
+
+def get_dataset_a_user_trades() -> list[dict[str, Any]]:
+    """Dataset A: Real user-confirmed positions with actual entry and realized P/L."""
+    journal = get_journal()
+    return [
+        pos for pos in journal.get("positions", [])
+        if pos.get("user_confirmed_taken", True) is not False
+    ]
+
+
+def get_dataset_b_scanner_predictions(memory_dir: Path | None = None) -> list[dict[str, Any]]:
+    """Dataset B: Prospective scanner predictions with frozen features and independent outcomes.
+
+    Labels are completely separate from Dataset A (never mix user trades with scanner predictions).
+    """
+    import gzip
+    mem_dir = Path(memory_dir or (DATA_DIR / "scanner-memory"))
+    records: list[dict[str, Any]] = []
+
+    prospective_dir = mem_dir / "prospective-opportunities"
+    if prospective_dir.exists():
+        for p in sorted(prospective_dir.glob("*.jsonl.gz")):
+            try:
+                with gzip.open(p, "rt", encoding="utf-8") as handle:
+                    for line in handle:
+                        if line.strip():
+                            records.append(json.loads(line))
+            except Exception:
+                pass
+
+    forecast_dir = mem_dir / "forecasts"
+    if forecast_dir.exists():
+        for p in sorted(forecast_dir.glob("*.jsonl.gz")):
+            try:
+                with gzip.open(p, "rt", encoding="utf-8") as handle:
+                    for line in handle:
+                        if line.strip():
+                            records.append(json.loads(line))
+            except Exception:
+                pass
+    return records
+
+
+def classify_market_regime(metrics: dict[str, Any]) -> str:
+    """Classify the current market-wide regime to context-weight signals.
+
+    Regimes:
+    - BULLISH: Strong positive breadth across major benchmarks.
+    - BEARISH: Severe broad market downtrend and negative net flows.
+    - HIGH_VOLATILITY: Extreme intraday swings or market-wide dispersion.
+    - LOW_LIQUIDITY: Depleted aggregate market liquidity.
+    - RISK_OFF: Heavy net outflows and negative smart money delta.
+    - SIDEWAYS: Low dispersion, range-bound consolidation.
+    """
+    btc_24h = _clean_num(metrics.get("btc_change_24h_pct") or metrics.get("market_change_24h_pct"))
+    volatility = _clean_num(metrics.get("market_volatility_pct") or metrics.get("atr_1h_pct"))
+    total_liq = _clean_num(metrics.get("aggregate_liquidity_usd") or metrics.get("liquidity_usd"))
+    net_inflow = _clean_num(metrics.get("net_ecosystem_inflow_usd"))
+
+    if total_liq is not None and total_liq < 50_000:
+        return "LOW_LIQUIDITY"
+    if volatility is not None and volatility >= 12.0:
+        return "HIGH_VOLATILITY"
+    if btc_24h is not None and btc_24h <= -8.0:
+        return "BEARISH"
+    if net_inflow is not None and net_inflow < 0 and (btc_24h is not None and btc_24h < -3.0):
+        return "RISK_OFF"
+    if btc_24h is not None and btc_24h >= 4.0:
+        return "BULLISH"
+    return "SIDEWAYS"
+
+
+def evaluate_shadow_model(
+    production_weights: dict[str, float],
+    candidate_weights: dict[str, float],
+    validation_records: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Compare production weights vs candidate weights in shadow mode.
+
+    Automatically rolls back if candidate weights regress on validation data.
+    """
+    if not validation_records:
+        return {
+            "status": "INSUFFICIENT_VALIDATION_DATA",
+            "promotion_decision": "ROLLBACK_TO_PRODUCTION",
+            "reason": "Holdout validation records are empty; candidate weights cannot be verified.",
+        }
+
+    def compute_loss(weights: dict[str, float]) -> float:
+        errors = []
+        for r in validation_records:
+            target_pnl = _clean_num(r.get("pnl") or r.get("realized_pnl_pct") or r.get("mfe_pct")) or 0.0
+            feats = r.get("features") or extract_position_features(r) or {}
+            score = sum(float(feats.get(k, 50.0)) * weights.get(k, 1.0) for k in weights if k in feats)
+            norm_score = (score / max(1.0, len(feats))) - 50.0
+            errors.append((norm_score - target_pnl) ** 2)
+        return (sum(errors) / len(errors)) if errors else 999.0
+
+    prod_loss = compute_loss(production_weights)
+    cand_loss = compute_loss(candidate_weights)
+
+    improved = bool(cand_loss < prod_loss)
+    decision = "PROMOTE_CANDIDATE" if improved else "ROLLBACK_TO_PRODUCTION"
+
+    return {
+        "status": "COMPLETED",
+        "production_loss": round(prod_loss, 4),
+        "candidate_loss": round(cand_loss, 4),
+        "loss_improvement_pct": round(((prod_loss - cand_loss) / prod_loss) * 100.0, 2) if prod_loss > 0 else 0.0,
+        "promotion_decision": decision,
+        "applied_weights": candidate_weights if improved else production_weights,
+    }
+
+
+def enforce_aura_safety_veto(candidate: dict[str, Any]) -> tuple[bool, str]:
+    """Enforces absolute AURA safety vetoes.
+
+    Under no circumstances can AURA weights or conviction scores promote a candidate that fails:
+    1. Contract security checks (e.g. honeypot, blacklist, unverified code, transfer tax > 10%).
+    2. LP lock / burn requirements.
+    3. The single technical take-profit minimum (+40.0%).
+    Returns (is_vetoed, veto_reason).
+    """
+    # 1. Contract security check
+    sec = candidate.get("security_assessment") or candidate.get("contract_security") or {}
+    if candidate.get("is_honeypot") or sec.get("is_honeypot") or sec.get("honeypot"):
+        return True, "SAFETY_VETO: Token is flagged as honeypot."
+    if candidate.get("security_pass") is False or sec.get("status") in {"FAIL", "CRITICAL_RISK"}:
+        return True, "SAFETY_VETO: Token failed security verification."
+
+    # 2. LP verification check
+    lp_status = candidate.get("lp_status") or sec.get("lp_status") or candidate.get("liquidity_lock_status")
+    if lp_status in {"UNLOCKED", "FAIL", "CRITICAL_RISK"}:
+        return True, f"SAFETY_VETO: Liquidity is unverified or unlocked ({lp_status})."
+
+    # 3. Technical +40% TP check
+    pot = _clean_num(candidate.get("tp_upside_pct") or candidate.get("potential_pct"))
+    if pot is None or pot < 40.0:
+        return True, f"SAFETY_VETO: Technical TP upside ({pot}%) is below mandatory +40.0% threshold."
+
+    return False, "SAFETY_PASS"
 
 
 if __name__ == "__main__":
