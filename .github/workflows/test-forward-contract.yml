@@ -70,8 +70,12 @@ jobs:
           python -m scripts.v419_upgrade --self-test
           python -m scripts.v420_upgrade --install --repo-root .
           python -m scripts.v420_upgrade --self-test
-      - name: Restore current tracked DEX safety integration after legacy archive extraction
+      - name: Restore current tracked core and DEX safety modules after legacy archive extraction
         run: |
+          # The legacy v4.19/v4.20 installers patch these runtime files. Restore
+          # their exact PR versions before collecting tests against the tracked code.
+          git show HEAD:scripts/rocket_hunt.py > scripts/rocket_hunt.py
+          git show HEAD:scripts/run_full_scan.py > scripts/run_full_scan.py
           git show HEAD:scripts/forward_24h_report.py > scripts/forward_24h_report.py
           git show HEAD:scripts/post_scan_audit.py > scripts/post_scan_audit.py
           git show HEAD:scripts/dex_onchain_evidence.py > scripts/dex_onchain_evidence.py
