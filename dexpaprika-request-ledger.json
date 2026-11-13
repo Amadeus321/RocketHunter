@@ -1,0 +1,16 @@
+{
+  "last_observed_credits_remaining": null,
+  "last_observed_credits_utc": null,
+  "last_observed_plan": null,
+  "provider_version": "4.29.0",
+  "requests": [
+    {
+      "family": "network_registry",
+      "request_reservation": 1,
+      "reserved_utc": "2026-11-13T12:13:46Z"
+    }
+  ],
+  "rolling_window_days": 30,
+  "scanner_request_ceiling": 7000,
+  "schema": "crypto-prebreakout.dexpaprika-request-ledger.v1"
+}

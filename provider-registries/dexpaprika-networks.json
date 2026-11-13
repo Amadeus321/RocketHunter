@@ -1,0 +1,148 @@
+{
+  "fetched_utc": "2026-11-13T12:13:47Z",
+  "networks": [
+    {
+      "display_name": "Celo",
+      "id": "celo"
+    },
+    {
+      "display_name": "HyperEVM",
+      "id": "hyperevm"
+    },
+    {
+      "display_name": "Monad",
+      "id": "monad"
+    },
+    {
+      "display_name": "x Layer",
+      "id": "x_layer"
+    },
+    {
+      "display_name": "Tempo",
+      "id": "tempo"
+    },
+    {
+      "display_name": "Ethereum",
+      "id": "ethereum"
+    },
+    {
+      "display_name": "Fantom",
+      "id": "fantom"
+    },
+    {
+      "display_name": "ZkSync",
+      "id": "zksync"
+    },
+    {
+      "display_name": "Linea",
+      "id": "linea"
+    },
+    {
+      "display_name": "Tron",
+      "id": "tron"
+    },
+    {
+      "display_name": "Robinhood Chain",
+      "id": "robinhood"
+    },
+    {
+      "display_name": "Ronin",
+      "id": "ronin"
+    },
+    {
+      "display_name": "Sei",
+      "id": "sei"
+    },
+    {
+      "display_name": "Optimism",
+      "id": "optimism"
+    },
+    {
+      "display_name": "Berachain",
+      "id": "berachain"
+    },
+    {
+      "display_name": "BOB Network",
+      "id": "bob_network"
+    },
+    {
+      "display_name": "Avalanche",
+      "id": "avalanche"
+    },
+    {
+      "display_name": "Aptos",
+      "id": "aptos"
+    },
+    {
+      "display_name": "Solana",
+      "id": "solana"
+    },
+    {
+      "display_name": "Ton",
+      "id": "ton"
+    },
+    {
+      "display_name": "MegaETH",
+      "id": "megaeth"
+    },
+    {
+      "display_name": "Base",
+      "id": "base"
+    },
+    {
+      "display_name": "Cronos",
+      "id": "cronos"
+    },
+    {
+      "display_name": "Scroll",
+      "id": "scroll"
+    },
+    {
+      "display_name": "Sonic",
+      "id": "sonic"
+    },
+    {
+      "display_name": "Unichain",
+      "id": "unichain"
+    },
+    {
+      "display_name": "Mantle",
+      "id": "mantle"
+    },
+    {
+      "display_name": "Binance Smart Chain",
+      "id": "bsc"
+    },
+    {
+      "display_name": "Arbitrum",
+      "id": "arbitrum"
+    },
+    {
+      "display_name": "Sui",
+      "id": "sui"
+    },
+    {
+      "display_name": "Flow EVM",
+      "id": "flow_evm"
+    },
+    {
+      "display_name": "Polygon",
+      "id": "polygon"
+    },
+    {
+      "display_name": "Plasma",
+      "id": "plasma"
+    },
+    {
+      "display_name": "Katana",
+      "id": "katana"
+    },
+    {
+      "display_name": "Arc",
+      "id": "arc"
+    }
+  ],
+  "provider": "dexpaprika",
+  "provider_version": "4.29.0",
+  "registry_scope": "DexPaprika supported-network registry; not a census of every chain or every on-chain market."
+}

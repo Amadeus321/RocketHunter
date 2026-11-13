@@ -1,0 +1,9 @@
+{
+  "estimated_cu_reserved": 0,
+  "last_updated_utc": "2026-11-13T12:13:46Z",
+  "month_utc": "2026-11",
+  "request_count": 0,
+  "requests_by_family": {},
+  "scanner_monthly_cu_ceiling": 20000,
+  "schema": "crypto-prebreakout.birdeye-cu-ledger.v1"
+}

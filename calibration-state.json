@@ -1,0 +1,94 @@
+{
+  "as_of_utc": "2026-11-13T11:12:15Z",
+  "breakout_threshold_pct": 10.0,
+  "brier_score_24h_breakout_10pct": null,
+  "buckets": {
+    "bucket_0_35": {
+      "bucket": "bucket_0_35",
+      "n_breakout_10pct": 0,
+      "n_positive_24h": 0,
+      "n_resolved_24h": 0,
+      "score_max": 35.0,
+      "score_min": 0.0,
+      "sum_pred_prob": 0.0
+    },
+    "bucket_35_50": {
+      "bucket": "bucket_35_50",
+      "n_breakout_10pct": 0,
+      "n_positive_24h": 0,
+      "n_resolved_24h": 0,
+      "score_max": 50.0,
+      "score_min": 35.0,
+      "sum_pred_prob": 0.0
+    },
+    "bucket_50_65": {
+      "bucket": "bucket_50_65",
+      "n_breakout_10pct": 0,
+      "n_positive_24h": 0,
+      "n_resolved_24h": 0,
+      "score_max": 65.0,
+      "score_min": 50.0,
+      "sum_pred_prob": 0.0
+    },
+    "bucket_65_80": {
+      "bucket": "bucket_65_80",
+      "n_breakout_10pct": 0,
+      "n_positive_24h": 0,
+      "n_resolved_24h": 0,
+      "score_max": 80.0,
+      "score_min": 65.0,
+      "sum_pred_prob": 0.0
+    },
+    "bucket_80_100": {
+      "bucket": "bucket_80_100",
+      "n_breakout_10pct": 0,
+      "n_positive_24h": 0,
+      "n_resolved_24h": 0,
+      "score_max": 1000.0,
+      "score_min": 80.0,
+      "sum_pred_prob": 0.0
+    }
+  },
+  "calibration_mode": "EMPIRICAL_BAYES_PRIOR_SHRINKAGE",
+  "interval_method": "NORMAL_APPROXIMATION_TO_BETA_POSTERIOR",
+  "log_loss_24h_breakout_10pct": null,
+  "minimum_bucket_observations_for_probability": 10,
+  "minimum_total_outcomes_for_calibration": 25,
+  "model_version": "v4.19.0-eb-beta-binomial",
+  "prior_strength_pseudo_count": 20.0,
+  "reliability_bins": [
+    {
+      "bucket": "bucket_0_35",
+      "empirical_breakout_10pct_rate": null,
+      "mean_predicted_prob": null,
+      "n_resolved_24h": 0
+    },
+    {
+      "bucket": "bucket_35_50",
+      "empirical_breakout_10pct_rate": null,
+      "mean_predicted_prob": null,
+      "n_resolved_24h": 0
+    },
+    {
+      "bucket": "bucket_50_65",
+      "empirical_breakout_10pct_rate": null,
+      "mean_predicted_prob": null,
+      "n_resolved_24h": 0
+    },
+    {
+      "bucket": "bucket_65_80",
+      "empirical_breakout_10pct_rate": null,
+      "mean_predicted_prob": null,
+      "n_resolved_24h": 0
+    },
+    {
+      "bucket": "bucket_80_100",
+      "empirical_breakout_10pct_rate": null,
+      "mean_predicted_prob": null,
+      "n_resolved_24h": 0
+    }
+  ],
+  "resolved_24h_outcomes_used": 0,
+  "schema": "crypto-prebreakout.calibration-model.v1",
+  "time_boundary_policy": "24H_OUTCOME_OBSERVED_WITHIN_6H_LAG; PRICE_AND_FORECAST_PROVENANCE_REQUIRED; NO_FUTURE_DATA"
+}
