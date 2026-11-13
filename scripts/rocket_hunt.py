@@ -227,7 +227,8 @@ def score_candidate(row):
     """Transparent prioritisation heuristic; deliberately not a probability."""
     p24 = max(0.0, n(row.get("change_24h_pct")) or 0.0)
     p6 = max(0.0, n(row.get("change_6h_pct")) or 0.0)
-    p1 = max(0.0, n(row.get("change_1h_pct")) or 0.0)
+    p1_raw = n(row.get("change_1h_pct"))
+    p1 = max(0.0, p1_raw) if p1_raw is not None else 0.0
     vol = max(0.0, n(row.get("volume_24h_usd")) or 0.0)
     liq = max(0.0, n(row.get("liquidity_usd")) or 0.0)
     txns = max(0.0, n(row.get("txns_24h")) or 0.0)
@@ -247,7 +248,7 @@ def score_candidate(row):
         penalty += 4.0
     if row.get("age_hours") is not None and row["age_hours"] < 2:
         penalty += 3.0
-    if p24 >= 500 and p1 is not None and p1 < 0:
+    if p24 >= 500 and p1_raw is not None and p1_raw < 0:
         penalty += 4.0
     return round(max(0.0, min(100.0, momentum + volume_score + liquidity_score + activity_score + source_score - penalty)), 2)
 

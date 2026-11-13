@@ -508,8 +508,16 @@ def score_candidate(row: dict[str, Any]) -> dict[str, Any]:
         tier = "EARLY_DISCOVERY_OR_WEAK_SIGNAL"
 
     # Evaluate 9 independent signal engines and 24h expected return model
+    signal_engine_executed = False
+    expected_return_engine_executed = False
+    engine_failure_module = None
+    engine_exception_category = None
+    engine_failure_diagnostic = None
+    engine_result_status = "SUCCESS"
+    expected_return_status = "SUCCESS"
     engines_res = {}
     expected_res = {}
+
     try:
         try:
             from scripts.breakout_signal_engines import BreakoutSignalEngines
@@ -517,11 +525,62 @@ def score_candidate(row: dict[str, Any]) -> dict[str, Any]:
         except ImportError:
             from breakout_signal_engines import BreakoutSignalEngines
             from expected_return_engine import ExpectedReturnEngine
+    except Exception as exc:
+        engine_failure_module = "import"
+        engine_exception_category = type(exc).__name__
+        engine_failure_diagnostic = f"Engine module import failed: {type(exc).__name__}"
+        engine_result_status = "SOFTWARE_FAILURE"
+        expected_return_status = "SOFTWARE_FAILURE"
 
-        engines_res = BreakoutSignalEngines.evaluate_all_engines(row)
-        expected_res = ExpectedReturnEngine.estimate_outcomes(row, engines_res)
-    except Exception:
-        pass
+    if engine_failure_module is None:
+        try:
+            engines_res = BreakoutSignalEngines.evaluate_all_engines(row)
+            signal_engine_executed = True
+            if engines_res.get("breakout_evidence_eligible"):
+                engine_result_status = "SUCCESS"
+            else:
+                engine_result_status = "DATA_UNAVAILABLE"
+        except Exception as exc:
+            signal_engine_executed = False
+            engine_failure_module = "breakout_signal_engines"
+            engine_exception_category = type(exc).__name__
+            engine_failure_diagnostic = f"BreakoutSignalEngines failed: {type(exc).__name__}"
+            engine_result_status = "SOFTWARE_FAILURE"
+            engines_res = {
+                "breakout_confluence_score": None,
+                "engine_scores": {},
+                "acceleration_signals": {},
+                "engine_evidence_status": {},
+                "evidence_coverage_pct": 0.0,
+                "breakout_evidence_eligible": False,
+                "evidence_status": "SOFTWARE_FAILURE",
+            }
+
+        try:
+            expected_res = ExpectedReturnEngine.estimate_outcomes(row, engines_res)
+            expected_return_engine_executed = True
+            expected_return_status = expected_res.get("forecast_status", "SUCCESS")
+        except Exception as exc:
+            expected_return_engine_executed = False
+            if engine_failure_module is None:
+                engine_failure_module = "expected_return_engine"
+                engine_exception_category = type(exc).__name__
+                engine_failure_diagnostic = f"ExpectedReturnEngine failed: {type(exc).__name__}"
+            expected_return_status = "SOFTWARE_FAILURE"
+            expected_res = {
+                "probability_tp_hit_24h_pct": None,
+                "expected_net_24h_return_pct": None,
+                "potential_mfe_24h_pct": None,
+                "potential_mae_24h_pct": None,
+                "estimated_hours_to_target": None,
+                "reversal_risk_score": None,
+                "realistic_opportunity_rank": None,
+                "forecast_status": "SOFTWARE_FAILURE",
+            }
+
+    if engine_failure_module is not None:
+        risks.append("SOFTWARE_ERROR_SIGNAL_ENGINES_INCOMPLETE")
+        risks.append("UNVERIFIED_DUE_TO_ENGINE_FAILURE")
 
     return {
         "score": score,
@@ -533,6 +592,13 @@ def score_candidate(row: dict[str, Any]) -> dict[str, Any]:
         "buy_pressure_pct": round(buy_share, 2) if buy_share is not None else None,
         "volume_to_liquidity": round(turnover, 3) if turnover is not None else None,
         "intraday_volume_acceleration_ratio": round(volume_acceleration_ratio, 3) if volume_acceleration_ratio is not None else None,
+        "signal_engine_executed": signal_engine_executed,
+        "expected_return_engine_executed": expected_return_engine_executed,
+        "engine_failure_module": engine_failure_module,
+        "engine_exception_category": engine_exception_category,
+        "engine_failure_diagnostic": engine_failure_diagnostic,
+        "engine_result_status": engine_result_status,
+        "expected_return_status": expected_return_status,
         "breakout_confluence_score": engines_res.get("breakout_confluence_score"),
         "breakout_engine_scores": engines_res.get("engine_scores", {}),
         "breakout_acceleration_signals": engines_res.get("acceleration_signals", {}),
@@ -679,6 +745,13 @@ def _normalize_pool(row: dict[str, Any], family: str, rank: int,
         "estimated_hours_to_target": score.get("estimated_hours_to_target"),
         "reversal_risk_score": score.get("reversal_risk_score"),
         "realistic_opportunity_rank": score.get("realistic_opportunity_rank"),
+        "signal_engine_executed": score.get("signal_engine_executed"),
+        "expected_return_engine_executed": score.get("expected_return_engine_executed"),
+        "engine_failure_module": score.get("engine_failure_module"),
+        "engine_exception_category": score.get("engine_exception_category"),
+        "engine_failure_diagnostic": score.get("engine_failure_diagnostic"),
+        "engine_result_status": score.get("engine_result_status"),
+        "expected_return_status": score.get("expected_return_status"),
     })
     return record
 
@@ -1163,6 +1236,13 @@ def _fallback_market_mover_candidates(report: dict[str, Any], limit: int = 500) 
                 incoming["estimated_hours_to_target"] = signal.get("estimated_hours_to_target")
                 incoming["reversal_risk_score"] = signal.get("reversal_risk_score")
                 incoming["realistic_opportunity_rank"] = signal.get("realistic_opportunity_rank")
+                incoming["signal_engine_executed"] = signal.get("signal_engine_executed")
+                incoming["expected_return_engine_executed"] = signal.get("expected_return_engine_executed")
+                incoming["engine_failure_module"] = signal.get("engine_failure_module")
+                incoming["engine_exception_category"] = signal.get("engine_exception_category")
+                incoming["engine_failure_diagnostic"] = signal.get("engine_failure_diagnostic")
+                incoming["engine_result_status"] = signal.get("engine_result_status")
+                incoming["expected_return_status"] = signal.get("expected_return_status")
             if existing is None:
                 by_market[key] = incoming
                 continue
@@ -1682,7 +1762,16 @@ def qualify_final_actionable_candidates(candidates: list[dict[str, Any]], now: d
             reference_drift_pct is not None and max_reference_drift is not None and
             reference_drift_pct <= max_reference_drift
         )
+        software_failure = (
+            candidate.get("signal_engine_executed") is False or
+            candidate.get("expected_return_engine_executed") is False or
+            candidate.get("engine_result_status") == "SOFTWARE_FAILURE" or
+            candidate.get("expected_return_status") == "SOFTWARE_FAILURE" or
+            "SOFTWARE_ERROR_SIGNAL_ENGINES_INCOMPLETE" in (candidate.get("early_breakout_risk_flags") or []) or
+            "SOFTWARE_ERROR_SIGNAL_ENGINES_INCOMPLETE" in (candidate.get("risk_flags") or [])
+        )
         complete = (
+            not software_failure and
             str(candidate.get("market_type") or "").lower() == "dex_pool" and
             candidate.get("final_price_verified") is True and reference is not None and reference > 0 and
             age_seconds is not None and 0 <= age_seconds <= 300 and
@@ -1706,6 +1795,8 @@ def qualify_final_actionable_candidates(candidates: list[dict[str, Any]], now: d
             upside is not None and upside >= 40.0
         )
         blockers = []
+        if software_failure:
+            blockers.append("signal engine software execution failed or threw an exception")
         if str(candidate.get("market_type") or "").lower() != "dex_pool":
             blockers.append("only exact-identity DEX pools can enter the qualified lane")
         if not observed_target:
