@@ -7,7 +7,9 @@ import datetime as dt
 import html
 import json
 import math
+import os
 import sys
+import time
 from pathlib import Path
 from typing import Any
 
@@ -345,6 +347,33 @@ def _latest(items: list[dict[str, Any]]) -> dict[str, Any] | None:
     ))
 
 
+def _is_pid_alive(pid: int | None) -> bool:
+    if not pid or pid <= 0:
+        return False
+    if os.name != "nt":
+        try:
+            os.kill(pid, 0)
+            return True
+        except OSError:
+            return False
+    try:
+        import ctypes
+        STILL_ACTIVE = 259
+        PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+        handle = ctypes.windll.kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+        if not handle:
+            return False
+        try:
+            exit_code = ctypes.c_ulong()
+            if ctypes.windll.kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code)):
+                return exit_code.value == STILL_ACTIVE
+            return False
+        finally:
+            ctypes.windll.kernel32.CloseHandle(handle)
+    except Exception:
+        return False
+
+
 def _scan_history(runs_root: Path) -> list[dict[str, Any]]:
     target_root = runs_root
     if not target_root.exists() and (ROOT / "rocket-runs").exists():
@@ -397,6 +426,61 @@ def _scan_history(runs_root: Path) -> list[dict[str, Any]]:
             run_id = run_dir.name
         if not status or not isinstance(status, str):
             status = "IN_PROGRESS" if not finished else "COMPLETED"
+
+        # Stale & Dead Run Auto-Resolution:
+        # A scan process cannot remain IN_PROGRESS if its process has terminated or if no files
+        # have been touched in >10 minutes (maximum scanner runtime is 170 minutes).
+        if status == "IN_PROGRESS" or not finished:
+            pid = None
+            pid_file = run_dir / "scan-pid.txt"
+            if pid_file.exists():
+                try:
+                    pid = int(pid_file.read_text(encoding="utf-8").strip())
+                except Exception:
+                    pass
+            if not pid and status_file.is_file():
+                try:
+                    pid = int(_read_object(status_file).get("process_id") or 0)
+                except Exception:
+                    pass
+
+            is_alive = _is_pid_alive(pid) if pid else False
+            file_mtimes = [f.stat().st_mtime for f in run_dir.iterdir() if f.is_file()]
+            latest_mtime = max(file_mtimes) if file_mtimes else run_dir.stat().st_mtime
+            seconds_since_last_write = max(0.0, time.time() - latest_mtime)
+
+            if not is_alive or seconds_since_last_write > 600.0:
+                if scan_path.is_file() and _read_object(scan_path).get("scan_status") == "COMPLETED":
+                    status = "COMPLETED"
+                elif forward_path.is_file() and _read_object(forward_path).get("scan_status") == "COMPLETED":
+                    status = "COMPLETED"
+                else:
+                    status = "INTERRUPTED"
+
+                if not finished:
+                    finished = dt.datetime.fromtimestamp(latest_mtime, tz=dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+                # Permanently correct disk artifacts so this run never displays as IN_PROGRESS again
+                try:
+                    if status_file.is_file():
+                        st_fix = _read_object(status_file)
+                        if isinstance(st_fix, dict):
+                            st_fix["status"] = status
+                            if status == "INTERRUPTED":
+                                st_fix["failure_reason"] = "process interrupted or terminated"
+                            if not st_fix.get("scan_finished_utc"):
+                                st_fix["scan_finished_utc"] = finished
+                            status_file.write_text(json.dumps(st_fix, indent=2) + "\n", encoding="utf-8")
+                    if scan_path.is_file():
+                        scan_fix = _read_object(scan_path)
+                        if isinstance(scan_fix, dict):
+                            scan_fix["scan_status"] = status
+                            if not scan_fix.get("scan_finished_utc"):
+                                scan_fix["scan_finished_utc"] = finished
+                            scan_path.write_text(json.dumps(scan_fix, indent=2) + "\n", encoding="utf-8")
+                except Exception:
+                    pass
+
         timestamp = next((
             _parse_utc(ts)
             for ts in (finished, started)

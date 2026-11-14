@@ -1,5 +1,7 @@
 import json
+import os
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -287,6 +289,39 @@ class StatusDashboardTests(unittest.TestCase):
         self.assertIn("tbody.innerHTML = active.map(p =>", html)
         # Verify positions.map is not used for reference-position monitoring
         self.assertNotIn("tbody.innerHTML = positions.map(p =>", html)
+
+    def test_dead_or_stale_in_progress_scan_auto_resolves_to_interrupted(self):
+        runs_dir = self.root / "rocket-runs"
+        runs_dir.mkdir(parents=True, exist_ok=True)
+        stale_run = runs_dir / "local-run-20261113T105528Z"
+        stale_run.mkdir(parents=True, exist_ok=True)
+
+        # Create a scan-status.json claiming IN_PROGRESS with non-existent dead PID
+        status_file = stale_run / "scan-status.json"
+        status_file.write_text(json.dumps({
+            "status": "IN_PROGRESS",
+            "run_id": "local-run-20261113T105528Z",
+            "process_id": 99999999,  # Non-existent dead PID
+            "scan_started_utc": "2026-11-13T10:55:28Z",
+        }), encoding="utf-8")
+
+        # Fake old file mtime (>10 mins ago)
+        old_time = time.time() - 3600
+        os.utime(status_file, (old_time, old_time))
+        os.utime(stale_run, (old_time, old_time))
+
+        from scripts.status_dashboard import _scan_history
+        scans = _scan_history(runs_dir)
+        matched = [s for s in scans if s["run_id"] == "local-run-20261113T105528Z"]
+        self.assertEqual(len(matched), 1)
+        # Must auto-resolve to INTERRUPTED rather than staying IN_PROGRESS
+        self.assertEqual(matched[0]["status"], "INTERRUPTED")
+        self.assertIsNotNone(matched[0]["finished_utc"])
+
+        # Must have permanently updated scan-status.json on disk
+        persisted = json.loads(status_file.read_text(encoding="utf-8"))
+        self.assertEqual(persisted["status"], "INTERRUPTED")
+        self.assertIn("scan_finished_utc", persisted)
 
 
 if __name__ == "__main__":

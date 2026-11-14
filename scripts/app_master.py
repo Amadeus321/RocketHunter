@@ -284,10 +284,14 @@ def sync_root_reports():
             dst = ROOT / fname
             if src.exists():
                 try:
-                    if not dst.exists() or src.stat().st_mtime > dst.stat().st_mtime:
-                        shutil.copy2(src, dst)
+                    shutil.copy2(src, dst)
                 except Exception:
                     pass
+        try:
+            from scripts import status_dashboard
+            status_dashboard.main(["--root", str(ROOT), "--output", str(ROOT / "status-dashboard.html")])
+        except Exception:
+            pass
 
 
 def find_scan_pid(run_dir: Path) -> int | None:

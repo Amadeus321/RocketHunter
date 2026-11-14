@@ -162,14 +162,15 @@ def open_results() -> None:
 
 
 def open_dashboard() -> None:
+    py_exe = get_python_exe()
+    try:
+        print("\n[+] Refreshing system status dashboard...")
+        subprocess.run([py_exe, str(SCRIPTS_DIR / "status_dashboard.py"), "--output", str(DASHBOARD_HTML)], cwd=str(ROOT), timeout=15)
+    except Exception as exc:
+        print(f"[!] Dashboard refresh notice: {exc}")
     if DASHBOARD_HTML.exists():
-        print(f"\n[+] Opening {DASHBOARD_HTML} in your browser...")
+        print(f"[+] Opening {DASHBOARD_HTML} in your browser...")
         webbrowser.open(str(DASHBOARD_HTML.resolve().as_uri()))
-    else:
-        py_exe = get_python_exe()
-        subprocess.run([py_exe, str(SCRIPTS_DIR / "status_dashboard.py")], cwd=str(ROOT))
-        if DASHBOARD_HTML.exists():
-            webbrowser.open(str(DASHBOARD_HTML.resolve().as_uri()))
 
 
 def main() -> None:

@@ -23,6 +23,57 @@ from typing import Any
 BACKTEST_VERSION = "4.30.0"
 MANDATORY_TARGET_PCT = 40.0
 
+RECOGNIZED_TRACE_PROVIDERS = {
+    "geckoterminal",
+    "dexscreener",
+    "birdeye",
+    "dexpaprika",
+    "binance",
+    "coinbase",
+    "kraken",
+    "bybit",
+    "okx",
+    "kucoin",
+    "gateio",
+}
+
+CANDLE_INTERVAL_SECONDS = {
+    "1m": 60,
+    "5m": 300,
+    "15m": 900,
+    "30m": 1800,
+    "1h": 3600,
+    "4h": 14400,
+    "1d": 86400,
+}
+
+CANDLE_TRACE_SCHEMA = {
+    "required_fields": [
+        "provider",            # recognized data source (e.g. geckoterminal, dexscreener, binance)
+        "source_ref",          # reference URL or query ID
+        "retrieved_utc",       # timestamp of evidence retrieval
+        "market_key",          # exact canonical market identity
+        "candle_interval",     # declared candle resolution (1m, 5m, 15m, 30m, 1h, 4h, 1d)
+        "trace_start_utc",     # trace window start ISO timestamp
+        "trace_end_utc",       # trace window end ISO timestamp
+        "candles",             # non-empty array of timestamped OHLC observations
+    ],
+    "candle_fields": ["timestamp_utc", "open", "high", "low", "close"],
+    "recognized_providers": sorted(RECOGNIZED_TRACE_PROVIDERS),
+    "recognized_intervals": list(CANDLE_INTERVAL_SECONDS.keys()),
+}
+
+
+def normalize_trace_provider(raw_prov: Any) -> str | None:
+    """Extract and normalize recognized data provider from provenance string or identifier."""
+    if not raw_prov or not isinstance(raw_prov, str):
+        return None
+    cleaned = raw_prov.strip().lower().replace("-", "").replace("_", "")
+    for prov in RECOGNIZED_TRACE_PROVIDERS:
+        if prov in cleaned:
+            return prov
+    return cleaned
+
 try:
     from scripts.address_identity import validate_and_build_identity
 except ImportError:
@@ -545,19 +596,24 @@ class ChronologicalBacktestEvaluator:
         outcome_status: str,
         mfe_pct: float | None,
         touch_time: float | None,
+        touch_dt: dt.datetime | None,
         effective_target_pct: float,
         detection_price: float,
-    ) -> tuple[bool, dict[str, Any] | None]:
+    ) -> tuple[bool, dict[str, Any] | None, dict[str, Any] | None]:
         """Validate candle trace evidence provenance and completeness according to CANDLE_TRACE_SCHEMA.
 
         Enforces:
-        - Trace provenance exists and is non-empty.
-        - Trace market_key matches the forecast canonical identity exactly.
-        - Candle interval exists and is non-empty.
-        - Trace start/end timestamps exist and trace start begins at or after detection time.
-        - Full 24-hour window coverage for TARGET_NOT_REACHED (trace_end >= detection + 24h).
-        - Rejection of traces with candle gaps or missing candles.
-        - Verification that raw candles (when present) or summary values support claimed MFE and touch time.
+        - Recognized data provider/source.
+        - Source reference or retrieval URL.
+        - Exact canonical market identity match.
+        - Declared candle interval in recognized formats.
+        - Valid trace start and end timestamps.
+        - Non-empty actual candle observations array (metadata-only traces are strictly rejected).
+        - Valid, finite, internally consistent OHLC values for every candle.
+        - Chronologically sorted observations without duplicate timestamps.
+        - Candle spacing verification against declared interval with gap detection.
+        - Complete window coverage from detection through required evaluation window (full 24h for losses).
+        - Derivation and chronological verification of MFE and first target touch.
         """
         trace = outcome_data.get("candle_trace") or outcome_data.get("evidence")
         exec_status = str(outcome_data.get("execution_status") or "EXECUTION_UNVERIFIED")
@@ -575,11 +631,17 @@ class ChronologicalBacktestEvaluator:
                 "resolution_reason": "MISSING_CANDLE_TRACE_EVIDENCE: outcome requires verifiable candle trace evidence",
                 "execution_status": exec_status,
                 "execution_net_return_pct": None,
-            }
+            }, None
 
         # 1. Source Provenance
-        provenance = str(trace.get("trace_provenance") or trace.get("source") or "").strip()
-        if not provenance:
+        raw_prov = (
+            trace.get("provider")
+            or trace.get("trace_provenance")
+            or trace.get("source")
+            or outcome_data.get("provider")
+            or outcome_data.get("trace_provenance")
+        )
+        if not raw_prov or not str(raw_prov).strip():
             self.diagnostics["unresolved_outcomes"] += 1
             return False, {
                 "outcome_classification": "MISSING_TRACE_PROVENANCE",
@@ -592,7 +654,23 @@ class ChronologicalBacktestEvaluator:
                 "resolution_reason": "MISSING_TRACE_PROVENANCE: candle trace lacks source provenance",
                 "execution_status": exec_status,
                 "execution_net_return_pct": None,
-            }
+            }, None
+
+        norm_prov = normalize_trace_provider(raw_prov)
+        if norm_prov not in RECOGNIZED_TRACE_PROVIDERS:
+            self.diagnostics["unresolved_outcomes"] += 1
+            return False, {
+                "outcome_classification": "UNRECOGNIZED_TRACE_PROVIDER",
+                "target_reached": None,
+                "market_target_reached": None,
+                "mfe_pct": mfe_pct,
+                "mae_pct": None,
+                "hours_to_target": None,
+                "is_evaluated": False,
+                "resolution_reason": f"UNRECOGNIZED_TRACE_PROVIDER: provider '{raw_prov}' is not a recognized market data provider",
+                "execution_status": exec_status,
+                "execution_net_return_pct": None,
+            }, None
 
         # 2. Market Key Provenance (Exact equality with forecast)
         trace_mkey = str(trace.get("market_key") or trace.get("exact_identity") or "").strip()
@@ -609,10 +687,10 @@ class ChronologicalBacktestEvaluator:
                 "resolution_reason": f"PROVENANCE_MARKET_MISMATCH: trace market_key '{trace_mkey}' != forecast '{forecast_canon_id}'",
                 "execution_status": exec_status,
                 "execution_net_return_pct": None,
-            }
+            }, None
 
         # 3. Candle Interval
-        candle_interval = str(trace.get("candle_interval") or trace.get("interval") or "").strip()
+        candle_interval = str(trace.get("candle_interval") or trace.get("interval") or "").strip().lower()
         if not candle_interval:
             self.diagnostics["unresolved_outcomes"] += 1
             return False, {
@@ -626,9 +704,26 @@ class ChronologicalBacktestEvaluator:
                 "resolution_reason": "MISSING_CANDLE_INTERVAL: candle trace lacks candle interval",
                 "execution_status": exec_status,
                 "execution_net_return_pct": None,
-            }
+            }, None
 
-        # 4. Observation Timestamps
+        if candle_interval not in CANDLE_INTERVAL_SECONDS:
+            self.diagnostics["unresolved_outcomes"] += 1
+            return False, {
+                "outcome_classification": "UNRECOGNIZED_CANDLE_INTERVAL",
+                "target_reached": None,
+                "market_target_reached": None,
+                "mfe_pct": mfe_pct,
+                "mae_pct": None,
+                "hours_to_target": None,
+                "is_evaluated": False,
+                "resolution_reason": f"UNRECOGNIZED_CANDLE_INTERVAL: interval '{candle_interval}' not supported",
+                "execution_status": exec_status,
+                "execution_net_return_pct": None,
+            }, None
+
+        step_seconds = CANDLE_INTERVAL_SECONDS[candle_interval]
+
+        # 4. Trace Start and End Timestamps
         trace_start_dt = _parse_utc(trace.get("trace_start_utc") or trace.get("start_utc"))
         trace_end_dt = _parse_utc(trace.get("trace_end_utc") or trace.get("end_utc"))
         if trace_start_dt is None or trace_end_dt is None:
@@ -644,9 +739,8 @@ class ChronologicalBacktestEvaluator:
                 "resolution_reason": "MISSING_TRACE_TIMESTAMPS: candle trace lacks valid start or end timestamp",
                 "execution_status": exec_status,
                 "execution_net_return_pct": None,
-            }
+            }, None
 
-        # Trace start must be at or after detection (allowing 5-min candle alignment tolerance)
         if trace_start_dt < (detection_dt - dt.timedelta(minutes=5)):
             self.diagnostics["unresolved_outcomes"] += 1
             return False, {
@@ -660,18 +754,250 @@ class ChronologicalBacktestEvaluator:
                 "resolution_reason": f"TRACE_PRECEDES_DETECTION: trace start {trace_start_dt} precedes detection {detection_dt}",
                 "execution_status": exec_status,
                 "execution_net_return_pct": None,
-            }
+            }, None
 
-        # 5. Check Candle Gaps and Incomplete Traces
-        has_gaps = (
+        # 5. Source Reference / Retrieval Evidence
+        source_ref = (
+            trace.get("source_ref")
+            or trace.get("source_url")
+            or trace.get("source_id")
+            or trace.get("query_url")
+            or outcome_data.get("source_ref")
+            or outcome_data.get("source_url")
+        )
+        if not source_ref or not str(source_ref).strip():
+            self.diagnostics["unresolved_outcomes"] += 1
+            return False, {
+                "outcome_classification": "MISSING_SOURCE_REFERENCE",
+                "target_reached": None,
+                "market_target_reached": None,
+                "mfe_pct": mfe_pct,
+                "mae_pct": None,
+                "hours_to_target": None,
+                "is_evaluated": False,
+                "resolution_reason": "MISSING_SOURCE_REFERENCE: candle trace lacks source reference or retrieval URL",
+                "execution_status": exec_status,
+                "execution_net_return_pct": None,
+            }, None
+
+        # 6. Evidence Retrieval Timestamp
+        raw_retrieved = (
+            trace.get("retrieved_utc")
+            or trace.get("retrieval_timestamp_utc")
+            or trace.get("retrieved_at")
+            or outcome_data.get("retrieved_utc")
+        )
+        retrieved_dt = _parse_utc(raw_retrieved)
+        if retrieved_dt is None:
+            self.diagnostics["unresolved_outcomes"] += 1
+            return False, {
+                "outcome_classification": "MISSING_RETRIEVAL_TIMESTAMP",
+                "target_reached": None,
+                "market_target_reached": None,
+                "mfe_pct": mfe_pct,
+                "mae_pct": None,
+                "hours_to_target": None,
+                "is_evaluated": False,
+                "resolution_reason": "MISSING_RETRIEVAL_TIMESTAMP: candle trace lacks valid evidence retrieval timestamp",
+                "execution_status": exec_status,
+                "execution_net_return_pct": None,
+            }, None
+
+        # 7. Require Non-Empty Actual Candle Observations Array
+        # A trace containing only metadata and a claimed 24h end timestamp must NEVER qualify as verified evidence.
+        # Self-reported coverage percentage is never trusted without actual candles.
+        raw_candles = trace.get("candles")
+        if not isinstance(raw_candles, list) or len(raw_candles) == 0:
+            self.diagnostics["unresolved_outcomes"] += 1
+            return False, {
+                "outcome_classification": "INCOMPLETE_OBSERVATION",
+                "target_reached": None,
+                "market_target_reached": None,
+                "mfe_pct": mfe_pct,
+                "mae_pct": None,
+                "hours_to_target": None,
+                "is_evaluated": False,
+                "resolution_reason": "MISSING_CANDLE_DATA: evaluated outcome requires non-empty candle observation array",
+                "execution_status": exec_status,
+                "execution_net_return_pct": None,
+            }, None
+
+        # 8. Parse and Validate Every Individual Candle
+        parsed_candles: list[dict[str, Any]] = []
+        seen_timestamps: set[dt.datetime] = set()
+
+        for idx, c in enumerate(raw_candles):
+            if not isinstance(c, dict):
+                self.diagnostics["unresolved_outcomes"] += 1
+                return False, {
+                    "outcome_classification": "INCOMPLETE_OBSERVATION",
+                    "target_reached": None,
+                    "market_target_reached": None,
+                    "mfe_pct": mfe_pct,
+                    "mae_pct": None,
+                    "hours_to_target": None,
+                    "is_evaluated": False,
+                    "resolution_reason": f"INVALID_CANDLE_DATA: candle at index {idx} is not a dictionary",
+                    "execution_status": exec_status,
+                    "execution_net_return_pct": None,
+                }, None
+
+            c_ts_raw = c.get("timestamp_utc") or c.get("timestamp") or c.get("t") or c.get("time_open")
+            c_dt = _parse_utc(c_ts_raw)
+            if c_dt is None:
+                self.diagnostics["unresolved_outcomes"] += 1
+                return False, {
+                    "outcome_classification": "INCOMPLETE_OBSERVATION",
+                    "target_reached": None,
+                    "market_target_reached": None,
+                    "mfe_pct": mfe_pct,
+                    "mae_pct": None,
+                    "hours_to_target": None,
+                    "is_evaluated": False,
+                    "resolution_reason": f"INVALID_CANDLE_TIMESTAMP: candle at index {idx} has invalid or missing timestamp '{c_ts_raw}'",
+                    "execution_status": exec_status,
+                    "execution_net_return_pct": None,
+                }, None
+
+            # Detect duplicate timestamps
+            if c_dt in seen_timestamps:
+                self.diagnostics["unresolved_outcomes"] += 1
+                return False, {
+                    "outcome_classification": "INCOMPLETE_OBSERVATION",
+                    "target_reached": None,
+                    "market_target_reached": None,
+                    "mfe_pct": mfe_pct,
+                    "mae_pct": None,
+                    "hours_to_target": None,
+                    "is_evaluated": False,
+                    "resolution_reason": f"DUPLICATE_CANDLE_TIMESTAMP: candle at index {idx} has duplicate timestamp {c_dt.isoformat()}",
+                    "execution_status": exec_status,
+                    "execution_net_return_pct": None,
+                }, None
+            seen_timestamps.add(c_dt)
+
+            c_high = _clean_num(c.get("high") or c.get("h"))
+            if c_high is None or c_high <= 0:
+                self.diagnostics["unresolved_outcomes"] += 1
+                return False, {
+                    "outcome_classification": "INCOMPLETE_OBSERVATION",
+                    "target_reached": None,
+                    "market_target_reached": None,
+                    "mfe_pct": mfe_pct,
+                    "mae_pct": None,
+                    "hours_to_target": None,
+                    "is_evaluated": False,
+                    "resolution_reason": f"INVALID_CANDLE_OHLC: candle at index {idx} has invalid high '{c_high}'",
+                    "execution_status": exec_status,
+                    "execution_net_return_pct": None,
+                }, None
+
+            c_open = _clean_num(c.get("open") or c.get("o"))
+            c_low = _clean_num(c.get("low") or c.get("l"))
+            c_close = _clean_num(c.get("close") or c.get("c"))
+
+            if c_low is not None:
+                if c_low <= 0 or c_low > c_high:
+                    self.diagnostics["unresolved_outcomes"] += 1
+                    return False, {
+                        "outcome_classification": "INCOMPLETE_OBSERVATION",
+                        "target_reached": None,
+                        "market_target_reached": None,
+                        "mfe_pct": mfe_pct,
+                        "mae_pct": None,
+                        "hours_to_target": None,
+                        "is_evaluated": False,
+                        "resolution_reason": f"INVALID_CANDLE_OHLC: candle at index {idx} has low {c_low} > high {c_high}",
+                        "execution_status": exec_status,
+                        "execution_net_return_pct": None,
+                    }, None
+                if c_open is not None and (c_open < c_low or c_open > c_high):
+                    self.diagnostics["unresolved_outcomes"] += 1
+                    return False, {
+                        "outcome_classification": "INCOMPLETE_OBSERVATION",
+                        "target_reached": None,
+                        "market_target_reached": None,
+                        "mfe_pct": mfe_pct,
+                        "mae_pct": None,
+                        "hours_to_target": None,
+                        "is_evaluated": False,
+                        "resolution_reason": f"INVALID_CANDLE_OHLC: candle at index {idx} open {c_open} outside low/high [{c_low}, {c_high}]",
+                        "execution_status": exec_status,
+                        "execution_net_return_pct": None,
+                    }, None
+                if c_close is not None and (c_close < c_low or c_close > c_high):
+                    self.diagnostics["unresolved_outcomes"] += 1
+                    return False, {
+                        "outcome_classification": "INCOMPLETE_OBSERVATION",
+                        "target_reached": None,
+                        "market_target_reached": None,
+                        "mfe_pct": mfe_pct,
+                        "mae_pct": None,
+                        "hours_to_target": None,
+                        "is_evaluated": False,
+                        "resolution_reason": f"INVALID_CANDLE_OHLC: candle at index {idx} close {c_close} outside low/high [{c_low}, {c_high}]",
+                        "execution_status": exec_status,
+                        "execution_net_return_pct": None,
+                    }, None
+
+            parsed_candles.append({
+                "dt": c_dt,
+                "high": c_high,
+                "open": c_open,
+                "low": c_low,
+                "close": c_close,
+                "raw": c,
+            })
+
+        # 9. Chronological Sorting
+        sorted_candles = sorted(parsed_candles, key=lambda x: x["dt"])
+
+        # 10. Validate Spacing and Gap Detection
+        for i in range(len(sorted_candles) - 1):
+            delta_s = (sorted_candles[i + 1]["dt"] - sorted_candles[i]["dt"]).total_seconds()
+            if delta_s < step_seconds * 0.5:
+                self.diagnostics["unresolved_outcomes"] += 1
+                return False, {
+                    "outcome_classification": "CANDLE_INTERVAL_MISMATCH",
+                    "target_reached": None,
+                    "market_target_reached": None,
+                    "mfe_pct": mfe_pct,
+                    "mae_pct": None,
+                    "hours_to_target": None,
+                    "is_evaluated": False,
+                    "resolution_reason": (
+                        f"CANDLE_INTERVAL_MISMATCH: spacing between candles {sorted_candles[i]['dt']} and "
+                        f"{sorted_candles[i + 1]['dt']} is {delta_s}s, mismatching declared {step_seconds}s"
+                    ),
+                    "execution_status": exec_status,
+                    "execution_net_return_pct": None,
+                }, None
+            if delta_s > step_seconds * 1.5:
+                self.diagnostics["unresolved_outcomes"] += 1
+                return False, {
+                    "outcome_classification": "INCOMPLETE_OBSERVATION",
+                    "target_reached": None,
+                    "market_target_reached": None,
+                    "mfe_pct": mfe_pct,
+                    "mae_pct": None,
+                    "hours_to_target": None,
+                    "is_evaluated": False,
+                    "resolution_reason": (
+                        f"CANDLE_GAP_DETECTED: gap of {delta_s}s between {sorted_candles[i]['dt']} and "
+                        f"{sorted_candles[i + 1]['dt']} exceeds declared {step_seconds}s interval"
+                    ),
+                    "execution_status": exec_status,
+                    "execution_net_return_pct": None,
+                }, None
+
+        # Check explicit gap flags from trace / outcome_data
+        has_flagged_gaps = (
             trace.get("has_gaps") is True
             or trace.get("gap_detected") is True
             or outcome_data.get("has_gaps") is True
             or outcome_data.get("candle_gap_detected") is True
-            or (trace.get("candle_coverage_pct") is not None and float(trace["candle_coverage_pct"]) < 95.0)
-            or (outcome_data.get("candle_coverage_pct") is not None and float(outcome_data["candle_coverage_pct"]) < 95.0)
         )
-        if has_gaps:
+        if has_flagged_gaps:
             self.diagnostics["unresolved_outcomes"] += 1
             return False, {
                 "outcome_classification": "INCOMPLETE_OBSERVATION",
@@ -684,12 +1010,32 @@ class ChronologicalBacktestEvaluator:
                 "resolution_reason": "CANDLE_GAP_DETECTED: candle trace has gaps or missing observations",
                 "execution_status": exec_status,
                 "execution_net_return_pct": None,
-            }
+            }, None
 
-        # 6. For TARGET_NOT_REACHED: Enforce full 24-hour observation coverage
+        # 11. Observation Window Coverage
+        first_candle_dt = sorted_candles[0]["dt"]
+        last_candle_dt = sorted_candles[-1]["dt"]
+
+        max_allowed_first_dt = detection_dt + dt.timedelta(seconds=step_seconds + 300)
+        if first_candle_dt > max_allowed_first_dt:
+            self.diagnostics["unresolved_outcomes"] += 1
+            return False, {
+                "outcome_classification": "INCOMPLETE_OBSERVATION",
+                "target_reached": None,
+                "market_target_reached": None,
+                "mfe_pct": mfe_pct,
+                "mae_pct": None,
+                "hours_to_target": None,
+                "is_evaluated": False,
+                "resolution_reason": f"OBSERVATION_STARTS_LATE: first candle at {first_candle_dt} starts later than detection {detection_dt}",
+                "execution_status": exec_status,
+                "execution_net_return_pct": None,
+            }, None
+
+        # 12. For TARGET_NOT_REACHED: Enforce full 24-hour observation coverage
         if outcome_status == "TARGET_NOT_REACHED":
-            elapsed_window_hours = (trace_end_dt - detection_dt).total_seconds() / 3600.0
-            if elapsed_window_hours < 24.0:
+            elapsed_trace_hours = (trace_end_dt - detection_dt).total_seconds() / 3600.0
+            if elapsed_trace_hours < 24.0:
                 self.diagnostics["unresolved_outcomes"] += 1
                 return False, {
                     "outcome_classification": "INCOMPLETE_OBSERVATION",
@@ -699,33 +1045,66 @@ class ChronologicalBacktestEvaluator:
                     "mae_pct": None,
                     "hours_to_target": None,
                     "is_evaluated": False,
-                    "resolution_reason": f"PARTIAL_OBSERVATION_WINDOW: observation window ended at {elapsed_window_hours:.2f}h, minimum 24.0h required for loss",
+                    "resolution_reason": f"PARTIAL_OBSERVATION_WINDOW: observation window ended at {elapsed_trace_hours:.2f}h, minimum 24.0h required for loss",
                     "execution_status": exec_status,
                     "execution_net_return_pct": None,
-                }
+                }, None
 
-        # 7. Verify Candles Array Consistency (if candles array is embedded)
-        if "candles" in trace:
-            candles = trace.get("candles")
-            if not isinstance(candles, list) or len(candles) == 0:
+            full_24h_dt = detection_dt + dt.timedelta(hours=24)
+            min_required_last_dt = full_24h_dt - dt.timedelta(seconds=step_seconds)
+            if last_candle_dt < min_required_last_dt:
+                elapsed_hours = (last_candle_dt - detection_dt).total_seconds() / 3600.0
                 self.diagnostics["unresolved_outcomes"] += 1
                 return False, {
-                    "outcome_classification": "INCOMPLETE_TRACE",
+                    "outcome_classification": "INCOMPLETE_OBSERVATION",
                     "target_reached": None,
                     "market_target_reached": None,
                     "mfe_pct": mfe_pct,
                     "mae_pct": None,
                     "hours_to_target": None,
                     "is_evaluated": False,
-                    "resolution_reason": "INCOMPLETE_TRACE: trace candles array is empty",
+                    "resolution_reason": (
+                        f"PARTIAL_OBSERVATION_WINDOW: STALE_FINAL_CANDLE final observation at {last_candle_dt} covers {elapsed_hours:.2f}h, "
+                        f"incomplete for full 24.0h loss evaluation"
+                    ),
                     "execution_status": exec_status,
                     "execution_net_return_pct": None,
-                }
+                }, None
 
-            detection_price_val = detection_price if detection_price > 0 else 1.0
-            max_high = max(float(c.get("high") or c.get("h") or 0.0) for c in candles)
-            candle_mfe = round(((max_high - detection_price_val) / detection_price_val) * 100.0, 2)
-            if mfe_pct is not None and abs(candle_mfe - mfe_pct) > 1.0:
+        # 13. Derive and Verify MFE and First-Touch Chronology
+        detection_price_val = detection_price if detection_price > 0 else 1.0
+        max_high = max(c["high"] for c in sorted_candles)
+        derived_mfe = round(((max_high - detection_price_val) / detection_price_val) * 100.0, 2)
+
+        if mfe_pct is not None and abs(derived_mfe - mfe_pct) > 1.0:
+            self.diagnostics["evidence_conflict_records"] += 1
+            self.diagnostics["unresolved_outcomes"] += 1
+            return False, {
+                "outcome_classification": "OUTCOME_EVIDENCE_CONFLICT",
+                "target_reached": None,
+                "market_target_reached": None,
+                "mfe_pct": mfe_pct,
+                "mae_pct": None,
+                "hours_to_target": None,
+                "is_evaluated": False,
+                "resolution_reason": f"OUTCOME_EVIDENCE_CONFLICT: derived candle MFE {derived_mfe:.2f}% conflicts with claimed MFE {mfe_pct:.2f}%",
+                "execution_status": exec_status,
+                "execution_net_return_pct": None,
+            }, None
+
+        target_price = detection_price_val * (1.0 + effective_target_pct / 100.0)
+        touching_candles = [c for c in sorted_candles if c["high"] >= target_price]
+
+        derived_touch_hours: float | None = None
+        derived_touch_dt: dt.datetime | None = None
+
+        if touching_candles:
+            first_touch_c = touching_candles[0]
+            derived_touch_dt = first_touch_c["dt"]
+            derived_touch_hours = round((derived_touch_dt - detection_dt).total_seconds() / 3600.0, 2)
+
+        if outcome_status == "TARGET_NOT_REACHED":
+            if touching_candles:
                 self.diagnostics["evidence_conflict_records"] += 1
                 self.diagnostics["unresolved_outcomes"] += 1
                 return False, {
@@ -736,15 +1115,70 @@ class ChronologicalBacktestEvaluator:
                     "mae_pct": None,
                     "hours_to_target": None,
                     "is_evaluated": False,
-                    "resolution_reason": f"OUTCOME_EVIDENCE_CONFLICT: trace candle MFE {candle_mfe:.2f}% conflicts with claimed MFE {mfe_pct:.2f}%",
+                    "resolution_reason": f"OUTCOME_EVIDENCE_CONFLICT: status is TARGET_NOT_REACHED but candle trace touches target price {target_price}",
                     "execution_status": exec_status,
                     "execution_net_return_pct": None,
-                }
+                }, None
 
-            if outcome_status == "TARGET_REACHED":
-                target_price = detection_price_val * (1.0 + effective_target_pct / 100.0)
-                touching_candles = [c for c in candles if float(c.get("high") or c.get("h") or 0.0) >= target_price]
-                if not touching_candles:
+        if outcome_status == "TARGET_REACHED":
+            if not touching_candles or derived_touch_hours is None or derived_touch_dt is None:
+                self.diagnostics["evidence_conflict_records"] += 1
+                self.diagnostics["unresolved_outcomes"] += 1
+                return False, {
+                    "outcome_classification": "OUTCOME_EVIDENCE_CONFLICT",
+                    "target_reached": None,
+                    "market_target_reached": None,
+                    "mfe_pct": mfe_pct,
+                    "mae_pct": None,
+                    "hours_to_target": None,
+                    "is_evaluated": False,
+                    "resolution_reason": f"OUTCOME_EVIDENCE_CONFLICT: no candle in trace touches target price {target_price}",
+                    "execution_status": exec_status,
+                    "execution_net_return_pct": None,
+                }, None
+
+            # First touch must occur within the 24-hour observation window (0.0 to 24.0 hours)
+            if derived_touch_hours < 0.0 or derived_touch_hours > 24.0:
+                self.diagnostics["target_outside_window_records"] += 1
+                self.diagnostics["unresolved_outcomes"] += 1
+                return False, {
+                    "outcome_classification": "TARGET_OUTSIDE_24H_WINDOW",
+                    "target_reached": None,
+                    "market_target_reached": None,
+                    "mfe_pct": mfe_pct,
+                    "mae_pct": None,
+                    "hours_to_target": derived_touch_hours,
+                    "is_evaluated": False,
+                    "resolution_reason": f"TARGET_OUTSIDE_24H_WINDOW: chronological first touch occurred at {derived_touch_hours:.2f}h",
+                    "execution_status": exec_status,
+                    "execution_net_return_pct": None,
+                }, None
+
+            # Verify agreement with claimed touch_time if provided
+            touch_tol_hours = max(1.0, step_seconds / 3600.0)
+            if touch_time is not None and abs(derived_touch_hours - touch_time) > touch_tol_hours:
+                self.diagnostics["evidence_conflict_records"] += 1
+                self.diagnostics["unresolved_outcomes"] += 1
+                return False, {
+                    "outcome_classification": "OUTCOME_EVIDENCE_CONFLICT",
+                    "target_reached": None,
+                    "market_target_reached": None,
+                    "mfe_pct": mfe_pct,
+                    "mae_pct": None,
+                    "hours_to_target": None,
+                    "is_evaluated": False,
+                    "resolution_reason": (
+                        f"OUTCOME_EVIDENCE_CONFLICT: chronological first touch is at {derived_touch_hours:.2f}h, "
+                        f"conflicting with claimed touch time {touch_time:.2f}h"
+                    ),
+                    "execution_status": exec_status,
+                    "execution_net_return_pct": None,
+                }, None
+
+            # Verify agreement with claimed touch_dt if provided
+            if touch_dt is not None:
+                touch_delta_s = abs((derived_touch_dt - touch_dt).total_seconds())
+                if touch_delta_s > max(3600.0, step_seconds):
                     self.diagnostics["evidence_conflict_records"] += 1
                     self.diagnostics["unresolved_outcomes"] += 1
                     return False, {
@@ -755,38 +1189,21 @@ class ChronologicalBacktestEvaluator:
                         "mae_pct": None,
                         "hours_to_target": None,
                         "is_evaluated": False,
-                        "resolution_reason": f"OUTCOME_EVIDENCE_CONFLICT: no candle in trace touches target price {target_price}",
+                        "resolution_reason": (
+                            f"OUTCOME_EVIDENCE_CONFLICT: chronological first touch timestamp {derived_touch_dt.isoformat()} "
+                            f"conflicts with claimed timestamp {touch_dt.isoformat()}"
+                        ),
                         "execution_status": exec_status,
                         "execution_net_return_pct": None,
-                    }
+                    }, None
 
-                # Check if first touching candle timestamp agrees with claimed touch_time
-                first_touch_c = touching_candles[0]
-                c_ts_str = first_touch_c.get("timestamp_utc") or first_touch_c.get("timestamp") or first_touch_c.get("t")
-                if c_ts_str and touch_time is not None:
-                    c_dt = _parse_utc(c_ts_str)
-                    if c_dt is not None:
-                        c_elapsed_hours = (c_dt - detection_dt).total_seconds() / 3600.0
-                        if abs(c_elapsed_hours - touch_time) > 1.0:
-                            self.diagnostics["evidence_conflict_records"] += 1
-                            self.diagnostics["unresolved_outcomes"] += 1
-                            return False, {
-                                "outcome_classification": "OUTCOME_EVIDENCE_CONFLICT",
-                                "target_reached": None,
-                                "market_target_reached": None,
-                                "mfe_pct": mfe_pct,
-                                "mae_pct": None,
-                                "hours_to_target": None,
-                                "is_evaluated": False,
-                                "resolution_reason": (
-                                    f"OUTCOME_EVIDENCE_CONFLICT: first candle touching target is at {c_elapsed_hours:.2f}h, "
-                                    f"conflicting with claimed touch time {touch_time:.2f}h"
-                                ),
-                                "execution_status": exec_status,
-                                "execution_net_return_pct": None,
-                            }
-
-        return True, None
+        return True, None, {
+            "derived_mfe": derived_mfe,
+            "derived_touch_hours": derived_touch_hours,
+            "derived_touch_dt": derived_touch_dt,
+            "candles_count": len(sorted_candles),
+            "sorted_candles": sorted_candles,
+        }
 
     def _resolve_outcome(self, item: dict[str, Any], lookup: dict[str, dict[str, Any]] | None) -> dict[str, Any]:
         """Resolve exact-identity, verified 24-hour outcome without synthetic labels.
@@ -922,22 +1339,115 @@ class ChronologicalBacktestEvaluator:
                 "execution_net_return_pct": exec_net_return,
             }
 
-        # 6. Validate verifiable candle-trace evidence schema and provenance
+        # 6. For TARGET_REACHED, validate touch timestamp and elapsed hours
+        if outcome_status == "TARGET_REACHED":
+            if touch_time is None and touch_dt is None:
+                self.diagnostics["missing_touch_evidence_records"] += 1
+                self.diagnostics["unresolved_outcomes"] += 1
+                return {
+                    "outcome_classification": "MISSING_TARGET_TOUCH_EVIDENCE",
+                    "target_reached": None,
+                    "market_target_reached": None,
+                    "mfe_pct": mfe_pct,
+                    "mae_pct": mae_pct,
+                    "hours_to_target": None,
+                    "is_evaluated": False,
+                    "resolution_reason": "MISSING_TARGET_TOUCH_EVIDENCE: TARGET_REACHED requires verifiable touch timestamp or elapsed time",
+                    "execution_status": exec_status,
+                    "execution_net_return_pct": exec_net_return,
+                }
+
+            if touch_dt is not None:
+                if touch_dt < detection_dt:
+                    self.diagnostics["evidence_conflict_records"] += 1
+                    self.diagnostics["unresolved_outcomes"] += 1
+                    return {
+                        "outcome_classification": "INVALID_TOUCH_TIMESTAMP",
+                        "target_reached": None,
+                        "market_target_reached": None,
+                        "mfe_pct": mfe_pct,
+                        "mae_pct": mae_pct,
+                        "hours_to_target": None,
+                        "is_evaluated": False,
+                        "resolution_reason": f"INVALID_TOUCH_TIMESTAMP: touch timestamp {touch_dt} precedes detection {detection_dt}",
+                        "execution_status": exec_status,
+                        "execution_net_return_pct": exec_net_return,
+                    }
+                calculated_elapsed_hours = (touch_dt - detection_dt).total_seconds() / 3600.0
+                if touch_time is not None and abs(calculated_elapsed_hours - touch_time) > 0.1:
+                    self.diagnostics["evidence_conflict_records"] += 1
+                    self.diagnostics["unresolved_outcomes"] += 1
+                    return {
+                        "outcome_classification": "OUTCOME_EVIDENCE_CONFLICT",
+                        "target_reached": None,
+                        "market_target_reached": None,
+                        "mfe_pct": mfe_pct,
+                        "mae_pct": mae_pct,
+                        "hours_to_target": None,
+                        "is_evaluated": False,
+                        "resolution_reason": (
+                            f"OUTCOME_EVIDENCE_CONFLICT: touch timestamp elapsed {calculated_elapsed_hours:.2f}h "
+                            f"conflicts with claimed elapsed time {touch_time:.2f}h (tolerance 0.1h)"
+                        ),
+                        "execution_status": exec_status,
+                        "execution_net_return_pct": exec_net_return,
+                    }
+                if touch_time is None:
+                    touch_time = calculated_elapsed_hours
+
+            if touch_time is not None:
+                if touch_time < 0.0:
+                    self.diagnostics["evidence_conflict_records"] += 1
+                    self.diagnostics["unresolved_outcomes"] += 1
+                    return {
+                        "outcome_classification": "INVALID_TOUCH_TIMESTAMP",
+                        "target_reached": None,
+                        "market_target_reached": None,
+                        "mfe_pct": mfe_pct,
+                        "mae_pct": mae_pct,
+                        "hours_to_target": touch_time,
+                        "is_evaluated": False,
+                        "resolution_reason": f"INVALID_TOUCH_TIMESTAMP: touch time {touch_time} is negative",
+                        "execution_status": exec_status,
+                        "execution_net_return_pct": exec_net_return,
+                    }
+                if touch_time > 24.0:
+                    self.diagnostics["target_outside_window_records"] += 1
+                    self.diagnostics["unresolved_outcomes"] += 1
+                    return {
+                        "outcome_classification": "TARGET_TOUCH_OUTSIDE_WINDOW",
+                        "target_reached": None,
+                        "market_target_reached": None,
+                        "mfe_pct": mfe_pct,
+                        "mae_pct": mae_pct,
+                        "hours_to_target": touch_time,
+                        "is_evaluated": False,
+                        "resolution_reason": f"TARGET_TOUCH_OUTSIDE_WINDOW: touch time {touch_time:.2f}h occurs outside the 24-hour evaluation window",
+                        "execution_status": exec_status,
+                        "execution_net_return_pct": exec_net_return,
+                    }
+
+        # 7. Validate verifiable candle-trace evidence schema and provenance
         detection_price = _clean_num(item.get("detection_price")) or 1.0
-        is_trace_valid, trace_rej = self._validate_candle_trace(
+        is_trace_valid, trace_rej, trace_info = self._validate_candle_trace(
             outcome_data=outcome_data,
             forecast_canon_id=forecast_canon_id,
             detection_dt=detection_dt,
             outcome_status=outcome_status,
             mfe_pct=mfe_pct,
             touch_time=touch_time,
+            touch_dt=touch_dt,
             effective_target_pct=effective_target_pct,
             detection_price=detection_price,
         )
         if not is_trace_valid:
             return trace_rej  # type: ignore[return-value]
 
-        # 7. Check for contradictory outcome classification vs candle evidence
+        if trace_info is not None and outcome_status == "TARGET_REACHED":
+            if touch_time is None:
+                touch_time = trace_info.get("derived_touch_hours")
+
+        # 8. Check for contradictory outcome classification vs candle evidence
         # Case A: status is TARGET_NOT_REACHED, but evidence says target was hit
         if outcome_status == "TARGET_NOT_REACHED":
             if claimed_target_reached is True or mfe_pct >= effective_target_pct:
@@ -973,46 +1483,6 @@ class ChronologicalBacktestEvaluator:
                     "execution_status": exec_status,
                     "execution_net_return_pct": exec_net_return,
                 }
-
-            # 7. Require verifiable touch evidence of WHEN the target was reached
-            if touch_time is None and touch_dt is None:
-                self.diagnostics["missing_touch_evidence_records"] += 1
-                self.diagnostics["unresolved_outcomes"] += 1
-                return {
-                    "outcome_classification": "MISSING_TARGET_TOUCH_EVIDENCE",
-                    "target_reached": None,
-                    "market_target_reached": None,
-                    "mfe_pct": mfe_pct,
-                    "mae_pct": mae_pct,
-                    "hours_to_target": None,
-                    "is_evaluated": False,
-                    "resolution_reason": "MISSING_TARGET_TOUCH_EVIDENCE: TARGET_REACHED requires verifiable touch timestamp or elapsed time",
-                    "execution_status": exec_status,
-                    "execution_net_return_pct": exec_net_return,
-                }
-
-            # 8. If both touch timestamp and elapsed hours are provided, verify they agree within tolerance
-            TOUCH_TOLERANCE_HOURS = 0.1  # 6-minute candle resolution tolerance
-            if touch_dt is not None:
-                calculated_elapsed_hours = (touch_dt - detection_dt).total_seconds() / 3600.0
-                if touch_time is not None and abs(calculated_elapsed_hours - touch_time) > TOUCH_TOLERANCE_HOURS:
-                    self.diagnostics["evidence_conflict_records"] += 1
-                    self.diagnostics["unresolved_outcomes"] += 1
-                    return {
-                        "outcome_classification": "OUTCOME_EVIDENCE_CONFLICT",
-                        "target_reached": None,
-                        "market_target_reached": None,
-                        "mfe_pct": mfe_pct,
-                        "mae_pct": mae_pct,
-                        "hours_to_target": None,
-                        "is_evaluated": False,
-                        "resolution_reason": (
-                            f"OUTCOME_EVIDENCE_CONFLICT: touch timestamp elapsed {calculated_elapsed_hours:.2f}h "
-                            f"conflicts with claimed elapsed time {touch_time:.2f}h (tolerance {TOUCH_TOLERANCE_HOURS}h)"
-                        ),
-                        "execution_status": exec_status,
-                        "execution_net_return_pct": exec_net_return,
-                    }
                 if touch_time is None:
                     touch_time = calculated_elapsed_hours
 
