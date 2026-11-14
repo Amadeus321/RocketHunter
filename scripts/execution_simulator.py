@@ -59,37 +59,45 @@ def validate_fee_bps(fee_bps: Any) -> float:
 
 
 def is_valid_address(chain: Any, address: Any) -> bool:
-    """Validate address structure for chain.
+    """Validate address syntax for specified chain.
 
-    Rejects empty, whitespace, malformed, punctuation-containing strings, and bare symbols.
+    Verifies structural format conformity against chain-specific encoding specifications:
+    - EVM: strictly '0x' followed by exactly 40 hexadecimal characters (case-insensitive, 42 chars total).
+      Non-hexadecimal characters and lengths other than 42 are strictly rejected.
+    - Solana: strictly Base58 string of 32 to 44 characters ([1-9A-HJ-NP-Za-km-z]{32,44}).
+    - Generic/other: strictly 32 to 128 alphanumeric characters ([0-9a-zA-Z_-]{32,128}).
+
+    Rejects non-string, empty, whitespace-padded, whitespace-containing, separator-containing
+    (:, /, \\, |, ?, #, ;, ,), non-hexadecimal EVM, or bare symbol inputs.
+
+    Note: Address format validation verifies structural conformity against encoding
+    specifications; it does NOT constitute cryptographic or on-chain proof that an address or
+    contract currently exists or is deployed on-chain.
     """
     if not isinstance(address, str) or not address:
         return False
     if address.strip() != address:
         return False
-    # Reject any whitespace or separators/punctuation
+    # Reject whitespace or separators/punctuation
     for ch in (" ", "\t", "\n", "\r", "|", ":", "/", "\\", "?", "#", ";", ","):
         if ch in address:
             return False
 
     chain_key = str(chain or "").strip().lower()
     if chain_key in {"solana", "sol"}:
-        # Base58 32-44 characters
         return bool(re.fullmatch(r"^[1-9A-HJ-NP-Za-km-z]{32,44}$", address))
     elif chain_key in {
         "ethereum", "eth", "base", "bsc", "bnb", "polygon", "polygon_pos",
-        "arbitrum", "optimism", "avalanche", "avax", "linea", "blast"
-    }:
-        # EVM: 0x followed by alphanumeric hex or identifier, length 4 to 66
-        # Strictly reject bare tickers like "PEPE", "USDC"
-        if not address.startswith("0x") or len(address) < 4 or len(address) > 66:
+        "arbitrum", "optimism", "avalanche", "avax", "fantom", "ftm",
+        "linea", "scroll", "zksync", "mantle", "blast", "mode", "opbnb"
+    } or address.startswith("0x"):
+        # EVM: strictly 0x followed by exactly 40 hex digits (total length 42)
+        if len(address) != 42 or not address.startswith("0x"):
             return False
-        return bool(re.fullmatch(r"^0x[0-9a-zA-Z]+$", address))
+        return bool(re.fullmatch(r"^0x[0-9a-fA-F]{40}$", address))
     else:
-        # Generic chain
-        if len(address) < 4 or len(address) > 128:
-            return False
-        return bool(re.fullmatch(r"^[0-9a-zA-Z_-]+$", address))
+        # Non-EVM / generic
+        return bool(re.fullmatch(r"^[0-9a-zA-Z_-]{32,128}$", address))
 
 
 def _find_book(obj):
@@ -311,19 +319,25 @@ def validate_two_way_quotes(
     expected_pool: str | None = None,
     expected_quote_asset: str | None = None,
     require_pool_identity: bool = False,
+    require_quote_asset: bool = False,
     target_size_usd: float | None = None,
     size_tolerance_pct: float = 1.0,
+    quantity_tolerance_pct: float = 0.1,
     quote_meta: dict[str, Any] | None = None,
 ) -> tuple[bool, str, dict[str, Any]]:
     """Validate both sides of a router trade quote.
 
     Enforces:
+    - Explicit 'BUY' direction on buy quote and 'SELL' direction on sell quote.
     - Explicit chain identity on both legs matching expected_chain.
     - Explicit pool identity on both legs where required/supplied matching expected_pool.
     - Explicit token addresses on both legs, verified swap directions:
         buy: expected quote asset -> candidate token
         sell: candidate token -> expected quote asset
     - Candidate token != quote asset.
+    - Positive finite input and output amounts on both quote legs.
+    - Round-trip token quantity reconciliation: buy output tokens must match sell input tokens
+      within quantity_tolerance_pct (default 0.1%).
     - Both buy notional size and sell notional size verified against target_size_usd within tolerance.
     """
     if not isinstance(buy_q, dict) or not buy_q:
@@ -331,7 +345,16 @@ def validate_two_way_quotes(
     if not isinstance(sell_q, dict) or not sell_q:
         return False, "MISSING_SELL_ROUTE", {"reason": "missing sell quote"}
 
-    # 1. Chain validation on both legs
+    # 1. Explicit swap direction on both legs
+    buy_dir = str(buy_q.get("direction") or "").strip().upper()
+    if buy_dir != "BUY":
+        return False, "DIRECTION_MISMATCH", {"reason": f"buy_quote direction must be explicitly 'BUY', got {buy_q.get('direction')!r}"}
+
+    sell_dir = str(sell_q.get("direction") or "").strip().upper()
+    if sell_dir != "SELL":
+        return False, "DIRECTION_MISMATCH", {"reason": f"sell_quote direction must be explicitly 'SELL', got {sell_q.get('direction')!r}"}
+
+    # 2. Chain validation on both legs
     buy_chain = buy_q.get("chain")
     sell_chain = sell_q.get("chain")
     if not buy_chain or not sell_chain:
@@ -354,13 +377,13 @@ def validate_two_way_quotes(
             "actual": effective_chain,
         }
 
-    # 2. Expected token address validation
+    # 3. Expected token address validation
     if not expected_token_address:
         return False, "MISSING_TOKEN_ADDRESS", {"reason": "expected_token_address is required for route verification"}
     if not is_valid_address(effective_chain, expected_token_address):
         return False, "INVALID_TOKEN_ADDRESS", {"reason": f"invalid expected token address format: {expected_token_address}"}
 
-    # 3. Pool validation
+    # 4. Pool validation
     buy_pool = buy_q.get("pool_address") or buy_q.get("pool") or buy_q.get("venue")
     sell_pool = sell_q.get("pool_address") or sell_q.get("pool") or sell_q.get("venue")
     if require_pool_identity or expected_pool:
@@ -370,6 +393,11 @@ def validate_two_way_quotes(
                 "buy_pool": buy_pool,
                 "sell_pool": sell_pool,
             }
+        if not is_valid_address(effective_chain, buy_pool):
+            return False, "INVALID_TOKEN_ADDRESS", {"reason": f"invalid buy pool address format: {buy_pool}"}
+        if not is_valid_address(effective_chain, sell_pool):
+            return False, "INVALID_TOKEN_ADDRESS", {"reason": f"invalid sell pool address format: {sell_pool}"}
+
     if buy_pool and sell_pool:
         if not same_address(effective_chain, buy_pool, sell_pool):
             return False, "POOL_MISMATCH", {
@@ -391,7 +419,7 @@ def validate_two_way_quotes(
                 "actual": sell_pool,
             }
 
-    # 4. Token addresses on both legs
+    # 5. Token addresses on both legs
     buy_in_tok = buy_q.get("in_token") or buy_q.get("input_token")
     buy_out_tok = buy_q.get("out_token") or buy_q.get("output_token")
     sell_in_tok = sell_q.get("in_token") or sell_q.get("input_token")
@@ -429,6 +457,8 @@ def validate_two_way_quotes(
             "sell_out": sell_out_tok,
         }
     if expected_quote_asset:
+        if not is_valid_address(effective_chain, expected_quote_asset):
+            return False, "INVALID_TOKEN_ADDRESS", {"reason": f"invalid expected quote asset format: {expected_quote_asset}"}
         if not same_address(effective_chain, buy_in_tok, expected_quote_asset):
             return False, "QUOTE_ASSET_MISMATCH", {
                 "reason": "buy in_token does not match expected_quote_asset",
@@ -441,45 +471,43 @@ def validate_two_way_quotes(
                 "expected": expected_quote_asset,
                 "actual": sell_out_tok,
             }
+    elif require_quote_asset:
+        return False, "MISSING_QUOTE_ASSET_EVIDENCE", {"reason": "expected quote asset is required but was not provided"}
 
     # Candidate token cannot be the quote asset
     if same_address(effective_chain, buy_out_tok, buy_in_tok):
         return False, "INVALID_TOKEN_ADDRESS", {"reason": "candidate token and quote asset cannot be the same address"}
 
-    # 5. Swap direction validation
-    buy_dir = str(buy_q.get("direction") or "").upper()
-    if buy_dir in {"SELL", "EXACT_OUT", "SWAP_OUT"}:
-        return False, "DIRECTION_MISMATCH", {"reason": "buy_quote has SELL direction"}
+    # 6. Input and output amounts on both quotes
+    def _extract_amount(q: dict[str, Any], keys: tuple[str, ...]) -> Any:
+        for k in keys:
+            if k in q:
+                return q[k]
+        return None
 
-    sell_dir = str(sell_q.get("direction") or "").upper()
-    if sell_dir in {"BUY", "EXACT_IN", "SWAP_IN"}:
-        return False, "DIRECTION_MISMATCH", {"reason": "sell_quote has BUY direction"}
+    buy_in = _clean_strictly_positive(_extract_amount(buy_q, ("in_amount", "amount_in", "input_amount")))
+    buy_out = _clean_strictly_positive(_extract_amount(buy_q, ("out_amount", "amount_out", "output_amount", "filled_quantity")))
+    if buy_in is None or buy_out is None:
+        return False, "INVALID_BUY_QUOTE_AMOUNTS", {"reason": "buy quote in_amount and out_amount must be positive and finite"}
 
-    # 6. Output and input amounts
-    buy_out = _clean_strictly_positive(
-        buy_q.get("out_amount") or buy_q.get("amount_out") or
-        buy_q.get("output_amount") or buy_q.get("filled_quantity")
-    )
-    if buy_out is None:
-        return False, "INVALID_BUY_QUOTE_AMOUNTS", {"reason": "buy output amount must be positive and finite"}
+    sell_in = _clean_strictly_positive(_extract_amount(sell_q, ("in_amount", "amount_in", "input_amount", "filled_quantity")))
+    sell_out = _clean_strictly_positive(_extract_amount(sell_q, ("out_amount", "amount_out", "output_amount", "filled_quote_usd")))
+    if sell_in is None or sell_out is None:
+        return False, "INVALID_SELL_QUOTE_AMOUNTS", {"reason": "sell quote in_amount and out_amount must be positive and finite"}
 
-    sell_out = _clean_strictly_positive(
-        sell_q.get("out_amount") or sell_q.get("amount_out") or
-        sell_q.get("output_amount") or sell_q.get("filled_quote_usd") or
-        sell_q.get("notional_size_usd")
-    )
-    if sell_out is None:
-        return False, "INVALID_SELL_QUOTE_AMOUNTS", {"reason": "sell output amount must be positive and finite"}
+    # 7. Round-trip token quantity reconciliation: buy output tokens must match sell input tokens
+    qty_diff = abs(buy_out - sell_in) / buy_out
+    qty_tol = (quantity_tolerance_pct / 100.0) + 1e-9
+    if qty_diff > qty_tol:
+        return False, "QUANTITY_MISMATCH", {
+            "reason": f"buy output quantity ({buy_out}) does not match sell input quantity ({sell_in}) within {quantity_tolerance_pct}% tolerance",
+            "buy_out": buy_out,
+            "sell_in": sell_in,
+            "diff_pct": qty_diff * 100.0,
+            "tolerance_pct": quantity_tolerance_pct,
+        }
 
-    for q_side, q_dict, err_name in (("buy", buy_q, "INVALID_BUY_QUOTE_AMOUNTS"), ("sell", sell_q, "INVALID_SELL_QUOTE_AMOUNTS")):
-        for key in ("in_amount", "amount_in", "input_amount"):
-            if key in q_dict:
-                v = q_dict[key]
-                cleaned = _clean_strictly_positive(v)
-                if cleaned is None:
-                    return False, err_name, {"reason": f"{q_side} {key} must be positive and finite"}
-
-    # 7. Quoted notional size verification on BOTH legs
+    # 8. Quoted notional size verification on BOTH legs
     buy_size = _clean_strictly_positive(buy_q.get("notional_size_usd") or buy_q.get("in_amount"))
     sell_size = _clean_strictly_positive(sell_q.get("notional_size_usd") or sell_q.get("out_amount") or sell_q.get("output_amount"))
 
@@ -495,9 +523,9 @@ def validate_two_way_quotes(
 
         buy_rel_diff = abs(buy_size - target_size_usd) / target_size_usd
         sell_rel_diff = abs(sell_size - target_size_usd) / target_size_usd
-        tolerance = size_tolerance_pct / 100.0
+        tolerance = (size_tolerance_pct / 100.0) + 1e-9
 
-        if buy_rel_diff > tolerance + 1e-9:
+        if buy_rel_diff > tolerance:
             return False, "ORDER_SIZE_MISMATCH", {
                 "size_bound": False,
                 "quoted_size": buy_size,
@@ -508,7 +536,7 @@ def validate_two_way_quotes(
                 "tolerance_pct": size_tolerance_pct,
                 "leg": "buy",
             }
-        if sell_rel_diff > tolerance + 1e-9:
+        if sell_rel_diff > tolerance:
             return False, "ORDER_SIZE_MISMATCH", {
                 "size_bound": False,
                 "quoted_size": sell_size,
@@ -541,11 +569,12 @@ def simulate_constant_product_amm(
     pool_address: str | None = None,
     token0: str | None = None,
     token1: str | None = None,
+    timestamp_utc: str | None = None,
     expected_chain: str | None = None,
     expected_pool: str | None = None,
     expected_token_address: str | None = None,
     expected_quote_asset: str | None = None,
-    require_reserve_identity: bool = False,
+    require_reserve_identity: bool = True,
 ) -> dict[str, Any]:
     """Exact constant-product AMM (x * y = k) simulation with reserve tracking, fees, and identity verification."""
     fee = validate_fee_bps(fee_bps)
@@ -559,19 +588,28 @@ def simulate_constant_product_amm(
     if buy_usd is None:
         raise ValueError("buy_notional_usd must be positive and finite")
 
-    # Reserve identity verification
-    if require_reserve_identity or expected_chain or expected_pool or expected_token_address:
-        if not pool_address:
-            raise ValueError("MISSING_AMM_POOL_IDENTITY: reserve snapshot missing pool identity")
-        if expected_pool and not same_address(expected_chain or chain, pool_address, expected_pool):
-            raise ValueError("AMM_POOL_MISMATCH: reserve pool does not match expected pool")
+    # Reserve identity verification directly from reserve evidence
+    if require_reserve_identity:
         if not chain:
             raise ValueError("MISSING_AMM_CHAIN_IDENTITY: reserve snapshot missing chain identity")
+        if not pool_address:
+            raise ValueError("MISSING_AMM_POOL_IDENTITY: reserve snapshot missing pool identity")
+        if not token0 or not token1:
+            raise ValueError("MISSING_AMM_TOKEN_IDENTITY: reserve snapshot missing token0 or token1")
+
+        if not is_valid_address(chain, pool_address):
+            raise ValueError(f"INVALID_TOKEN_ADDRESS: invalid AMM pool address format: {pool_address}")
+        if not is_valid_address(chain, token0):
+            raise ValueError(f"INVALID_TOKEN_ADDRESS: invalid AMM token0 address format: {token0}")
+        if not is_valid_address(chain, token1):
+            raise ValueError(f"INVALID_TOKEN_ADDRESS: invalid AMM token1 address format: {token1}")
+
         if expected_chain and str(chain).strip().lower() != str(expected_chain).strip().lower():
-            raise ValueError("AMM_CHAIN_MISMATCH: reserve chain does not match expected chain")
+            raise ValueError("AMM_CHAIN_MISMATCH: reserve snapshot chain does not match expected chain")
+        if expected_pool and not same_address(expected_chain or chain, pool_address, expected_pool):
+            raise ValueError("AMM_POOL_MISMATCH: reserve pool does not match expected pool")
+
         if expected_token_address:
-            if not token0 or not token1:
-                raise ValueError("AMM_TOKEN_MISMATCH: reserve snapshot missing token0 or token1 identity")
             match0 = same_address(expected_chain or chain, token0, expected_token_address)
             match1 = same_address(expected_chain or chain, token1, expected_token_address)
             if not match0 and not match1:
@@ -580,7 +618,7 @@ def simulate_constant_product_amm(
                 quote_match0 = same_address(expected_chain or chain, token0, expected_quote_asset)
                 quote_match1 = same_address(expected_chain or chain, token1, expected_quote_asset)
                 if not (match0 and quote_match1) and not (match1 and quote_match0):
-                    raise ValueError("AMM_TOKEN_MISMATCH: reserve tokens do not match candidate and quote asset pair")
+                    raise ValueError("QUOTE_ASSET_MISMATCH: reserve tokens do not match candidate and quote asset pair")
 
     mid_price = rq / rb
     fee_factor = 1.0 - (fee / 10000.0)
@@ -659,8 +697,10 @@ def simulate_multi_size(
     expected_pool: str | None = None,
     expected_quote_asset: str | None = None,
     require_pool_identity: bool = False,
-    require_reserve_identity: bool = False,
+    require_reserve_identity: bool = True,
+    require_quote_asset: bool = False,
     size_tolerance_pct: float = 1.0,
+    quantity_tolerance_pct: float = 0.1,
 ) -> dict[str, Any]:
     """Evaluate multi-size read-only execution scenarios ($100, $500, $1k, $5k).
 
@@ -669,7 +709,8 @@ def simulate_multi_size(
     Never assumes the same token has identical execution cost across sizes.
     Never assumes a buy quote proves a sell route is possible.
     Enforces quote freshness verification, size-bound quote validation, AMM reserve identity,
-    and pre-simulation fee validation. Fails closed on any unverified condition.
+    order-book identity, expected quote-asset verification, and pre-simulation fee validation.
+    Fails closed on any unverified condition.
     """
     liquidity_usd = None
     if isinstance(source, dict):
@@ -756,6 +797,57 @@ def simulate_multi_size(
                     "quote_age_seconds": round(book_age, 1) if book_age is not None else None,
                     "buy": {"status": "UNAVAILABLE", "reason": f"Freshness verification failed: {book_fresh_status}"},
                     "sell": {"status": "UNAVAILABLE", "reason": f"Freshness verification failed: {book_fresh_status}"},
+                    "estimated_round_trip_cost_pct": None,
+                    "execution_adjusted_return_pct": None,
+                }
+                continue
+
+            # Order book identity validation
+            book_chain = book.get("chain")
+            book_pool = book.get("pool_address") or book.get("venue") or book.get("pool")
+            book_token = book.get("token_address") or book.get("contract_address") or book.get("base_token")
+            book_quote = book.get("quote_asset") or book.get("quote_token") or book.get("quote_address")
+
+            book_ident_status = None
+            book_ident_reason = None
+            if not book_chain:
+                book_ident_status = "MISSING_BOOK_CHAIN_IDENTITY"
+                book_ident_reason = "order book evidence missing chain identity"
+            elif not book_pool:
+                book_ident_status = "MISSING_BOOK_POOL_IDENTITY"
+                book_ident_reason = "order book evidence missing pool or venue identity"
+            elif not book_token:
+                book_ident_status = "MISSING_BOOK_TOKEN_IDENTITY"
+                book_ident_reason = "order book evidence missing token contract identity"
+            elif not is_valid_address(book_chain, book_token):
+                book_ident_status = "INVALID_TOKEN_ADDRESS"
+                book_ident_reason = f"order book token address format invalid: {book_token}"
+            elif expected_chain and str(book_chain).strip().lower() != str(expected_chain).strip().lower():
+                book_ident_status = "BOOK_CHAIN_MISMATCH"
+                book_ident_reason = f"order book chain ({book_chain}) does not match expected ({expected_chain})"
+            elif expected_pool and not same_address(expected_chain or book_chain, book_pool, expected_pool):
+                book_ident_status = "BOOK_POOL_MISMATCH"
+                book_ident_reason = f"order book pool/venue ({book_pool}) does not match expected ({expected_pool})"
+            elif expected_token_address and not same_address(expected_chain or book_chain, book_token, expected_token_address):
+                book_ident_status = "BOOK_TOKEN_MISMATCH"
+                book_ident_reason = f"order book token ({book_token}) does not match expected ({expected_token_address})"
+            elif expected_quote_asset and book_quote and not same_address(expected_chain or book_chain, book_quote, expected_quote_asset):
+                book_ident_status = "QUOTE_ASSET_MISMATCH"
+                book_ident_reason = f"order book quote asset ({book_quote}) does not match expected ({expected_quote_asset})"
+
+            if book_ident_status:
+                size_evaluations[size_key] = {
+                    "size_usd": size,
+                    "status": book_ident_status,
+                    "route_available": False,
+                    "quote_freshness": "FRESH",
+                    "simulation_method": "ORDER_BOOK_IDENTITY_REJECTED",
+                    "quote_verified_for_size": False,
+                    "size_verification_status": "ORDER_SIZE_UNVERIFIED_ESTIMATE",
+                    "quote_age_seconds": round(book_age, 1) if book_age is not None else None,
+                    "reason": book_ident_reason,
+                    "buy": {"status": "UNAVAILABLE", "reason": book_ident_reason},
+                    "sell": {"status": "UNAVAILABLE", "reason": book_ident_reason},
                     "estimated_round_trip_cost_pct": None,
                     "execution_adjusted_return_pct": None,
                 }
@@ -850,13 +942,63 @@ def simulate_multi_size(
                 }
                 continue
 
+            # DO NOT inherit missing identity from parent candidate! Must be provided by reserve snapshot itself.
+            res_chain = amm_reserves.get("chain")
+            res_pool = amm_reserves.get("pool_address") or amm_reserves.get("pool")
+            res_t0 = amm_reserves.get("token0") or amm_reserves.get("base_token")
+            res_t1 = amm_reserves.get("token1") or amm_reserves.get("quote_token")
+
+            if not res_chain:
+                size_evaluations[size_key] = {
+                    "size_usd": size,
+                    "status": "MISSING_AMM_CHAIN_IDENTITY",
+                    "route_available": False,
+                    "quote_freshness": "FRESH",
+                    "simulation_method": "CONSTANT_PRODUCT_AMM_SIMULATION",
+                    "quote_verified_for_size": False,
+                    "size_verification_status": "ORDER_SIZE_UNVERIFIED_ESTIMATE",
+                    "quote_age_seconds": round(res_age, 1) if res_age is not None else None,
+                    "reason": "reserve snapshot missing chain identity",
+                    "buy": {"status": "UNAVAILABLE", "reason": "Missing AMM chain identity"},
+                    "sell": {"status": "UNAVAILABLE", "reason": "Missing AMM chain identity"},
+                }
+                continue
+
+            if not res_pool:
+                size_evaluations[size_key] = {
+                    "size_usd": size,
+                    "status": "MISSING_AMM_POOL_IDENTITY",
+                    "route_available": False,
+                    "quote_freshness": "FRESH",
+                    "simulation_method": "CONSTANT_PRODUCT_AMM_SIMULATION",
+                    "quote_verified_for_size": False,
+                    "size_verification_status": "ORDER_SIZE_UNVERIFIED_ESTIMATE",
+                    "quote_age_seconds": round(res_age, 1) if res_age is not None else None,
+                    "reason": "reserve snapshot missing pool identity",
+                    "buy": {"status": "UNAVAILABLE", "reason": "Missing AMM pool identity"},
+                    "sell": {"status": "UNAVAILABLE", "reason": "Missing AMM pool identity"},
+                }
+                continue
+
+            if not res_t0 or not res_t1:
+                size_evaluations[size_key] = {
+                    "size_usd": size,
+                    "status": "MISSING_AMM_TOKEN_IDENTITY",
+                    "route_available": False,
+                    "quote_freshness": "FRESH",
+                    "simulation_method": "CONSTANT_PRODUCT_AMM_SIMULATION",
+                    "quote_verified_for_size": False,
+                    "size_verification_status": "ORDER_SIZE_UNVERIFIED_ESTIMATE",
+                    "quote_age_seconds": round(res_age, 1) if res_age is not None else None,
+                    "reason": "reserve snapshot missing token0 or token1 identity",
+                    "buy": {"status": "UNAVAILABLE", "reason": "Missing AMM token identity"},
+                    "sell": {"status": "UNAVAILABLE", "reason": "Missing AMM token identity"},
+                }
+                continue
+
             try:
                 rb = amm_reserves.get("reserve_base") or amm_reserves.get("reserve_token") or amm_reserves.get("base_reserve") or amm_reserves.get("reserve0")
                 rq = amm_reserves.get("reserve_quote") or amm_reserves.get("reserve_usd") or amm_reserves.get("quote_reserve") or amm_reserves.get("reserve1")
-                res_chain = amm_reserves.get("chain") or (source.get("chain") if isinstance(source, dict) else None)
-                res_pool = amm_reserves.get("pool_address") or amm_reserves.get("pool") or (source.get("pool_address") if isinstance(source, dict) else None)
-                res_t0 = amm_reserves.get("token0") or amm_reserves.get("base_token")
-                res_t1 = amm_reserves.get("token1") or amm_reserves.get("quote_token")
 
                 amm_sim = simulate_constant_product_amm(
                     rb, rq,
@@ -866,11 +1008,12 @@ def simulate_multi_size(
                     pool_address=res_pool,
                     token0=res_t0,
                     token1=res_t1,
+                    timestamp_utc=res_stamp,
                     expected_chain=expected_chain,
                     expected_pool=expected_pool,
                     expected_token_address=expected_token_address,
                     expected_quote_asset=expected_quote_asset,
-                    require_reserve_identity=require_reserve_identity or bool(expected_pool or expected_chain or expected_token_address),
+                    require_reserve_identity=require_reserve_identity,
                 )
 
                 buy_ok = amm_sim["buy"]["complete"]
@@ -917,7 +1060,8 @@ def simulate_multi_size(
                 status_code = "INVALID_AMM_RESERVES"
                 for code in ("MISSING_AMM_POOL_IDENTITY", "AMM_POOL_MISMATCH",
                              "MISSING_AMM_CHAIN_IDENTITY", "AMM_CHAIN_MISMATCH",
-                             "AMM_TOKEN_MISMATCH", "INVALID_AMM_RESERVES"):
+                             "MISSING_AMM_TOKEN_IDENTITY", "AMM_TOKEN_MISMATCH",
+                             "QUOTE_ASSET_MISMATCH", "INVALID_TOKEN_ADDRESS", "INVALID_AMM_RESERVES"):
                     if code in err_msg:
                         status_code = code
                         break
@@ -1027,8 +1171,10 @@ def simulate_multi_size(
                 expected_pool=expected_pool,
                 expected_quote_asset=expected_quote_asset,
                 require_pool_identity=require_pool_identity,
+                require_quote_asset=require_quote_asset,
                 target_size_usd=size,
                 size_tolerance_pct=size_tolerance_pct,
+                quantity_tolerance_pct=quantity_tolerance_pct,
                 quote_meta=quotes,
             )
 

@@ -722,16 +722,21 @@ class FinalActionableGateTests(unittest.TestCase):
     def setUp(self):
         self.now = datetime(2026, 11, 9, 12, tzinfo=timezone.utc)
         now_iso = self.now.isoformat().replace("+00:00", "Z")
+        self.pool_address = "0x1111111111111111111111111111111111111111"
+        self.contract_address = "0x2222222222222222222222222222222222222222"
+        self.quote_address = "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48"
         self.candidate = {
-            "market_type": "dex_pool", "chain": "ethereum", "pool_address": "0xpool",
-            "contract_address": "0xtoken", "final_pool_address": "0xpool",
-            "final_token_contract": "0xtoken", "final_quote_chain": "ethereum",
+            "market_type": "dex_pool", "chain": "ethereum", "pool_address": self.pool_address,
+            "contract_address": self.contract_address, "final_pool_address": self.pool_address,
+            "final_token_contract": self.contract_address, "final_quote_chain": "ethereum",
             "final_price_verified": True, "final_price_usd": 100.0,
             "final_price_timestamp_utc": now_iso,
             "final_quote_token_orientation_verified": True,
             "dex_loss_guard_status": "PASS", "safety_verified": True,
             "executable_route_verified": True,
             "intended_trade_size_usd": 100.0,
+            "quote_token_address": self.quote_address,
+            "expected_quote_asset": self.quote_address,
             "fee_bps": 30.0,
             "dex_loss_guard_evidence": {"status": "PASS", "checks": {
                 "exact_token_and_pool_identity": True, "launch_wallet_analysis": True,
@@ -741,15 +746,15 @@ class FinalActionableGateTests(unittest.TestCase):
                 "provider": "test-router",
                 "timestamp_utc": now_iso,
                 "chain": "ethereum",
-                "pool_address": "0xpool",
+                "pool_address": self.pool_address,
                 "notional_size_usd": 100.0,
                 "buy_quote": {
                     "direction": "BUY",
                     "chain": "ethereum",
-                    "pool_address": "0xpool",
+                    "pool_address": self.pool_address,
                     "timestamp_utc": now_iso,
-                    "in_token": "0xusdc",
-                    "out_token": "0xtoken",
+                    "in_token": self.quote_address,
+                    "out_token": self.contract_address,
                     "in_amount": 100.0,
                     "out_amount": 1.0,
                     "notional_size_usd": 100.0,
@@ -757,10 +762,10 @@ class FinalActionableGateTests(unittest.TestCase):
                 "sell_quote": {
                     "direction": "SELL",
                     "chain": "ethereum",
-                    "pool_address": "0xpool",
+                    "pool_address": self.pool_address,
                     "timestamp_utc": now_iso,
-                    "in_token": "0xtoken",
-                    "out_token": "0xusdc",
+                    "in_token": self.contract_address,
+                    "out_token": self.quote_address,
                     "in_amount": 1.0,
                     "out_amount": 100.0,
                     "notional_size_usd": 100.0,
@@ -771,8 +776,8 @@ class FinalActionableGateTests(unittest.TestCase):
             "target_price_source": "7D_SWING_RESISTANCE",
             "technical_tp_validation": {
                 "status": "PASS", "blockers": [],
-                "chain": "ethereum", "pool_address": "0xpool",
-                "token_address": "0xtoken", "token_orientation_verified": True,
+                "chain": "ethereum", "pool_address": self.pool_address,
+                "token_address": self.contract_address, "token_orientation_verified": True,
                 "current_price": 100.0, "target_price": 140.0,
                 "target_price_source": "7D_SWING_RESISTANCE",
                 "atr_1h_pct": 10.0, "maximum_tp_distance_pct": 40.0,
@@ -837,7 +842,7 @@ class FinalActionableGateTests(unittest.TestCase):
 
     def test_stale_final_price_and_pool_mismatch_fail_closed(self):
         old = {**self.candidate, "final_price_timestamp_utc": "2026-11-09T11:54:59Z"}
-        mismatch = {**self.candidate, "final_pool_address": "0xother"}
+        mismatch = {**self.candidate, "final_pool_address": "0x9999999999999999999999999999999999999999"}
         self.assertEqual(v425.qualify_final_actionable_candidates([old, mismatch], self.now), [])
 
     def test_recalculates_single_tp_with_refreshed_live_price(self):
@@ -876,8 +881,8 @@ class FinalActionableGateTests(unittest.TestCase):
         self.assertEqual(item["price"], 100.0)
         self.assertEqual(item["trade_plan"]["single_take_profit"], 140.0)
         self.assertEqual(item["tp_upside_pct"], 40.0)
-        self.assertEqual(item["pool_address"], "0xpool")
-        self.assertEqual(item["contract_address"], "0xtoken")
+        self.assertEqual(item["pool_address"], self.pool_address)
+        self.assertEqual(item["contract_address"], self.contract_address)
         self.assertEqual(item["verification_status"], "PASS")
         self.assertEqual(item["safety_status"], "PASS")
 

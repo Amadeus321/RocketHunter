@@ -10,12 +10,31 @@ from scripts.execution_simulator import (
     validate_fee_bps,
     validate_two_way_quotes,
     validate_timestamp_freshness,
+    is_valid_address,
 )
+
+# Realistic, syntactically valid blockchain test addresses (42 chars, valid hexadecimal)
+VALID_EVM_CHAIN = "ethereum"
+VALID_POOL_ADDR = "0x1111111111111111111111111111111111111111"
+VALID_TOKEN_ADDR = "0x2222222222222222222222222222222222222222"
+VALID_QUOTE_ADDR = "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48"  # USDC on Ethereum
+VALID_ALT_POOL = "0x9999999999999999999999999999999999999999"
+VALID_ALT_TOKEN = "0x3333333333333333333333333333333333333333"
+VALID_ALT_QUOTE = "0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2"  # WETH on Ethereum
+
+# Syntactically valid Solana test addresses (Base58, 32-44 characters)
+VALID_SOLANA_CHAIN = "solana"
+VALID_SOLANA_TOKEN = "So11111111111111111111111111111111111111112"
+VALID_SOLANA_POOL = "7XawhbbxtsRcQA8KTkHT9f9nc6d69UwqCDh6U5EEbEmX"
+VALID_SOLANA_QUOTE = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
 
 
 class ExecutionSimulatorTests(unittest.TestCase):
     def test_simulates_round_trip_without_enabling_execution(self):
         result = simulate({
+            "chain": VALID_EVM_CHAIN,
+            "pool_address": VALID_POOL_ADDR,
+            "token_address": VALID_TOKEN_ADDR,
             "timestamp_utc": "2026-11-09T12:00:00Z",
             "bids": [[99.0, 2.0], [98.0, 2.0]],
             "asks": [[101.0, 2.0], [102.0, 2.0]],
@@ -33,6 +52,9 @@ class ExecutionSimulatorTests(unittest.TestCase):
 
     def test_reports_insufficient_displayed_depth(self):
         result = simulate({
+            "chain": VALID_EVM_CHAIN,
+            "pool_address": VALID_POOL_ADDR,
+            "token_address": VALID_TOKEN_ADDR,
             "timestamp_utc": "2026-11-09T12:00:00Z",
             "bids": [[99.0, 0.1]],
             "asks": [[101.0, 0.25]],
@@ -44,7 +66,14 @@ class ExecutionSimulatorTests(unittest.TestCase):
         self.assertEqual(result["immediate_exit"]["remaining_quantity"], 0.15)
 
     def test_rejects_invalid_notional_and_crossed_books(self):
-        book = {"timestamp_utc": "2026-11-09T12:00:00Z", "bids": [[100.0, 1.0]], "asks": [[101.0, 1.0]]}
+        book = {
+            "chain": VALID_EVM_CHAIN,
+            "pool_address": VALID_POOL_ADDR,
+            "token_address": VALID_TOKEN_ADDR,
+            "timestamp_utc": "2026-11-09T12:00:00Z",
+            "bids": [[100.0, 1.0]],
+            "asks": [[101.0, 1.0]],
+        }
         with self.assertRaisesRegex(ValueError, "must be positive and finite"):
             simulate(book, buy_notional_usd=0)
 
@@ -52,155 +81,204 @@ class ExecutionSimulatorTests(unittest.TestCase):
             simulate(book, buy_notional_usd=10, fee_bps=-1)
 
         with self.assertRaisesRegex(ValueError, "crossed or locked book"):
-            simulate({"timestamp_utc": "2026-11-09T12:00:00Z", "bids": [[101.0, 1.0]], "asks": [[101.0, 1.0]]}, 10)
+            simulate({
+                "chain": VALID_EVM_CHAIN,
+                "pool_address": VALID_POOL_ADDR,
+                "token_address": VALID_TOKEN_ADDR,
+                "timestamp_utc": "2026-11-09T12:00:00Z",
+                "bids": [[101.0, 1.0]],
+                "asks": [[101.0, 1.0]],
+            }, 10)
 
     def test_multi_size_simulation_scales_price_impact_across_notional_sizes(self):
         book = {
+            "chain": VALID_EVM_CHAIN,
+            "pool_address": VALID_POOL_ADDR,
+            "token_address": VALID_TOKEN_ADDR,
+            "quote_asset": VALID_QUOTE_ADDR,
             "timestamp_utc": "2026-11-13T12:00:00Z",
-            # Book has 2 units ($202) at best ask, so $100 stays at best ask, but $500 and $5,000 walk the book
             "bids": [[99.0, 2.0], [98.0, 20.0], [95.0, 30.0]],
             "asks": [[101.0, 2.0], [102.0, 20.0], [105.0, 30.0]],
         }
-        res = simulate_multi_size(book, sizes_usd=[100.0, 500.0, 5000.0], as_of_utc="2026-11-13T12:01:00Z")
+        res = simulate_multi_size(
+            book,
+            sizes_usd=[100.0, 500.0, 5000.0],
+            as_of_utc="2026-11-13T12:01:00Z",
+            expected_token_address=VALID_TOKEN_ADDR,
+            expected_chain=VALID_EVM_CHAIN,
+            expected_pool=VALID_POOL_ADDR,
+            expected_quote_asset=VALID_QUOTE_ADDR,
+        )
         evals = res["size_evaluations"]
 
         assert "$100" in evals
         assert "$500" in evals
         assert "$5000" in evals
 
-        # $100 fills completely with zero impact vs best ask
         assert evals["$100"]["status"] == "EXECUTABLE_DEPTH_AVAILABLE"
         assert evals["$100"]["buy"]["price_impact_bps"] == 0.0
 
-        # $500 fills completely but walks book to 102.0
         assert evals["$500"]["status"] == "EXECUTABLE_DEPTH_AVAILABLE"
         assert evals["$500"]["buy"]["price_impact_bps"] > 0.0
 
-        # $5,000 walks book even further and has higher price impact than $500
         assert evals["$5000"]["buy"]["price_impact_bps"] > evals["$500"]["buy"]["price_impact_bps"]
 
     def test_multi_size_detects_stale_quotes(self):
         stale_source = {
-            "chain": "ethereum",
-            "pool_address": "0xpool1111",
-            "contract_address": "0xtoken2222",
+            "chain": VALID_EVM_CHAIN,
+            "pool_address": VALID_POOL_ADDR,
+            "contract_address": VALID_TOKEN_ADDR,
             "dex_execution_quotes": {
                 "timestamp_utc": "2026-11-13T11:00:00Z",  # 1 hour old
-                "chain": "ethereum",
-                "pool_address": "0xpool1111",
+                "chain": VALID_EVM_CHAIN,
+                "pool_address": VALID_POOL_ADDR,
                 "buy_quote": {
                     "direction": "BUY",
-                    "chain": "ethereum",
-                    "pool_address": "0xpool1111",
+                    "chain": VALID_EVM_CHAIN,
+                    "pool_address": VALID_POOL_ADDR,
                     "timestamp_utc": "2026-11-13T11:00:00Z",
-                    "in_token": "0xusdc",
-                    "out_token": "0xtoken2222",
+                    "in_token": VALID_QUOTE_ADDR,
+                    "out_token": VALID_TOKEN_ADDR,
                     "in_amount": 100.0,
-                    "amount_out": 100.0,
+                    "out_amount": 50.0,
                     "notional_size_usd": 100.0,
                 },
                 "sell_quote": {
                     "direction": "SELL",
-                    "chain": "ethereum",
-                    "pool_address": "0xpool1111",
+                    "chain": VALID_EVM_CHAIN,
+                    "pool_address": VALID_POOL_ADDR,
                     "timestamp_utc": "2026-11-13T11:00:00Z",
-                    "in_token": "0xtoken2222",
-                    "out_token": "0xusdc",
-                    "in_amount": 100.0,
-                    "amount_out": 95.0,
+                    "in_token": VALID_TOKEN_ADDR,
+                    "out_token": VALID_QUOTE_ADDR,
+                    "in_amount": 50.0,
+                    "out_amount": 95.0,
                     "notional_size_usd": 100.0,
                 },
             },
             "liquidity_usd": 100_000,
         }
-        res = simulate_multi_size(stale_source, sizes_usd=[100.0], as_of_utc="2026-11-13T12:05:00Z", max_quote_age_seconds=300)
+        res = simulate_multi_size(
+            stale_source,
+            sizes_usd=[100.0],
+            as_of_utc="2026-11-13T12:05:00Z",
+            max_quote_age_seconds=300,
+            expected_token_address=VALID_TOKEN_ADDR,
+            expected_chain=VALID_EVM_CHAIN,
+            expected_pool=VALID_POOL_ADDR,
+            expected_quote_asset=VALID_QUOTE_ADDR,
+        )
         assert res["size_evaluations"]["$100"]["status"] == "STALE_QUOTE"
         assert res["size_evaluations"]["$100"]["route_available"] is False
 
     def test_buy_quote_does_not_prove_sellability(self):
         honeypot_source = {
-            "chain": "ethereum",
-            "pool_address": "0xpool1111",
-            "contract_address": "0xtoken2222",
+            "chain": VALID_EVM_CHAIN,
+            "pool_address": VALID_POOL_ADDR,
+            "contract_address": VALID_TOKEN_ADDR,
             "dex_execution_quotes": {
                 "timestamp_utc": "2026-11-13T12:00:00Z",
-                "chain": "ethereum",
-                "pool_address": "0xpool1111",
+                "chain": VALID_EVM_CHAIN,
+                "pool_address": VALID_POOL_ADDR,
                 "buy_quote": {
                     "direction": "BUY",
-                    "chain": "ethereum",
-                    "pool_address": "0xpool1111",
+                    "chain": VALID_EVM_CHAIN,
+                    "pool_address": VALID_POOL_ADDR,
                     "timestamp_utc": "2026-11-13T12:00:00Z",
-                    "in_token": "0xusdc",
-                    "out_token": "0xtoken2222",
+                    "in_token": VALID_QUOTE_ADDR,
+                    "out_token": VALID_TOKEN_ADDR,
                     "in_amount": 100.0,
-                    "amount_out": 1000.0,
+                    "out_amount": 1000.0,
                     "notional_size_usd": 100.0,
                 },
-                "sell_quote": None,  # Honeypot: buy is possible, sell route missing!
+                "sell_quote": None,  # Honeypot: sell route missing!
             },
             "liquidity_usd": 100_000,
         }
-        res = simulate_multi_size(honeypot_source, sizes_usd=[100.0], as_of_utc="2026-11-13T12:01:00Z")
+        res = simulate_multi_size(
+            honeypot_source,
+            sizes_usd=[100.0],
+            as_of_utc="2026-11-13T12:01:00Z",
+            expected_token_address=VALID_TOKEN_ADDR,
+            expected_chain=VALID_EVM_CHAIN,
+            expected_pool=VALID_POOL_ADDR,
+            expected_quote_asset=VALID_QUOTE_ADDR,
+        )
         assert res["size_evaluations"]["$100"]["status"] == "MISSING_SELL_ROUTE"
         assert res["size_evaluations"]["$100"]["route_available"] is False
         assert res["size_evaluations"]["$100"]["sell"]["status"] == "UNAVAILABLE"
 
     def test_insufficient_liquidity_blocks_large_notional_size(self):
         thin_liquidity_source = {
-            "chain": "ethereum",
-            "pool_address": "0xpool1111",
-            "contract_address": "0xtoken2222",
+            "chain": VALID_EVM_CHAIN,
+            "pool_address": VALID_POOL_ADDR,
+            "contract_address": VALID_TOKEN_ADDR,
             "dex_execution_quotes": {
                 "timestamp_utc": "2026-11-13T12:00:00Z",
-                "chain": "ethereum",
-                "pool_address": "0xpool1111",
+                "chain": VALID_EVM_CHAIN,
+                "pool_address": VALID_POOL_ADDR,
                 "notional_size_usd": 100.0,
                 "buy_quote": {
                     "direction": "BUY",
-                    "chain": "ethereum",
-                    "pool_address": "0xpool1111",
+                    "chain": VALID_EVM_CHAIN,
+                    "pool_address": VALID_POOL_ADDR,
                     "timestamp_utc": "2026-11-13T12:00:00Z",
-                    "in_token": "0xusdc",
-                    "out_token": "0xtoken2222",
+                    "in_token": VALID_QUOTE_ADDR,
+                    "out_token": VALID_TOKEN_ADDR,
                     "in_amount": 100.0,
-                    "amount_out": 100.0,
+                    "out_amount": 50.0,
                     "notional_size_usd": 100.0,
                 },
                 "sell_quote": {
                     "direction": "SELL",
-                    "chain": "ethereum",
-                    "pool_address": "0xpool1111",
+                    "chain": VALID_EVM_CHAIN,
+                    "pool_address": VALID_POOL_ADDR,
                     "timestamp_utc": "2026-11-13T12:00:00Z",
-                    "in_token": "0xtoken2222",
-                    "out_token": "0xusdc",
-                    "in_amount": 100.0,
-                    "amount_out": 95.0,
+                    "in_token": VALID_TOKEN_ADDR,
+                    "out_token": VALID_QUOTE_ADDR,
+                    "in_amount": 50.0,
+                    "out_amount": 95.0,
                     "notional_size_usd": 100.0,
                 },
             },
             "liquidity_usd": 2_000,  # Only $2,000 total liquidity
         }
-        res = simulate_multi_size(thin_liquidity_source, sizes_usd=[100.0, 5000.0], as_of_utc="2026-11-13T12:01:00Z", expected_token_address="0xtoken2222")
-        # $100 is < half liquidity
+        res = simulate_multi_size(
+            thin_liquidity_source,
+            sizes_usd=[100.0, 5000.0],
+            as_of_utc="2026-11-13T12:01:00Z",
+            expected_token_address=VALID_TOKEN_ADDR,
+            expected_chain=VALID_EVM_CHAIN,
+            expected_pool=VALID_POOL_ADDR,
+            expected_quote_asset=VALID_QUOTE_ADDR,
+        )
         assert res["size_evaluations"]["$100"]["status"] == "EXECUTABLE_ROUTE_AVAILABLE"
-        # $5,000 exceeds available pool liquidity!
         assert res["size_evaluations"]["$5000"]["status"] == "INSUFFICIENT_LIQUIDITY"
         assert res["size_evaluations"]["$5000"]["route_available"] is False
 
     def test_distinguishes_depth_walk_from_approximate_liquidity_heuristic(self):
         book = {
+            "chain": VALID_EVM_CHAIN,
+            "pool_address": VALID_POOL_ADDR,
+            "token_address": VALID_TOKEN_ADDR,
+            "quote_asset": VALID_QUOTE_ADDR,
             "timestamp_utc": "2026-11-13T12:00:00Z",
             "bids": [[99.0, 10.0]],
             "asks": [[101.0, 10.0]],
         }
-        res_book = simulate_multi_size(book, sizes_usd=[100.0], as_of_utc="2026-11-13T12:01:00Z")
+        res_book = simulate_multi_size(
+            book,
+            sizes_usd=[100.0],
+            as_of_utc="2026-11-13T12:01:00Z",
+            expected_token_address=VALID_TOKEN_ADDR,
+            expected_chain=VALID_EVM_CHAIN,
+            expected_pool=VALID_POOL_ADDR,
+            expected_quote_asset=VALID_QUOTE_ADDR,
+        )
         eval_book = res_book["size_evaluations"]["$100"]
         assert eval_book["simulation_method"] == "ORDER_BOOK_DEPTH_WALK"
         assert eval_book["is_depth_walk"] is True
         assert eval_book["size_verification_status"] == "SIZE_BOUND_ORDER_BOOK_WALK"
 
-        # Only liquidity_usd supplied; no order book, no AMM reserves, no router quotes
         heuristic_source = {
             "liquidity_usd": 50_000,
         }
@@ -214,7 +292,6 @@ class ExecutionSimulatorTests(unittest.TestCase):
         assert eval_quote["quote_verified_for_size"] is False
 
     def test_malformed_and_negative_inputs_sanitized_safely(self):
-        # Invalid fee fails closed immediately with INVALID_FEE_DATA
         quote_source = {
             "liquidity_usd": 50_000,
         }
@@ -228,7 +305,6 @@ class ExecutionSimulatorTests(unittest.TestCase):
         assert res_invalid_fee["fee_bps"] is None
         assert res_invalid_fee["size_evaluations"]["$250"]["route_available"] is False
 
-        # When fee is valid, invalid sizes are sanitized and only valid positive size ($250) is evaluated
         res_valid_fee = simulate_multi_size(
             quote_source,
             sizes_usd=[-500.0, 0, "invalid", 250.0, float("nan")],
@@ -243,19 +319,30 @@ class ExecutionSimulatorTests(unittest.TestCase):
 
     def test_missing_quote_timestamp_fails_freshness_verification(self):
         missing_timestamp_source = {
-            "chain": "ethereum",
-            "pool_address": "0xpool1111",
-            "contract_address": "0xtoken2222",
+            "chain": VALID_EVM_CHAIN,
+            "pool_address": VALID_POOL_ADDR,
+            "contract_address": VALID_TOKEN_ADDR,
             "dex_execution_quotes": {
-                # No timestamps on quotes!
-                "chain": "ethereum",
-                "pool_address": "0xpool1111",
-                "buy_quote": {"direction": "BUY", "chain": "ethereum", "pool_address": "0xpool1111", "in_token": "0xusdc", "out_token": "0xtoken2222", "in_amount": 100.0, "amount_out": 100.0, "notional_size_usd": 100.0},
-                "sell_quote": {"direction": "SELL", "chain": "ethereum", "pool_address": "0xpool1111", "in_token": "0xtoken2222", "out_token": "0xusdc", "in_amount": 100.0, "amount_out": 95.0, "notional_size_usd": 100.0},
+                "chain": VALID_EVM_CHAIN,
+                "pool_address": VALID_POOL_ADDR,
+                "buy_quote": {
+                    "direction": "BUY", "chain": VALID_EVM_CHAIN, "pool_address": VALID_POOL_ADDR,
+                    "in_token": VALID_QUOTE_ADDR, "out_token": VALID_TOKEN_ADDR,
+                    "in_amount": 100.0, "out_amount": 50.0, "notional_size_usd": 100.0,
+                },
+                "sell_quote": {
+                    "direction": "SELL", "chain": VALID_EVM_CHAIN, "pool_address": VALID_POOL_ADDR,
+                    "in_token": VALID_TOKEN_ADDR, "out_token": VALID_QUOTE_ADDR,
+                    "in_amount": 50.0, "out_amount": 95.0, "notional_size_usd": 100.0,
+                },
             },
             "liquidity_usd": 50_000,
         }
-        res = simulate_multi_size(missing_timestamp_source, sizes_usd=[100.0], as_of_utc="2026-11-13T12:01:00Z", expected_token_address="0xtoken2222")
+        res = simulate_multi_size(
+            missing_timestamp_source, sizes_usd=[100.0], as_of_utc="2026-11-13T12:01:00Z",
+            expected_token_address=VALID_TOKEN_ADDR, expected_chain=VALID_EVM_CHAIN, expected_pool=VALID_POOL_ADDR,
+            expected_quote_asset=VALID_QUOTE_ADDR,
+        )
         eval100 = res["size_evaluations"]["$100"]
         assert eval100["status"] == "MISSING_EXECUTION_QUOTE_TIMESTAMP"
         assert eval100["quote_freshness"] == "MISSING_EXECUTION_QUOTE_TIMESTAMP"
@@ -263,43 +350,45 @@ class ExecutionSimulatorTests(unittest.TestCase):
 
 
 class AdversarialPhase2ExecutionTests(unittest.TestCase):
-    """22 adversarial regression tests mandated for Rocket Hunter v4.30 Phase 2."""
+    """Adversarial regression tests covering all six Phase 2 execution realism requirements."""
 
     def setUp(self):
         self.as_of_utc = "2026-11-13T12:00:00Z"
         self.now_dt = datetime(2026, 11, 13, 12, 0, 0, tzinfo=timezone.utc)
         self.valid_quote_source = {
-            "chain": "ethereum",
-            "pool_address": "0xpool1111",
-            "contract_address": "0xtoken2222",
+            "chain": VALID_EVM_CHAIN,
+            "pool_address": VALID_POOL_ADDR,
+            "contract_address": VALID_TOKEN_ADDR,
             "intended_trade_size_usd": 100.0,
+            "quote_token_address": VALID_QUOTE_ADDR,
+            "expected_quote_asset": VALID_QUOTE_ADDR,
             "liquidity_usd": 100_000.0,
             "final_price_timestamp_utc": "2026-11-13T12:00:00Z",
             "dex_execution_quotes": {
                 "provider": "uniswap_v3",
                 "timestamp_utc": "2026-11-13T12:00:00Z",
-                "chain": "ethereum",
-                "pool_address": "0xpool1111",
+                "chain": VALID_EVM_CHAIN,
+                "pool_address": VALID_POOL_ADDR,
                 "notional_size_usd": 100.0,
                 "buy_quote": {
                     "direction": "BUY",
-                    "chain": "ethereum",
-                    "pool_address": "0xpool1111",
+                    "chain": VALID_EVM_CHAIN,
+                    "pool_address": VALID_POOL_ADDR,
                     "timestamp_utc": "2026-11-13T12:00:00Z",
-                    "in_token": "0xusdc",
-                    "out_token": "0xtoken2222",
+                    "in_token": VALID_QUOTE_ADDR,
+                    "out_token": VALID_TOKEN_ADDR,
                     "in_amount": 100.0,
                     "out_amount": 50.0,
                     "notional_size_usd": 100.0,
                 },
                 "sell_quote": {
                     "direction": "SELL",
-                    "chain": "ethereum",
-                    "pool_address": "0xpool1111",
+                    "chain": VALID_EVM_CHAIN,
+                    "pool_address": VALID_POOL_ADDR,
                     "timestamp_utc": "2026-11-13T12:00:00Z",
-                    "in_token": "0xtoken2222",
-                    "out_token": "0xusdc",
-                    "in_amount": 50.0,
+                    "in_token": VALID_TOKEN_ADDR,
+                    "out_token": VALID_QUOTE_ADDR,
+                    "in_amount": 50.0,  # Matches buy_quote out_amount exactly (50.0)
                     "out_amount": 98.0,
                     "notional_size_usd": 100.0,
                 },
@@ -311,7 +400,7 @@ class AdversarialPhase2ExecutionTests(unittest.TestCase):
         src = copy.deepcopy(self.valid_quote_source)
         del src["dex_execution_quotes"]["buy_quote"]["timestamp_utc"]
         src["final_price_timestamp_utc"] = self.as_of_utc  # Present, but must never substitute!
-        res = simulate_multi_size(src, sizes_usd=[100.0], as_of_utc=self.as_of_utc, expected_token_address="0xtoken2222")
+        res = simulate_multi_size(src, sizes_usd=[100.0], as_of_utc=self.as_of_utc, expected_token_address=VALID_TOKEN_ADDR)
         ev = res["size_evaluations"]["$100"]
         self.assertFalse(ev["route_available"])
         self.assertEqual(ev["status"], "MISSING_EXECUTION_QUOTE_TIMESTAMP")
@@ -322,7 +411,7 @@ class AdversarialPhase2ExecutionTests(unittest.TestCase):
         src = copy.deepcopy(self.valid_quote_source)
         del src["dex_execution_quotes"]["sell_quote"]["timestamp_utc"]
         src["final_price_timestamp_utc"] = self.as_of_utc  # Present, but must never substitute!
-        res = simulate_multi_size(src, sizes_usd=[100.0], as_of_utc=self.as_of_utc, expected_token_address="0xtoken2222")
+        res = simulate_multi_size(src, sizes_usd=[100.0], as_of_utc=self.as_of_utc, expected_token_address=VALID_TOKEN_ADDR)
         ev = res["size_evaluations"]["$100"]
         self.assertFalse(ev["route_available"])
         self.assertEqual(ev["status"], "MISSING_EXECUTION_QUOTE_TIMESTAMP")
@@ -332,22 +421,22 @@ class AdversarialPhase2ExecutionTests(unittest.TestCase):
     def test_03_buy_and_sell_timestamps_independently_validated(self):
         # Case A: Buy fresh, sell stale
         src_stale = copy.deepcopy(self.valid_quote_source)
-        src_stale["dex_execution_quotes"]["sell_quote"]["timestamp_utc"] = "2026-11-13T11:50:00Z"  # 10 min old (> 300s)
-        res_stale = simulate_multi_size(src_stale, sizes_usd=[100.0], as_of_utc=self.as_of_utc, expected_token_address="0xtoken2222")
+        src_stale["dex_execution_quotes"]["sell_quote"]["timestamp_utc"] = "2026-11-13T11:50:00Z"
+        res_stale = simulate_multi_size(src_stale, sizes_usd=[100.0], as_of_utc=self.as_of_utc, expected_token_address=VALID_TOKEN_ADDR)
         self.assertFalse(res_stale["size_evaluations"]["$100"]["route_available"])
         self.assertEqual(res_stale["size_evaluations"]["$100"]["status"], "STALE_QUOTE")
 
         # Case B: Buy future-dated, sell fresh
         src_future = copy.deepcopy(self.valid_quote_source)
-        src_future["dex_execution_quotes"]["buy_quote"]["timestamp_utc"] = "2026-11-13T12:05:00Z"  # 5 min in future
-        res_future = simulate_multi_size(src_future, sizes_usd=[100.0], as_of_utc=self.as_of_utc, expected_token_address="0xtoken2222")
+        src_future["dex_execution_quotes"]["buy_quote"]["timestamp_utc"] = "2026-11-13T12:05:00Z"
+        res_future = simulate_multi_size(src_future, sizes_usd=[100.0], as_of_utc=self.as_of_utc, expected_token_address=VALID_TOKEN_ADDR)
         self.assertFalse(res_future["size_evaluations"]["$100"]["route_available"])
         self.assertEqual(res_future["size_evaluations"]["$100"]["status"], "FUTURE_DATED_QUOTE")
 
         # Case C: Buy naive without timezone, sell fresh
         src_naive = copy.deepcopy(self.valid_quote_source)
         src_naive["dex_execution_quotes"]["buy_quote"]["timestamp_utc"] = "2026-11-13 12:00:00"
-        res_naive = simulate_multi_size(src_naive, sizes_usd=[100.0], as_of_utc=self.as_of_utc, expected_token_address="0xtoken2222")
+        res_naive = simulate_multi_size(src_naive, sizes_usd=[100.0], as_of_utc=self.as_of_utc, expected_token_address=VALID_TOKEN_ADDR)
         self.assertFalse(res_naive["size_evaluations"]["$100"]["route_available"])
         self.assertEqual(res_naive["size_evaluations"]["$100"]["status"], "NAIVE_TIMESTAMP_REJECTED")
 
@@ -361,7 +450,7 @@ class AdversarialPhase2ExecutionTests(unittest.TestCase):
         ]:
             src = copy.deepcopy(self.valid_quote_source)
             del src["dex_execution_quotes"][leg][field]
-            res = simulate_multi_size(src, sizes_usd=[100.0], as_of_utc=self.as_of_utc, expected_token_address="0xtoken2222")
+            res = simulate_multi_size(src, sizes_usd=[100.0], as_of_utc=self.as_of_utc, expected_token_address=VALID_TOKEN_ADDR)
             ev = res["size_evaluations"]["$100"]
             self.assertFalse(ev["route_available"])
             self.assertEqual(ev["status"], "MISSING_TOKEN_ADDRESS")
@@ -371,7 +460,7 @@ class AdversarialPhase2ExecutionTests(unittest.TestCase):
         for leg in ["buy_quote", "sell_quote"]:
             src = copy.deepcopy(self.valid_quote_source)
             del src["dex_execution_quotes"][leg]["chain"]
-            res = simulate_multi_size(src, sizes_usd=[100.0], as_of_utc=self.as_of_utc, expected_token_address="0xtoken2222")
+            res = simulate_multi_size(src, sizes_usd=[100.0], as_of_utc=self.as_of_utc, expected_token_address=VALID_TOKEN_ADDR)
             ev = res["size_evaluations"]["$100"]
             self.assertFalse(ev["route_available"])
             self.assertEqual(ev["status"], "MISSING_CHAIN_IDENTITY")
@@ -383,8 +472,8 @@ class AdversarialPhase2ExecutionTests(unittest.TestCase):
             del src["dex_execution_quotes"][leg]["pool_address"]
             res = simulate_multi_size(
                 src, sizes_usd=[100.0], as_of_utc=self.as_of_utc,
-                expected_token_address="0xtoken2222",
-                expected_pool="0xpool1111",
+                expected_token_address=VALID_TOKEN_ADDR,
+                expected_pool=VALID_POOL_ADDR,
                 require_pool_identity=True,
             )
             ev = res["size_evaluations"]["$100"]
@@ -396,7 +485,7 @@ class AdversarialPhase2ExecutionTests(unittest.TestCase):
         src = copy.deepcopy(self.valid_quote_source)
         src["dex_execution_quotes"]["buy_quote"]["chain"] = "ethereum"
         src["dex_execution_quotes"]["sell_quote"]["chain"] = "bsc"
-        res = simulate_multi_size(src, sizes_usd=[100.0], as_of_utc=self.as_of_utc, expected_token_address="0xtoken2222")
+        res = simulate_multi_size(src, sizes_usd=[100.0], as_of_utc=self.as_of_utc, expected_token_address=VALID_TOKEN_ADDR)
         ev = res["size_evaluations"]["$100"]
         self.assertFalse(ev["route_available"])
         self.assertEqual(ev["status"], "CHAIN_MISMATCH")
@@ -404,19 +493,19 @@ class AdversarialPhase2ExecutionTests(unittest.TestCase):
     # 8. Buy and sell quotes with different pool identities
     def test_08_buy_and_sell_quotes_with_different_pool_identities(self):
         src = copy.deepcopy(self.valid_quote_source)
-        src["dex_execution_quotes"]["buy_quote"]["pool_address"] = "0xpool1111"
-        src["dex_execution_quotes"]["sell_quote"]["pool_address"] = "0xpool2222"
-        res = simulate_multi_size(src, sizes_usd=[100.0], as_of_utc=self.as_of_utc, expected_token_address="0xtoken2222")
+        src["dex_execution_quotes"]["buy_quote"]["pool_address"] = VALID_POOL_ADDR
+        src["dex_execution_quotes"]["sell_quote"]["pool_address"] = VALID_ALT_POOL
+        res = simulate_multi_size(src, sizes_usd=[100.0], as_of_utc=self.as_of_utc, expected_token_address=VALID_TOKEN_ADDR)
         ev = res["size_evaluations"]["$100"]
         self.assertFalse(ev["route_available"])
         self.assertEqual(ev["status"], "POOL_MISMATCH")
 
-    # 9. Incorrect quote-asset address
-    def test_09_incorrect_quote_asset_address(self):
+    # 9. Expected quote asset validation and mismatch rejection
+    def test_09_expected_quote_asset_validation_and_mismatch(self):
         # Case A: Buy in_token != Sell out_token
         src_diff = copy.deepcopy(self.valid_quote_source)
-        src_diff["dex_execution_quotes"]["sell_quote"]["out_token"] = "0xweth"
-        res_diff = simulate_multi_size(src_diff, sizes_usd=[100.0], as_of_utc=self.as_of_utc, expected_token_address="0xtoken2222")
+        src_diff["dex_execution_quotes"]["sell_quote"]["out_token"] = VALID_ALT_QUOTE
+        res_diff = simulate_multi_size(src_diff, sizes_usd=[100.0], as_of_utc=self.as_of_utc, expected_token_address=VALID_TOKEN_ADDR)
         self.assertFalse(res_diff["size_evaluations"]["$100"]["route_available"])
         self.assertEqual(res_diff["size_evaluations"]["$100"]["status"], "QUOTE_ASSET_MISMATCH")
 
@@ -424,11 +513,22 @@ class AdversarialPhase2ExecutionTests(unittest.TestCase):
         src_exp = copy.deepcopy(self.valid_quote_source)
         res_exp = simulate_multi_size(
             src_exp, sizes_usd=[100.0], as_of_utc=self.as_of_utc,
-            expected_token_address="0xtoken2222",
-            expected_quote_asset="0xusdt"
+            expected_token_address=VALID_TOKEN_ADDR,
+            expected_quote_asset=VALID_ALT_QUOTE,
         )
         self.assertFalse(res_exp["size_evaluations"]["$100"]["route_available"])
         self.assertEqual(res_exp["size_evaluations"]["$100"]["status"], "QUOTE_ASSET_MISMATCH")
+
+        # Case C: Missing expected quote asset when required
+        src_req = copy.deepcopy(self.valid_quote_source)
+        res_req = simulate_multi_size(
+            src_req, sizes_usd=[100.0], as_of_utc=self.as_of_utc,
+            expected_token_address=VALID_TOKEN_ADDR,
+            expected_quote_asset=None,
+            require_quote_asset=True,
+        )
+        self.assertFalse(res_req["size_evaluations"]["$100"]["route_available"])
+        self.assertEqual(res_req["size_evaluations"]["$100"]["status"], "MISSING_QUOTE_ASSET_EVIDENCE")
 
     # 10. Incorrect token address despite matching symbol
     def test_10_incorrect_token_address_despite_matching_symbol(self):
@@ -436,195 +536,302 @@ class AdversarialPhase2ExecutionTests(unittest.TestCase):
         src["symbol"] = "PEPE"
         src["dex_execution_quotes"]["symbol"] = "PEPE"
         src["dex_execution_quotes"]["buy_quote"]["symbol"] = "PEPE"
-        # Wrong token address despite matching symbol "PEPE"
-        src["dex_execution_quotes"]["buy_quote"]["out_token"] = "0xfakepepe"
+        src["dex_execution_quotes"]["buy_quote"]["out_token"] = VALID_ALT_TOKEN  # Different valid hex address!
         res = simulate_multi_size(
             src, sizes_usd=[100.0], as_of_utc=self.as_of_utc,
-            expected_token_address="0xtoken2222"
+            expected_token_address=VALID_TOKEN_ADDR,
         )
         ev = res["size_evaluations"]["$100"]
         self.assertFalse(ev["route_available"])
         self.assertEqual(ev["status"], "TOKEN_ADDRESS_MISMATCH")
 
-    # 11. Invalid or malformed token addresses
-    def test_11_invalid_or_malformed_token_addresses(self):
-        for bad_addr in [" 0xtoken2222 ", "0xtoken 2222", "PEPE", "0xtoken:2222", "0xtoken/2222", ""]:
+    # 11. Real blockchain address validation (reject non-hex EVM, invalid length, invalid formats)
+    def test_11_real_blockchain_address_validation(self):
+        # Non-hex EVM addresses
+        self.assertFalse(is_valid_address("ethereum", "0xpool"))
+        self.assertFalse(is_valid_address("ethereum", "0xtoken"))
+        self.assertFalse(is_valid_address("ethereum", "0xtoken2222"))
+        self.assertFalse(is_valid_address("ethereum", "0xpool1111"))
+        self.assertFalse(is_valid_address("ethereum", "0xzzzz111111111111111111111111111111111111"))
+        self.assertFalse(is_valid_address("ethereum", "PEPE"))
+        # Invalid lengths
+        self.assertFalse(is_valid_address("ethereum", "0x111111111111111111111111111111111111111"))  # 41 chars
+        self.assertFalse(is_valid_address("ethereum", "0x11111111111111111111111111111111111111111"))  # 43 chars
+        # Whitespace and punctuation
+        self.assertFalse(is_valid_address("ethereum", f" {VALID_TOKEN_ADDR} "))
+        self.assertFalse(is_valid_address("ethereum", f"{VALID_TOKEN_ADDR[:20]} {VALID_TOKEN_ADDR[20:]}"))
+        self.assertFalse(is_valid_address("ethereum", f"{VALID_TOKEN_ADDR[:20]}:{VALID_TOKEN_ADDR[21:]}"))
+        self.assertFalse(is_valid_address("ethereum", f"{VALID_TOKEN_ADDR[:20]}/{VALID_TOKEN_ADDR[21:]}"))
+
+        # Valid EVM addresses
+        self.assertTrue(is_valid_address("ethereum", VALID_TOKEN_ADDR))
+        self.assertTrue(is_valid_address("base", VALID_QUOTE_ADDR))
+        self.assertTrue(is_valid_address("arbitrum", VALID_POOL_ADDR))
+
+        # Solana validation
+        self.assertTrue(is_valid_address("solana", VALID_SOLANA_TOKEN))
+        self.assertFalse(is_valid_address("solana", VALID_TOKEN_ADDR))  # EVM 0x rejected on Solana
+        self.assertFalse(is_valid_address("solana", "too_short"))
+
+    # 12. Mandatory explicit BUY and SELL direction
+    def test_12_mandatory_explicit_swap_direction(self):
+        # Non-BUY on buy quote
+        for bad_dir in ["SELL", "EXACT_IN", "SWAP", "", None]:
             src = copy.deepcopy(self.valid_quote_source)
-            src["dex_execution_quotes"]["buy_quote"]["out_token"] = bad_addr
-            res = simulate_multi_size(
-                src, sizes_usd=[100.0], as_of_utc=self.as_of_utc,
-                expected_token_address="0xtoken2222"
-            )
+            src["dex_execution_quotes"]["buy_quote"]["direction"] = bad_dir
+            res = simulate_multi_size(src, sizes_usd=[100.0], as_of_utc=self.as_of_utc, expected_token_address=VALID_TOKEN_ADDR)
             ev = res["size_evaluations"]["$100"]
             self.assertFalse(ev["route_available"])
-            self.assertIn(ev["status"], {"INVALID_TOKEN_ADDRESS", "MISSING_TOKEN_ADDRESS"})
+            self.assertEqual(ev["status"], "DIRECTION_MISMATCH")
 
-    # 12. Missing configured intended trade size despite quote-size fields being present
-    def test_12_missing_configured_intended_trade_size_despite_quote_size_present(self):
-        from scripts import v425_early_breakout as v425
-        cand = copy.deepcopy(self.valid_quote_source)
-        # Delete configured trade size
-        del cand["intended_trade_size_usd"]
-        # Quote size is explicitly present in quotes
-        cand["dex_execution_quotes"]["notional_size_usd"] = 100.0
-        cand["dex_execution_quotes"]["buy_quote"]["notional_size_usd"] = 100.0
-        cand["dex_execution_quotes"]["sell_quote"]["notional_size_usd"] = 100.0
-        # Mandatory fields for candidate
-        cand["market_type"] = "dex_pool"
-        cand["final_price_usd"] = 100.0
-        cand["target_price"] = 140.0
-        cand["target_price_source"] = "7D_SWING_RESISTANCE"
+        # Non-SELL on sell quote
+        for bad_dir in ["BUY", "EXACT_OUT", "SWAP", "", None]:
+            src = copy.deepcopy(self.valid_quote_source)
+            src["dex_execution_quotes"]["sell_quote"]["direction"] = bad_dir
+            res = simulate_multi_size(src, sizes_usd=[100.0], as_of_utc=self.as_of_utc, expected_token_address=VALID_TOKEN_ADDR)
+            ev = res["size_evaluations"]["$100"]
+            self.assertFalse(ev["route_available"])
+            self.assertEqual(ev["status"], "DIRECTION_MISMATCH")
 
-        qualified = v425.qualify_final_actionable_candidates([cand], self.now_dt)
-        self.assertEqual(len(qualified), 0)
-        self.assertIn("intended trade size is missing or unconfigured for execution simulation", cand["qualification_blockers"])
+    # 13. Mandatory positive and finite amounts on both quotes
+    def test_13_mandatory_positive_finite_amounts(self):
+        # Buy leg: zero, negative, NaN
+        for bad_val in [0.0, -10.0, float("nan"), float("inf"), None]:
+            src_in = copy.deepcopy(self.valid_quote_source)
+            src_in["dex_execution_quotes"]["buy_quote"]["in_amount"] = bad_val
+            res_in = simulate_multi_size(src_in, sizes_usd=[100.0], as_of_utc=self.as_of_utc, expected_token_address=VALID_TOKEN_ADDR)
+            self.assertFalse(res_in["size_evaluations"]["$100"]["route_available"])
+            self.assertEqual(res_in["size_evaluations"]["$100"]["status"], "INVALID_BUY_QUOTE_AMOUNTS")
 
-    # 13. Zero, negative, NaN, and infinite intended trade sizes
-    def test_13_zero_negative_nan_infinite_intended_trade_sizes(self):
-        from scripts import v425_early_breakout as v425
-        for invalid_size in [0.0, -100.0, float("nan"), float("inf"), -float("inf")]:
-            cand = copy.deepcopy(self.valid_quote_source)
-            cand["intended_trade_size_usd"] = invalid_size
-            cand["market_type"] = "dex_pool"
-            cand["final_price_usd"] = 100.0
-            cand["target_price"] = 140.0
-            cand["target_price_source"] = "7D_SWING_RESISTANCE"
+            src_out = copy.deepcopy(self.valid_quote_source)
+            src_out["dex_execution_quotes"]["buy_quote"]["out_amount"] = bad_val
+            res_out = simulate_multi_size(src_out, sizes_usd=[100.0], as_of_utc=self.as_of_utc, expected_token_address=VALID_TOKEN_ADDR)
+            self.assertFalse(res_out["size_evaluations"]["$100"]["route_available"])
+            self.assertEqual(res_out["size_evaluations"]["$100"]["status"], "INVALID_BUY_QUOTE_AMOUNTS")
 
-            qualified = v425.qualify_final_actionable_candidates([cand], self.now_dt)
-            self.assertEqual(len(qualified), 0)
-            self.assertIn("intended trade size must be a positive finite number", cand["qualification_blockers"])
+        # Sell leg: zero, negative, NaN
+        for bad_val in [0.0, -10.0, float("nan"), float("inf"), None]:
+            src_sell_in = copy.deepcopy(self.valid_quote_source)
+            src_sell_in["dex_execution_quotes"]["sell_quote"]["in_amount"] = bad_val
+            res_sell_in = simulate_multi_size(src_sell_in, sizes_usd=[100.0], as_of_utc=self.as_of_utc, expected_token_address=VALID_TOKEN_ADDR)
+            self.assertFalse(res_sell_in["size_evaluations"]["$100"]["route_available"])
+            self.assertEqual(res_sell_in["size_evaluations"]["$100"]["status"], "INVALID_SELL_QUOTE_AMOUNTS")
 
-    # 14. Buy quote size matching but sell quote size mismatching
-    def test_14_buy_quote_size_matching_but_sell_quote_size_mismatching(self):
-        src = copy.deepcopy(self.valid_quote_source)
-        src["dex_execution_quotes"]["buy_quote"]["notional_size_usd"] = 100.0  # Matches $100
-        src["dex_execution_quotes"]["sell_quote"]["notional_size_usd"] = 50.0   # Mismatches $100
-        res = simulate_multi_size(src, sizes_usd=[100.0], as_of_utc=self.as_of_utc, expected_token_address="0xtoken2222")
-        ev = res["size_evaluations"]["$100"]
+            src_sell_out = copy.deepcopy(self.valid_quote_source)
+            src_sell_out["dex_execution_quotes"]["sell_quote"]["out_amount"] = bad_val
+            res_sell_out = simulate_multi_size(src_sell_out, sizes_usd=[100.0], as_of_utc=self.as_of_utc, expected_token_address=VALID_TOKEN_ADDR)
+            self.assertFalse(res_sell_out["size_evaluations"]["$100"]["route_available"])
+            self.assertEqual(res_sell_out["size_evaluations"]["$100"]["status"], "INVALID_SELL_QUOTE_AMOUNTS")
+
+    # 14. Round-trip token quantity reconciliation
+    def test_14_round_trip_token_quantity_reconciliation(self):
+        # Buy output quantity is 50.0 tokens. If sell input quantity is 10.0 (or 100.0), mismatch!
+        src_mismatch = copy.deepcopy(self.valid_quote_source)
+        src_mismatch["dex_execution_quotes"]["buy_quote"]["out_amount"] = 50.0
+        src_mismatch["dex_execution_quotes"]["sell_quote"]["in_amount"] = 10.0
+        res_mismatch = simulate_multi_size(src_mismatch, sizes_usd=[100.0], as_of_utc=self.as_of_utc, expected_token_address=VALID_TOKEN_ADDR)
+        ev = res_mismatch["size_evaluations"]["$100"]
         self.assertFalse(ev["route_available"])
-        self.assertFalse(ev["quote_verified_for_size"])
-        self.assertEqual(ev["status"], "ORDER_SIZE_MISMATCH")
+        self.assertEqual(ev["status"], "QUANTITY_MISMATCH")
 
-    # 15. Exact size-tolerance boundary and values immediately outside it
-    def test_15_exact_size_tolerance_boundary_and_values_immediately_outside(self):
-        # 1.0% tolerance on $100 target: allowed range is exactly $99.00 to $101.00
-        # Inside boundaries: $101.00 and $99.00
+        # Exact boundary test for 0.1% quantity tolerance:
+        # 50.0 * 0.001 = 0.05
+        # 50.05 is exactly 0.1% -> passes!
+        src_boundary_pass = copy.deepcopy(self.valid_quote_source)
+        src_boundary_pass["dex_execution_quotes"]["buy_quote"]["out_amount"] = 50.0
+        src_boundary_pass["dex_execution_quotes"]["sell_quote"]["in_amount"] = 50.05
+        res_pass = simulate_multi_size(src_boundary_pass, sizes_usd=[100.0], as_of_utc=self.as_of_utc, expected_token_address=VALID_TOKEN_ADDR, quantity_tolerance_pct=0.1)
+        self.assertTrue(res_pass["size_evaluations"]["$100"]["route_available"])
+
+        # 50.10 is 0.2% (> 0.1%) -> fails!
+        src_boundary_fail = copy.deepcopy(self.valid_quote_source)
+        src_boundary_fail["dex_execution_quotes"]["buy_quote"]["out_amount"] = 50.0
+        src_boundary_fail["dex_execution_quotes"]["sell_quote"]["in_amount"] = 50.10
+        res_fail = simulate_multi_size(src_boundary_fail, sizes_usd=[100.0], as_of_utc=self.as_of_utc, expected_token_address=VALID_TOKEN_ADDR, quantity_tolerance_pct=0.1)
+        self.assertFalse(res_fail["size_evaluations"]["$100"]["route_available"])
+        self.assertEqual(res_fail["size_evaluations"]["$100"]["status"], "QUANTITY_MISMATCH")
+
+    # 15. Configured trade size enforcement & exact size-tolerance boundary
+    def test_15_configured_trade_size_enforcement_and_boundary(self):
+        # 1.0% tolerance on $100 target: allowed range is $99.00 to $101.00
         src_101 = copy.deepcopy(self.valid_quote_source)
         src_101["dex_execution_quotes"]["buy_quote"]["notional_size_usd"] = 101.0
         src_101["dex_execution_quotes"]["sell_quote"]["notional_size_usd"] = 101.0
-        res_101 = simulate_multi_size(src_101, sizes_usd=[100.0], as_of_utc=self.as_of_utc, size_tolerance_pct=1.0, expected_token_address="0xtoken2222")
+        res_101 = simulate_multi_size(src_101, sizes_usd=[100.0], as_of_utc=self.as_of_utc, size_tolerance_pct=1.0, expected_token_address=VALID_TOKEN_ADDR)
         self.assertTrue(res_101["size_evaluations"]["$100"]["route_available"])
-        self.assertEqual(res_101["size_evaluations"]["$100"]["status"], "EXECUTABLE_ROUTE_AVAILABLE")
 
         src_99 = copy.deepcopy(self.valid_quote_source)
         src_99["dex_execution_quotes"]["buy_quote"]["notional_size_usd"] = 99.0
         src_99["dex_execution_quotes"]["sell_quote"]["notional_size_usd"] = 99.0
-        res_99 = simulate_multi_size(src_99, sizes_usd=[100.0], as_of_utc=self.as_of_utc, size_tolerance_pct=1.0, expected_token_address="0xtoken2222")
+        res_99 = simulate_multi_size(src_99, sizes_usd=[100.0], as_of_utc=self.as_of_utc, size_tolerance_pct=1.0, expected_token_address=VALID_TOKEN_ADDR)
         self.assertTrue(res_99["size_evaluations"]["$100"]["route_available"])
-        self.assertEqual(res_99["size_evaluations"]["$100"]["status"], "EXECUTABLE_ROUTE_AVAILABLE")
 
-        # Outside boundaries: $101.01 and $98.99
+        # Values immediately outside boundary
         src_101_01 = copy.deepcopy(self.valid_quote_source)
         src_101_01["dex_execution_quotes"]["buy_quote"]["notional_size_usd"] = 101.01
         src_101_01["dex_execution_quotes"]["sell_quote"]["notional_size_usd"] = 101.01
-        res_101_01 = simulate_multi_size(src_101_01, sizes_usd=[100.0], as_of_utc=self.as_of_utc, size_tolerance_pct=1.0, expected_token_address="0xtoken2222")
+        res_101_01 = simulate_multi_size(src_101_01, sizes_usd=[100.0], as_of_utc=self.as_of_utc, size_tolerance_pct=1.0, expected_token_address=VALID_TOKEN_ADDR)
         self.assertFalse(res_101_01["size_evaluations"]["$100"]["route_available"])
         self.assertEqual(res_101_01["size_evaluations"]["$100"]["status"], "ORDER_SIZE_MISMATCH")
 
         src_98_99 = copy.deepcopy(self.valid_quote_source)
         src_98_99["dex_execution_quotes"]["buy_quote"]["notional_size_usd"] = 98.99
         src_98_99["dex_execution_quotes"]["sell_quote"]["notional_size_usd"] = 98.99
-        res_98_99 = simulate_multi_size(src_98_99, sizes_usd=[100.0], as_of_utc=self.as_of_utc, size_tolerance_pct=1.0, expected_token_address="0xtoken2222")
+        res_98_99 = simulate_multi_size(src_98_99, sizes_usd=[100.0], as_of_utc=self.as_of_utc, size_tolerance_pct=1.0, expected_token_address=VALID_TOKEN_ADDR)
         self.assertFalse(res_98_99["size_evaluations"]["$100"]["route_available"])
         self.assertEqual(res_98_99["size_evaluations"]["$100"]["status"], "ORDER_SIZE_MISMATCH")
 
-    # 16. AMM reserves belonging to the wrong pool
-    def test_16_amm_reserves_belonging_to_the_wrong_pool(self):
-        src_amm = {
-            "chain": "ethereum",
+    # 16. AMM reserve identity on snapshot itself (no inheritance from candidate)
+    def test_16_amm_reserve_identity_on_snapshot_itself(self):
+        # Missing chain on reserve snapshot itself
+        src_no_chain = {
+            "chain": VALID_EVM_CHAIN,  # On parent, but must not be inherited!
             "amm_reserves": {
-                "chain": "ethereum",
-                "pool_address": "0xWRONG_POOL",
-                "token0": "0xtoken2222",
-                "token1": "0xusdc",
+                "pool_address": VALID_POOL_ADDR,
+                "token0": VALID_TOKEN_ADDR,
+                "token1": VALID_QUOTE_ADDR,
                 "reserve_base": 10000.0,
                 "reserve_quote": 50000.0,
                 "timestamp_utc": self.as_of_utc,
             },
         }
-        res = simulate_multi_size(
-            src_amm, sizes_usd=[100.0], as_of_utc=self.as_of_utc,
-            expected_pool="0xpool1111",
-            expected_token_address="0xtoken2222",
-            require_reserve_identity=True,
+        res_chain = simulate_multi_size(
+            src_no_chain, sizes_usd=[100.0], as_of_utc=self.as_of_utc,
+            expected_pool=VALID_POOL_ADDR, expected_token_address=VALID_TOKEN_ADDR,
         )
-        ev = res["size_evaluations"]["$100"]
-        self.assertFalse(ev["route_available"])
-        self.assertEqual(ev["status"], "AMM_POOL_MISMATCH")
+        self.assertFalse(res_chain["size_evaluations"]["$100"]["route_available"])
+        self.assertEqual(res_chain["size_evaluations"]["$100"]["status"], "MISSING_AMM_CHAIN_IDENTITY")
 
-    # 17. AMM reserves with wrong token identity or orientation
-    def test_17_amm_reserves_with_wrong_token_identity_or_orientation(self):
-        src_amm = {
-            "chain": "ethereum",
-            "amm_reserves": {
-                "chain": "ethereum",
-                "pool_address": "0xpool1111",
-                "token0": "0xWRONG_TOKEN_A",
-                "token1": "0xWRONG_TOKEN_B",
-                "reserve_base": 10000.0,
-                "reserve_quote": 50000.0,
-                "timestamp_utc": self.as_of_utc,
-            },
-        }
-        res = simulate_multi_size(
-            src_amm, sizes_usd=[100.0], as_of_utc=self.as_of_utc,
-            expected_pool="0xpool1111",
-            expected_token_address="0xtoken2222",
-            require_reserve_identity=True,
-        )
-        ev = res["size_evaluations"]["$100"]
-        self.assertFalse(ev["route_available"])
-        self.assertEqual(ev["status"], "AMM_TOKEN_MISMATCH")
-
-    # 18. AMM reserves with missing chain or pool evidence
-    def test_18_amm_reserves_with_missing_chain_or_pool_evidence(self):
-        # Missing pool
+        # Missing pool on reserve snapshot itself
         src_no_pool = {
+            "pool_address": VALID_POOL_ADDR,  # On parent, but must not be inherited!
             "amm_reserves": {
-                "chain": "ethereum",
-                "token0": "0xtoken2222",
-                "token1": "0xusdc",
+                "chain": VALID_EVM_CHAIN,
+                "token0": VALID_TOKEN_ADDR,
+                "token1": VALID_QUOTE_ADDR,
                 "reserve_base": 10000.0,
                 "reserve_quote": 50000.0,
                 "timestamp_utc": self.as_of_utc,
             },
         }
-        res_no_pool = simulate_multi_size(
+        res_pool = simulate_multi_size(
             src_no_pool, sizes_usd=[100.0], as_of_utc=self.as_of_utc,
-            expected_pool="0xpool1111",
-            require_reserve_identity=True,
+            expected_token_address=VALID_TOKEN_ADDR,
         )
-        self.assertFalse(res_no_pool["size_evaluations"]["$100"]["route_available"])
-        self.assertEqual(res_no_pool["size_evaluations"]["$100"]["status"], "MISSING_AMM_POOL_IDENTITY")
+        self.assertFalse(res_pool["size_evaluations"]["$100"]["route_available"])
+        self.assertEqual(res_pool["size_evaluations"]["$100"]["status"], "MISSING_AMM_POOL_IDENTITY")
+
+        # Missing token0/token1
+        src_no_tokens = {
+            "amm_reserves": {
+                "chain": VALID_EVM_CHAIN,
+                "pool_address": VALID_POOL_ADDR,
+                "reserve_base": 10000.0,
+                "reserve_quote": 50000.0,
+                "timestamp_utc": self.as_of_utc,
+            },
+        }
+        res_tokens = simulate_multi_size(
+            src_no_tokens, sizes_usd=[100.0], as_of_utc=self.as_of_utc,
+            expected_token_address=VALID_TOKEN_ADDR,
+        )
+        self.assertFalse(res_tokens["size_evaluations"]["$100"]["route_available"])
+        self.assertEqual(res_tokens["size_evaluations"]["$100"]["status"], "MISSING_AMM_TOKEN_IDENTITY")
+
+    # 17. AMM reserve token orientation and expected quote asset
+    def test_17_amm_reserve_token_orientation_and_quote_asset(self):
+        # Tokens do not match candidate and quote asset
+        src_wrong_tokens = {
+            "amm_reserves": {
+                "chain": VALID_EVM_CHAIN,
+                "pool_address": VALID_POOL_ADDR,
+                "token0": VALID_ALT_TOKEN,
+                "token1": VALID_ALT_QUOTE,
+                "reserve_base": 10000.0,
+                "reserve_quote": 50000.0,
+                "timestamp_utc": self.as_of_utc,
+            },
+        }
+        res_wrong = simulate_multi_size(
+            src_wrong_tokens, sizes_usd=[100.0], as_of_utc=self.as_of_utc,
+            expected_pool=VALID_POOL_ADDR, expected_token_address=VALID_TOKEN_ADDR, expected_quote_asset=VALID_QUOTE_ADDR,
+        )
+        self.assertFalse(res_wrong["size_evaluations"]["$100"]["route_available"])
+        self.assertEqual(res_wrong["size_evaluations"]["$100"]["status"], "AMM_TOKEN_MISMATCH")
+
+        # Candidate token matches, but quote asset does not match expected_quote_asset
+        src_wrong_quote = {
+            "amm_reserves": {
+                "chain": VALID_EVM_CHAIN,
+                "pool_address": VALID_POOL_ADDR,
+                "token0": VALID_TOKEN_ADDR,
+                "token1": VALID_ALT_QUOTE,  # WETH instead of USDC
+                "reserve_base": 10000.0,
+                "reserve_quote": 50000.0,
+                "timestamp_utc": self.as_of_utc,
+            },
+        }
+        res_quote = simulate_multi_size(
+            src_wrong_quote, sizes_usd=[100.0], as_of_utc=self.as_of_utc,
+            expected_pool=VALID_POOL_ADDR, expected_token_address=VALID_TOKEN_ADDR, expected_quote_asset=VALID_QUOTE_ADDR,
+        )
+        self.assertFalse(res_quote["size_evaluations"]["$100"]["route_available"])
+        self.assertEqual(res_quote["size_evaluations"]["$100"]["status"], "QUOTE_ASSET_MISMATCH")
+
+    # 18. Order-book identity validation
+    def test_18_order_book_identity_validation(self):
+        base_book = {
+            "timestamp_utc": self.as_of_utc,
+            "bids": [[99.0, 10.0]],
+            "asks": [[101.0, 10.0]],
+        }
 
         # Missing chain
-        src_no_chain = {
-            "amm_reserves": {
-                "pool_address": "0xpool1111",
-                "token0": "0xtoken2222",
-                "token1": "0xusdc",
-                "reserve_base": 10000.0,
-                "reserve_quote": 50000.0,
-                "timestamp_utc": self.as_of_utc,
-            },
-        }
-        res_no_chain = simulate_multi_size(
-            src_no_chain, sizes_usd=[100.0], as_of_utc=self.as_of_utc,
-            expected_chain="ethereum",
-            require_reserve_identity=True,
+        book_no_chain = copy.deepcopy(base_book)
+        book_no_chain["pool_address"] = VALID_POOL_ADDR
+        book_no_chain["token_address"] = VALID_TOKEN_ADDR
+        res = simulate_multi_size(book_no_chain, sizes_usd=[100.0], as_of_utc=self.as_of_utc, expected_token_address=VALID_TOKEN_ADDR)
+        self.assertFalse(res["size_evaluations"]["$100"]["route_available"])
+        self.assertEqual(res["size_evaluations"]["$100"]["status"], "MISSING_BOOK_CHAIN_IDENTITY")
+
+        # Missing pool
+        book_no_pool = copy.deepcopy(base_book)
+        book_no_pool["chain"] = VALID_EVM_CHAIN
+        book_no_pool["token_address"] = VALID_TOKEN_ADDR
+        res = simulate_multi_size(book_no_pool, sizes_usd=[100.0], as_of_utc=self.as_of_utc, expected_token_address=VALID_TOKEN_ADDR)
+        self.assertFalse(res["size_evaluations"]["$100"]["route_available"])
+        self.assertEqual(res["size_evaluations"]["$100"]["status"], "MISSING_BOOK_POOL_IDENTITY")
+
+        # Missing token
+        book_no_token = copy.deepcopy(base_book)
+        book_no_token["chain"] = VALID_EVM_CHAIN
+        book_no_token["pool_address"] = VALID_POOL_ADDR
+        res = simulate_multi_size(book_no_token, sizes_usd=[100.0], as_of_utc=self.as_of_utc, expected_token_address=VALID_TOKEN_ADDR)
+        self.assertFalse(res["size_evaluations"]["$100"]["route_available"])
+        self.assertEqual(res["size_evaluations"]["$100"]["status"], "MISSING_BOOK_TOKEN_IDENTITY")
+
+        # Token mismatch
+        book_wrong_token = copy.deepcopy(base_book)
+        book_wrong_token["chain"] = VALID_EVM_CHAIN
+        book_wrong_token["pool_address"] = VALID_POOL_ADDR
+        book_wrong_token["token_address"] = VALID_ALT_TOKEN
+        res = simulate_multi_size(book_wrong_token, sizes_usd=[100.0], as_of_utc=self.as_of_utc, expected_token_address=VALID_TOKEN_ADDR)
+        self.assertFalse(res["size_evaluations"]["$100"]["route_available"])
+        self.assertEqual(res["size_evaluations"]["$100"]["status"], "BOOK_TOKEN_MISMATCH")
+
+        # Fully evidenced valid order book passes
+        valid_book = copy.deepcopy(base_book)
+        valid_book["chain"] = VALID_EVM_CHAIN
+        valid_book["pool_address"] = VALID_POOL_ADDR
+        valid_book["token_address"] = VALID_TOKEN_ADDR
+        valid_book["quote_asset"] = VALID_QUOTE_ADDR
+        res_ok = simulate_multi_size(
+            valid_book, sizes_usd=[100.0], as_of_utc=self.as_of_utc,
+            expected_token_address=VALID_TOKEN_ADDR, expected_chain=VALID_EVM_CHAIN,
+            expected_pool=VALID_POOL_ADDR, expected_quote_asset=VALID_QUOTE_ADDR,
         )
-        self.assertFalse(res_no_chain["size_evaluations"]["$100"]["route_available"])
-        self.assertEqual(res_no_chain["size_evaluations"]["$100"]["status"], "MISSING_AMM_CHAIN_IDENTITY")
+        self.assertTrue(res_ok["size_evaluations"]["$100"]["route_available"])
+        self.assertEqual(res_ok["size_evaluations"]["$100"]["status"], "EXECUTABLE_DEPTH_AVAILABLE")
 
     # 19. Invalid fees passed through simulate_multi_size()
     def test_19_invalid_fees_passed_through_simulate_multi_size(self):
@@ -638,7 +845,6 @@ class AdversarialPhase2ExecutionTests(unittest.TestCase):
 
     # 20. Invalid fees never silently defaulted or clamped
     def test_20_invalid_fees_never_silently_defaulted_or_clamped(self):
-        # Direct validate_fee_bps rejects
         with self.assertRaisesRegex(ValueError, "INVALID_FEE_DATA"):
             validate_fee_bps(-0.01)
         with self.assertRaisesRegex(ValueError, "INVALID_FEE_DATA"):
@@ -648,14 +854,15 @@ class AdversarialPhase2ExecutionTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "INVALID_FEE_DATA"):
             validate_fee_bps(10000.0)
 
-        # In simulate
-        book = {"timestamp_utc": self.as_of_utc, "bids": [[99.0, 1.0]], "asks": [[101.0, 1.0]]}
+        book = {
+            "chain": VALID_EVM_CHAIN, "pool_address": VALID_POOL_ADDR, "token_address": VALID_TOKEN_ADDR,
+            "timestamp_utc": self.as_of_utc, "bids": [[99.0, 1.0]], "asks": [[101.0, 1.0]],
+        }
         with self.assertRaisesRegex(ValueError, "INVALID_FEE_DATA"):
             simulate(book, buy_notional_usd=100.0, fee_bps=-5.0)
 
-        # In simulate_constant_product_amm
         with self.assertRaisesRegex(ValueError, "INVALID_FEE_DATA"):
-            simulate_constant_product_amm(1000.0, 1000.0, buy_notional_usd=100.0, fee_bps=-5.0)
+            simulate_constant_product_amm(1000.0, 1000.0, buy_notional_usd=100.0, fee_bps=-5.0, require_reserve_identity=False)
 
     # 21. Production qualification rejects every unverified execution case
     def test_21_production_qualification_rejects_every_unverified_execution_case(self):
@@ -663,12 +870,12 @@ class AdversarialPhase2ExecutionTests(unittest.TestCase):
 
         base_cand = {
             "market_type": "dex_pool",
-            "chain": "ethereum",
-            "pool_address": "0xpool1111",
-            "contract_address": "0xtoken2222",
-            "final_pool_address": "0xpool1111",
-            "final_token_contract": "0xtoken2222",
-            "final_quote_chain": "ethereum",
+            "chain": VALID_EVM_CHAIN,
+            "pool_address": VALID_POOL_ADDR,
+            "contract_address": VALID_TOKEN_ADDR,
+            "final_pool_address": VALID_POOL_ADDR,
+            "final_token_contract": VALID_TOKEN_ADDR,
+            "final_quote_chain": VALID_EVM_CHAIN,
             "final_quote_token_orientation_verified": True,
             "final_price_usd": 100.0,
             "final_price_timestamp_utc": self.as_of_utc,
@@ -676,13 +883,15 @@ class AdversarialPhase2ExecutionTests(unittest.TestCase):
             "target_price": 140.0,
             "target_price_source": "7D_SWING_RESISTANCE",
             "intended_trade_size_usd": 100.0,
+            "quote_token_address": VALID_QUOTE_ADDR,
+            "expected_quote_asset": VALID_QUOTE_ADDR,
             "liquidity_usd": 100_000.0,
             "fee_bps": 30.0,
             "technical_tp_validation": {
                 "status": "PASS",
-                "chain": "ethereum",
-                "pool_address": "0xpool1111",
-                "token_address": "0xtoken2222",
+                "chain": VALID_EVM_CHAIN,
+                "pool_address": VALID_POOL_ADDR,
+                "token_address": VALID_TOKEN_ADDR,
                 "token_orientation_verified": True,
                 "target_price": 140.0,
                 "target_price_source": "7D_SWING_RESISTANCE",
@@ -691,7 +900,7 @@ class AdversarialPhase2ExecutionTests(unittest.TestCase):
                 "maximum_tp_distance_pct": 40.0,
                 "candle_retrieved_utc": self.as_of_utc,
             },
-            "trade_plan": {"single_take_profit": 140.0, "intended_trade_size_usd": 100.0},
+            "trade_plan": {"single_take_profit": 140.0, "intended_trade_size_usd": 100.0, "quote_token_address": VALID_QUOTE_ADDR},
             "dex_loss_guard_status": "PASS",
             "dex_loss_guard_evidence": {
                 "status": "PASS",
@@ -723,7 +932,7 @@ class AdversarialPhase2ExecutionTests(unittest.TestCase):
 
         # Case C: Identity mismatch
         cand_ident_mismatch = copy.deepcopy(base_cand)
-        cand_ident_mismatch["dex_execution_quotes"]["buy_quote"]["out_token"] = "0xwrongtoken"
+        cand_ident_mismatch["dex_execution_quotes"]["buy_quote"]["out_token"] = VALID_ALT_TOKEN
         self.assertEqual(len(v425.qualify_final_actionable_candidates([cand_ident_mismatch], self.now_dt)), 0)
         self.assertTrue(any("execution identity verification failed" in b for b in cand_ident_mismatch["qualification_blockers"]))
 
@@ -733,23 +942,32 @@ class AdversarialPhase2ExecutionTests(unittest.TestCase):
         self.assertEqual(len(v425.qualify_final_actionable_candidates([cand_dir], self.now_dt)), 0)
         self.assertTrue(any("execution identity verification failed: DIRECTION_MISMATCH" in b for b in cand_dir["qualification_blockers"]))
 
-        # Case E: Heuristic only (no book, no quotes, no AMM)
-        cand_heur = copy.deepcopy(base_cand)
-        del cand_heur["dex_execution_quotes"]
-        self.assertEqual(len(v425.qualify_final_actionable_candidates([cand_heur], self.now_dt)), 0)
-        self.assertTrue(any("approximate heuristic" in b or "fresh two-way execution quotes are missing" in b for b in cand_heur["qualification_blockers"]))
+        # Case E: Round-trip token quantity mismatch
+        cand_qty = copy.deepcopy(base_cand)
+        cand_qty["dex_execution_quotes"]["buy_quote"]["out_amount"] = 50.0
+        cand_qty["dex_execution_quotes"]["sell_quote"]["in_amount"] = 10.0
+        self.assertEqual(len(v425.qualify_final_actionable_candidates([cand_qty], self.now_dt)), 0)
+        self.assertIn("execution simulation round-trip token quantity mismatch", cand_qty["qualification_blockers"])
+
+        # Case F: Missing configured quote asset
+        cand_no_quote_asset = copy.deepcopy(base_cand)
+        del cand_no_quote_asset["quote_token_address"]
+        del cand_no_quote_asset["expected_quote_asset"]
+        del cand_no_quote_asset["trade_plan"]["quote_token_address"]
+        self.assertEqual(len(v425.qualify_final_actionable_candidates([cand_no_quote_asset], self.now_dt)), 0)
+        self.assertIn("expected quote asset is missing, unconfigured, or invalid", cand_no_quote_asset["qualification_blockers"])
 
     # 22. Existing valid, fully evidenced scenarios continue to work
     def test_22_existing_valid_fully_evidenced_scenarios_continue_to_work(self):
         from scripts import v425_early_breakout as v425
         cand = {
             "market_type": "dex_pool",
-            "chain": "ethereum",
-            "pool_address": "0xpool1111",
-            "contract_address": "0xtoken2222",
-            "final_pool_address": "0xpool1111",
-            "final_token_contract": "0xtoken2222",
-            "final_quote_chain": "ethereum",
+            "chain": VALID_EVM_CHAIN,
+            "pool_address": VALID_POOL_ADDR,
+            "contract_address": VALID_TOKEN_ADDR,
+            "final_pool_address": VALID_POOL_ADDR,
+            "final_token_contract": VALID_TOKEN_ADDR,
+            "final_quote_chain": VALID_EVM_CHAIN,
             "final_quote_token_orientation_verified": True,
             "final_price_usd": 100.0,
             "final_price_timestamp_utc": self.as_of_utc,
@@ -757,13 +975,15 @@ class AdversarialPhase2ExecutionTests(unittest.TestCase):
             "target_price": 140.0,
             "target_price_source": "7D_SWING_RESISTANCE",
             "intended_trade_size_usd": 100.0,
+            "quote_token_address": VALID_QUOTE_ADDR,
+            "expected_quote_asset": VALID_QUOTE_ADDR,
             "liquidity_usd": 100_000.0,
             "fee_bps": 30.0,
             "technical_tp_validation": {
                 "status": "PASS",
-                "chain": "ethereum",
-                "pool_address": "0xpool1111",
-                "token_address": "0xtoken2222",
+                "chain": VALID_EVM_CHAIN,
+                "pool_address": VALID_POOL_ADDR,
+                "token_address": VALID_TOKEN_ADDR,
                 "token_orientation_verified": True,
                 "target_price": 140.0,
                 "target_price_source": "7D_SWING_RESISTANCE",
@@ -772,7 +992,7 @@ class AdversarialPhase2ExecutionTests(unittest.TestCase):
                 "maximum_tp_distance_pct": 40.0,
                 "candle_retrieved_utc": self.as_of_utc,
             },
-            "trade_plan": {"single_take_profit": 140.0, "intended_trade_size_usd": 100.0},
+            "trade_plan": {"single_take_profit": 140.0, "intended_trade_size_usd": 100.0, "quote_token_address": VALID_QUOTE_ADDR},
             "dex_loss_guard_status": "PASS",
             "dex_loss_guard_evidence": {
                 "status": "PASS",

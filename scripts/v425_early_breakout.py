@@ -1781,11 +1781,11 @@ def qualify_final_actionable_candidates(candidates: list[dict[str, Any]], now: d
     try:
         from scripts.tp_gate import canonical_tp_upside
         from scripts.address_identity import same_address
-        from scripts.execution_simulator import simulate_multi_size
+        from scripts.execution_simulator import simulate_multi_size, is_valid_address
     except ImportError:
         from tp_gate import canonical_tp_upside
         from address_identity import same_address
-        from execution_simulator import simulate_multi_size
+        from execution_simulator import simulate_multi_size, is_valid_address
     actionable = []
     for candidate in candidates:
         if not isinstance(candidate, dict):
@@ -1882,7 +1882,21 @@ def qualify_final_actionable_candidates(candidates: list[dict[str, Any]], now: d
             else:
                 intended_size = intended_num
 
-        if intended_size is not None:
+        raw_quote_asset = (
+            candidate.get("expected_quote_asset") or
+            candidate.get("quote_token_address") or
+            candidate.get("quote_asset_address") or
+            plan.get("expected_quote_asset") or
+            plan.get("quote_token_address") or
+            plan.get("quote_asset_address")
+        )
+        if not raw_quote_asset or not is_valid_address(candidate.get("chain"), raw_quote_asset):
+            sim_blockers.append("expected quote asset is missing, unconfigured, or invalid")
+            expected_quote = None
+        else:
+            expected_quote = raw_quote_asset
+
+        if intended_size is not None and expected_quote is not None:
             sim_now_iso = (
                 now.isoformat().replace("+00:00", "Z")
                 if now.tzinfo else
@@ -1900,8 +1914,10 @@ def qualify_final_actionable_candidates(candidates: list[dict[str, Any]], now: d
                 expected_token_address=contract,
                 expected_chain=candidate.get("chain"),
                 expected_pool=pool,
+                expected_quote_asset=expected_quote,
                 require_pool_identity=True,
                 require_reserve_identity=True,
+                require_quote_asset=True,
             )
             size_key = f"${int(intended_size) if intended_size.is_integer() else intended_size}"
             sim_eval = sim_res.get("size_evaluations", {}).get(size_key) or {}
@@ -1928,11 +1944,23 @@ def qualify_final_actionable_candidates(candidates: list[dict[str, Any]], now: d
             elif not sim_fresh_ok:
                 sim_blockers.append("buy/sell quotes are stale, future-dated, or missing a timestamp")
 
-            if sim_status in {"MISSING_TOKEN_ADDRESS", "INVALID_TOKEN_ADDRESS", "TOKEN_ADDRESS_MISMATCH", "QUOTE_ASSET_MISMATCH", "DIRECTION_MISMATCH", "MISSING_CHAIN_IDENTITY", "CHAIN_MISMATCH", "MISSING_POOL_IDENTITY", "POOL_MISMATCH"}:
+            if sim_status == "QUANTITY_MISMATCH":
+                sim_blockers.append("execution simulation round-trip token quantity mismatch")
+
+            if sim_status in {"MISSING_QUOTE_ASSET_EVIDENCE", "QUOTE_ASSET_MISMATCH"}:
+                sim_blockers.append(f"quote asset verification failed: {sim_status}")
+
+            if sim_status in {"MISSING_TOKEN_ADDRESS", "INVALID_TOKEN_ADDRESS", "TOKEN_ADDRESS_MISMATCH", "DIRECTION_MISMATCH", "MISSING_CHAIN_IDENTITY", "CHAIN_MISMATCH", "MISSING_POOL_IDENTITY", "POOL_MISMATCH"}:
                 sim_blockers.append(f"execution identity verification failed: {sim_status}")
 
-            if sim_status in {"MISSING_AMM_POOL_IDENTITY", "MISSING_AMM_CHAIN_IDENTITY", "AMM_POOL_MISMATCH", "AMM_CHAIN_MISMATCH", "AMM_TOKEN_MISMATCH", "INVALID_AMM_RESERVES"}:
+            if sim_status in {"MISSING_BOOK_IDENTITY", "MISSING_BOOK_CHAIN_IDENTITY", "MISSING_BOOK_POOL_IDENTITY", "MISSING_BOOK_TOKEN_IDENTITY", "BOOK_CHAIN_MISMATCH", "BOOK_POOL_MISMATCH", "BOOK_TOKEN_MISMATCH"}:
+                sim_blockers.append(f"order book identity verification failed: {sim_status}")
+
+            if sim_status in {"MISSING_AMM_POOL_IDENTITY", "MISSING_AMM_CHAIN_IDENTITY", "MISSING_AMM_TOKEN_IDENTITY", "AMM_POOL_MISMATCH", "AMM_CHAIN_MISMATCH", "AMM_TOKEN_MISMATCH", "INVALID_AMM_RESERVES"}:
                 sim_blockers.append(f"AMM reserve verification failed: {sim_status}")
+
+            if sim_status in {"INVALID_BUY_QUOTE_AMOUNTS", "INVALID_SELL_QUOTE_AMOUNTS"}:
+                sim_blockers.append(f"execution quote amounts invalid: {sim_status}")
 
             if sim_status == "INVALID_FEE_DATA" or sim_res.get("status") == "INVALID_FEE_DATA":
                 sim_blockers.append("invalid fee data in execution simulation")
