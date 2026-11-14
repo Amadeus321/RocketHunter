@@ -781,6 +781,12 @@ class FinalActionableGateTests(unittest.TestCase):
                 "provider": "chainlink",
                 "feed_address": "0x8fa59a53f040d12d26f03bc9920373707c3c4004",
                 "valuation_policy": "STABLECOIN_ORACLE_VERIFIED",
+                "observation": {
+                    "answer": 100000000,
+                    "decimals": 8,
+                    "round_id": 1,
+                    "updated_at": now_iso,
+                },
             },
             "liquidity_usd": 150000,
             "target_price": 140.0,

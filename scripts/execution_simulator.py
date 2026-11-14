@@ -571,6 +571,13 @@ TRUSTED_CHAINLINK_FEEDS: dict[str, dict[str, Any]] = {
         "usd_reference": "USD",
         "allowed_policies": {"CRYPTO_ORACLE_VERIFIED"},
     },
+    "0x3f3f5df88d6c13861d1e7883853244da4817e357": {
+        "chain": "arbitrum",
+        "quote_asset": "0xfd086bc7cd5c481dcc9c85ebe478a1c0b69fcbb9",  # USDT
+        "symbol": "USDT/USD",
+        "usd_reference": "USD",
+        "allowed_policies": {"STABLECOIN_ORACLE_VERIFIED", "STABLECOIN_DEVIATION_BAND_POLICY"},
+    },
 }
 
 TRUSTED_PYTH_FEEDS: dict[str, dict[str, Any]] = {
@@ -609,6 +616,19 @@ TRUSTED_PYTH_FEEDS: dict[str, dict[str, Any]] = {
         "usd_reference": "USD",
         "allowed_policies": {"CRYPTO_ORACLE_VERIFIED"},
     },
+    # Pyth USDT/USD
+    "0x2b89b9dc8fdf9f34709a5b106b472f0f39bb6ca9ce04b0fd7f2e971688e2e53b": {
+        "chains": {"solana", "ethereum", "arbitrum", "base"},
+        "quote_asset": {
+            "solana": "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB",
+            "ethereum": "0xdac17f958d2ee523a2206206994597c13d831ec7",
+            "arbitrum": "0xfd086bc7cd5c481dcc9c85ebe478a1c0b69fcbb9",
+            "base": "0x50c5725949a6f0c72e6c4a641f24049a917db0cb",
+        },
+        "symbol": "Crypto.USDT/USD",
+        "usd_reference": "USD",
+        "allowed_policies": {"STABLECOIN_ORACLE_VERIFIED", "STABLECOIN_DEVIATION_BAND_POLICY"},
+    },
 }
 
 TRUSTED_UNISWAP_V3_POOLS: dict[str, dict[str, Any]] = {
@@ -618,7 +638,9 @@ TRUSTED_UNISWAP_V3_POOLS: dict[str, dict[str, Any]] = {
         "token0": "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48",  # USDC
         "token1": "0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2",  # WETH
         "fee": 500,
-        "usd_reference": "USD",
+        "usd_reference": "USDC",
+        "intermediate_quote": "USDC",
+        "requires_chained_usd_conversion": True,
         "allowed_assets": {
             "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48",
             "0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2",
@@ -631,7 +653,9 @@ TRUSTED_UNISWAP_V3_POOLS: dict[str, dict[str, Any]] = {
         "token0": "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48",  # USDC
         "token1": "0xdac17f958d2ee523a2206206994597c13d831ec7",  # USDT
         "fee": 100,
-        "usd_reference": "USD",
+        "usd_reference": "USDC",
+        "intermediate_quote": "USDC",
+        "requires_chained_usd_conversion": True,
         "allowed_assets": {
             "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48",
             "0xdac17f958d2ee523a2206206994597c13d831ec7",
@@ -644,7 +668,9 @@ TRUSTED_UNISWAP_V3_POOLS: dict[str, dict[str, Any]] = {
         "token0": "0x4200000000000000000000000000000000000006",  # WETH
         "token1": "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913",  # USDC
         "fee": 500,
-        "usd_reference": "USD",
+        "usd_reference": "USDC",
+        "intermediate_quote": "USDC",
+        "requires_chained_usd_conversion": True,
         "allowed_assets": {
             "0x4200000000000000000000000000000000000006",
             "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913",
@@ -664,6 +690,7 @@ TRUSTED_CEX_MARKETS: dict[str, dict[str, dict[str, Any]]] = {
         "USDC-USD": {
             "symbol": "USDC",
             "usd_reference": "USD",
+            "quote_currency": "USD",
             "allowed_assets": {
                 "ethereum": "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48",
                 "base": "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913",
@@ -674,6 +701,7 @@ TRUSTED_CEX_MARKETS: dict[str, dict[str, dict[str, Any]]] = {
         "ETH-USD": {
             "symbol": "WETH",
             "usd_reference": "USD",
+            "quote_currency": "USD",
             "allowed_assets": {
                 "ethereum": "0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2",
                 "base": "0x4200000000000000000000000000000000000006",
@@ -683,6 +711,7 @@ TRUSTED_CEX_MARKETS: dict[str, dict[str, dict[str, Any]]] = {
         "SOL-USD": {
             "symbol": "SOL",
             "usd_reference": "USD",
+            "quote_currency": "USD",
             "allowed_assets": {
                 "solana": "So11111111111111111111111111111111111111112",
             },
@@ -690,6 +719,7 @@ TRUSTED_CEX_MARKETS: dict[str, dict[str, dict[str, Any]]] = {
         "USDT-USD": {
             "symbol": "USDT",
             "usd_reference": "USD",
+            "quote_currency": "USD",
             "allowed_assets": {
                 "ethereum": "0xdac17f958d2ee523a2206206994597c13d831ec7",
             },
@@ -698,7 +728,9 @@ TRUSTED_CEX_MARKETS: dict[str, dict[str, dict[str, Any]]] = {
     "binance": {
         "USDCUSDT": {
             "symbol": "USDC",
-            "usd_reference": "USD",
+            "usd_reference": "USDT",
+            "quote_currency": "USDT",
+            "requires_chained_usd_conversion": True,
             "allowed_assets": {
                 "ethereum": "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48",
                 "base": "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913",
@@ -708,7 +740,9 @@ TRUSTED_CEX_MARKETS: dict[str, dict[str, dict[str, Any]]] = {
         },
         "ETHUSDT": {
             "symbol": "WETH",
-            "usd_reference": "USD",
+            "usd_reference": "USDT",
+            "quote_currency": "USDT",
+            "requires_chained_usd_conversion": True,
             "allowed_assets": {
                 "ethereum": "0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2",
                 "base": "0x4200000000000000000000000000000000000006",
@@ -717,7 +751,9 @@ TRUSTED_CEX_MARKETS: dict[str, dict[str, dict[str, Any]]] = {
         },
         "SOLUSDT": {
             "symbol": "SOL",
-            "usd_reference": "USD",
+            "usd_reference": "USDT",
+            "quote_currency": "USDT",
+            "requires_chained_usd_conversion": True,
             "allowed_assets": {
                 "solana": "So11111111111111111111111111111111111111112",
             },
@@ -727,6 +763,7 @@ TRUSTED_CEX_MARKETS: dict[str, dict[str, dict[str, Any]]] = {
         "USDCUSD": {
             "symbol": "USDC",
             "usd_reference": "USD",
+            "quote_currency": "USD",
             "allowed_assets": {
                 "ethereum": "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48",
                 "base": "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913",
@@ -737,6 +774,7 @@ TRUSTED_CEX_MARKETS: dict[str, dict[str, dict[str, Any]]] = {
         "ETHUSD": {
             "symbol": "WETH",
             "usd_reference": "USD",
+            "quote_currency": "USD",
             "allowed_assets": {
                 "ethereum": "0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2",
                 "base": "0x4200000000000000000000000000000000000006",
@@ -746,8 +784,17 @@ TRUSTED_CEX_MARKETS: dict[str, dict[str, dict[str, Any]]] = {
         "SOLUSD": {
             "symbol": "SOL",
             "usd_reference": "USD",
+            "quote_currency": "USD",
             "allowed_assets": {
                 "solana": "So11111111111111111111111111111111111111112",
+            },
+        },
+        "USDTUSD": {
+            "symbol": "USDT",
+            "usd_reference": "USD",
+            "quote_currency": "USD",
+            "allowed_assets": {
+                "ethereum": "0xdac17f958d2ee523a2206206994597c13d831ec7",
             },
         },
     },
@@ -765,7 +812,9 @@ TRUSTED_DEX_AGG_PAIRS: dict[str, dict[str, dict[str, Any]]] = {
             "chain": "ethereum",
             "quote_asset": "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48",
             "symbol": "USDC",
-            "usd_reference": "USD",
+            "usd_reference": "USDC",
+            "intermediate_quote": "USDC",
+            "requires_chained_usd_conversion": True,
         },
         "ethereum:0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2": {
             "chain": "ethereum",
@@ -777,7 +826,9 @@ TRUSTED_DEX_AGG_PAIRS: dict[str, dict[str, dict[str, Any]]] = {
             "chain": "solana",
             "quote_asset": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
             "symbol": "USDC",
-            "usd_reference": "USD",
+            "usd_reference": "USDC",
+            "intermediate_quote": "USDC",
+            "requires_chained_usd_conversion": True,
         },
         "solana:So11111111111111111111111111111111111111112": {
             "chain": "solana",
@@ -789,13 +840,17 @@ TRUSTED_DEX_AGG_PAIRS: dict[str, dict[str, dict[str, Any]]] = {
             "chain": "base",
             "quote_asset": "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913",
             "symbol": "USDC",
-            "usd_reference": "USD",
+            "usd_reference": "USDC",
+            "intermediate_quote": "USDC",
+            "requires_chained_usd_conversion": True,
         },
         "arbitrum:0xaf88d065e77c8cc2239327c5edb3a432268e5831": {
             "chain": "arbitrum",
             "quote_asset": "0xaf88d065e77c8cc2239327c5edb3a432268e5831",
             "symbol": "USDC",
-            "usd_reference": "USD",
+            "usd_reference": "USDC",
+            "intermediate_quote": "USDC",
+            "requires_chained_usd_conversion": True,
         },
     },
     "geckoterminal": {
@@ -803,13 +858,17 @@ TRUSTED_DEX_AGG_PAIRS: dict[str, dict[str, dict[str, Any]]] = {
             "chain": "ethereum",
             "quote_asset": "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48",
             "symbol": "USDC",
-            "usd_reference": "USD",
+            "usd_reference": "USDC",
+            "intermediate_quote": "USDC",
+            "requires_chained_usd_conversion": True,
         },
         "base_0xd0b53d9277642d899df5c87a3966a349a798f224": {
             "chain": "base",
             "quote_asset": "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913",
             "symbol": "USDC",
-            "usd_reference": "USD",
+            "usd_reference": "USDC",
+            "intermediate_quote": "USDC",
+            "requires_chained_usd_conversion": True,
         },
     },
     "dexscreener": {
@@ -817,13 +876,17 @@ TRUSTED_DEX_AGG_PAIRS: dict[str, dict[str, dict[str, Any]]] = {
             "chain": "ethereum",
             "quote_asset": "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48",
             "symbol": "USDC",
-            "usd_reference": "USD",
+            "usd_reference": "USDC",
+            "intermediate_quote": "USDC",
+            "requires_chained_usd_conversion": True,
         },
         "base/0xd0b53d9277642d899df5c87a3966a349a798f224": {
             "chain": "base",
             "quote_asset": "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913",
             "symbol": "USDC",
-            "usd_reference": "USD",
+            "usd_reference": "USDC",
+            "intermediate_quote": "USDC",
+            "requires_chained_usd_conversion": True,
         },
     },
 }
@@ -862,6 +925,7 @@ def validate_quote_usd_conversion(
     expected_quote_asset: str | None = None,
     as_of_utc: str | None = None,
     max_conversion_age_seconds: float = 300.0,
+    _recursion_depth: int = 0,
 ) -> tuple[bool, str, float | None, dict[str, Any]]:
     """Validate quote-asset/USD conversion evidence and provenance.
 
@@ -879,6 +943,18 @@ def validate_quote_usd_conversion(
         - Uniswap v3 TWAP: pool address registered in TRUSTED_UNISWAP_V3_POOLS matching chain & asset.
         - CEX tickers (Coinbase, Binance, Kraken): registered market ID & trusted domain.
         - DEX aggregators (DefiLlama, GeckoTerminal, DexScreener): registered pair ID & trusted domain.
+    - Provider-specific observation verification:
+        - Chainlink: requires answer, decimals (8), round_id (>0), updated_at.
+        - Pyth: requires price, expo, publish_time.
+        - Uniswap v3 TWAP: requires twap_window_seconds (>= 60s).
+        - CEX: requires symbol, last_price, bid_price, ask_price, volume_24h (>0), non-inverted bid/ask.
+        - DEX aggregators: requires price, token, chain, timestamp.
+        - Validates returned observation price against claimed conversion price.
+    - Removal of USDT-as-USD assumption & verification of chained conversion paths:
+        - USDT is never treated as USD; reference_asset="USDT" requires verified chained USDT/USD conversion.
+        - Markets quoting in USDT (e.g. Binance USDCUSDT, ETHUSDT, SOLUSDT) claiming USD reference asset fail with REFERENCE_CURRENCY_MISMATCH.
+        - Uniswap v3 TWAP and DEX aggregator pairs represent token ratios, requiring verified usd_conversion_leg to USD.
+        - Chained conversion paths are verified recursively, check freshness, and compound price.
     - Arbitrary feed addresses, feed IDs, URLs, and market IDs are strictly rejected.
     - Documents honestly that cryptographic signatures are not evaluated.
 
@@ -1030,6 +1106,9 @@ def validate_quote_usd_conversion(
 
     # 8. Provider-specific feed identity binding
     prov_str: str = ""
+    market_info: dict[str, Any] = {}
+    pool_info: dict[str, Any] = {}
+    pair_info: dict[str, Any] = {}
 
     if canonical_provider == "chainlink":
         feed_addr_raw = conversion.get("feed_address") or conversion.get("aggregator_address") or conversion.get("oracle_address")
@@ -1139,6 +1218,13 @@ def validate_quote_usd_conversion(
                 "reason": f"unrecognized market identifier '{market_key or market_id}' for {canonical_provider}"
             }
         market_info = TRUSTED_CEX_MARKETS[canonical_provider][market_key]
+        if market_info.get("quote_currency") == "USDT":
+            if norm_usd_ref == "USD":
+                return False, "REFERENCE_CURRENCY_MISMATCH", None, {
+                    "reason": f"market '{market_key}' quotes in USDT, not USD; cannot label USDT as USD without verified chained conversion",
+                    "market": market_key,
+                    "actual_quote_currency": "USDT",
+                }
         allowed_asset_for_chain = market_info["allowed_assets"].get(norm_chain)
         if not allowed_asset_for_chain or not same_address(norm_chain, allowed_asset_for_chain, conv_asset_str):
             return False, "QUOTE_CONVERSION_ASSET_MISMATCH", None, {
@@ -1185,8 +1271,295 @@ def validate_quote_usd_conversion(
             "reason": f"provider '{canonical_provider}' cannot be verified with available evidence"
         }
 
-    return True, "CONVERSION_VERIFIED", clean_price, {
-        "price_usd": clean_price,
+    # 9. Provider-specific observation verification
+    obs = conversion.get("observation") if isinstance(conversion.get("observation"), dict) else conversion
+
+    if canonical_provider == "chainlink":
+        ans_raw = obs.get("answer") if obs.get("answer") is not None else obs.get("latest_answer")
+        dec_raw = obs.get("decimals")
+        rnd_raw = obs.get("round_id") if obs.get("round_id") is not None else obs.get("answered_in_round")
+        upd_raw = obs.get("updated_at") or obs.get("updated_at_utc") or obs.get("timestamp_utc") or obs.get("timestamp")
+
+        if ans_raw is None or dec_raw is None or rnd_raw is None or upd_raw is None:
+            return False, "MISSING_PROVIDER_OBSERVATION_FIELDS", None, {
+                "reason": "missing required Chainlink observation fields: answer, decimals, round_id, updated_at",
+                "provider": "chainlink",
+            }
+        try:
+            ans_val = float(ans_raw)
+            dec_val = int(dec_raw)
+            rnd_val = int(rnd_raw)
+        except (ValueError, TypeError):
+            return False, "INVALID_PROVIDER_OBSERVATION", None, {
+                "reason": f"Chainlink observation values must be numeric: answer={ans_raw!r}, decimals={dec_raw!r}, round_id={rnd_raw!r}"
+            }
+        if dec_val != 8:
+            return False, "OBSERVATION_DECIMALS_MISMATCH", None, {
+                "reason": f"Chainlink USD reference feeds must have 8 decimals, got {dec_val}"
+            }
+        if rnd_val <= 0:
+            return False, "INVALID_PROVIDER_OBSERVATION", None, {
+                "reason": f"Chainlink round_id must be a strictly positive integer, got {rnd_val}"
+            }
+        if ans_val <= 0:
+            return False, "INVALID_PROVIDER_OBSERVATION", None, {
+                "reason": f"Chainlink answer must be strictly positive, got {ans_val}"
+            }
+        obs_price = ans_val / (10 ** dec_val)
+        if abs(obs_price - clean_price) > max(clean_price * 1e-4, 1e-6):
+            return False, "OBSERVATION_PRICE_DISCREPANCY", None, {
+                "reason": f"Chainlink observation price ({obs_price}) does not match claimed price ({clean_price})",
+                "observation_price": obs_price,
+                "claimed_price": clean_price,
+            }
+
+    elif canonical_provider == "pyth":
+        p_raw = obs.get("price") if obs.get("price") is not None else obs.get("price_val")
+        e_raw = obs.get("expo") if obs.get("expo") is not None else obs.get("exponent")
+        pub_raw = obs.get("publish_time") or obs.get("timestamp_utc") or obs.get("timestamp")
+
+        if p_raw is None or e_raw is None or pub_raw is None:
+            return False, "MISSING_PROVIDER_OBSERVATION_FIELDS", None, {
+                "reason": "missing required Pyth observation fields: price, expo, publish_time",
+                "provider": "pyth",
+            }
+        try:
+            p_val = float(p_raw)
+            e_val = int(e_raw)
+        except (ValueError, TypeError):
+            return False, "INVALID_PROVIDER_OBSERVATION", None, {
+                "reason": f"Pyth observation values must be numeric: price={p_raw!r}, expo={e_raw!r}"
+            }
+        obs_price = p_val * (10 ** e_val)
+        if obs_price <= 0:
+            return False, "INVALID_PROVIDER_OBSERVATION", None, {
+                "reason": f"Pyth observation price must be strictly positive, got {obs_price}"
+            }
+        if abs(obs_price - clean_price) > max(clean_price * 1e-4, 1e-6):
+            return False, "OBSERVATION_PRICE_DISCREPANCY", None, {
+                "reason": f"Pyth observation price ({obs_price}) does not match claimed price ({clean_price})",
+                "observation_price": obs_price,
+                "claimed_price": clean_price,
+            }
+
+    elif canonical_provider == "uniswap_v3_twap":
+        win_raw = (
+            obs.get("twap_window_seconds") if obs.get("twap_window_seconds") is not None else
+            (obs.get("twap_window") if obs.get("twap_window") is not None else obs.get("window_seconds"))
+        )
+        if win_raw is None:
+            return False, "MISSING_PROVIDER_OBSERVATION_FIELDS", None, {
+                "reason": "missing required Uniswap v3 TWAP observation field: twap_window_seconds",
+                "provider": "uniswap_v3_twap",
+            }
+        try:
+            win_sec = float(win_raw)
+        except (ValueError, TypeError):
+            return False, "INVALID_TWAP_WINDOW", None, {
+                "reason": f"invalid Uniswap v3 twap_window_seconds: {win_raw!r}"
+            }
+        if win_sec < 60.0:
+            return False, "INVALID_TWAP_WINDOW", None, {
+                "reason": f"Uniswap v3 TWAP window ({win_sec}s) must be at least 60 seconds",
+                "window_seconds": win_sec,
+            }
+        twap_p = obs.get("twap_price") or obs.get("price")
+        if twap_p is not None:
+            try:
+                tp_val = float(twap_p)
+                if abs(tp_val - clean_price) > max(clean_price * 1e-4, 1e-6):
+                    return False, "OBSERVATION_PRICE_DISCREPANCY", None, {
+                        "reason": f"Uniswap v3 TWAP observation price ({tp_val}) does not match claimed price ({clean_price})"
+                    }
+            except (ValueError, TypeError):
+                return False, "INVALID_TWAP_OBSERVATION", None, {
+                    "reason": f"invalid twap_price in Uniswap v3 observation: {twap_p!r}"
+                }
+
+    elif canonical_provider in {"coinbase", "binance", "kraken"}:
+        sym_raw = obs.get("symbol") or obs.get("market") or obs.get("pair")
+        lp_raw = obs.get("last_price") if obs.get("last_price") is not None else obs.get("price")
+        bp_raw = obs.get("bid_price") if obs.get("bid_price") is not None else obs.get("bid")
+        ap_raw = obs.get("ask_price") if obs.get("ask_price") is not None else obs.get("ask")
+        vol_raw = (
+            obs.get("volume_24h") if obs.get("volume_24h") is not None else
+            (obs.get("volume") if obs.get("volume") is not None else obs.get("base_volume"))
+        )
+        if sym_raw is None or lp_raw is None or bp_raw is None or ap_raw is None or vol_raw is None:
+            return False, "MISSING_PROVIDER_OBSERVATION_FIELDS", None, {
+                "reason": f"missing required {canonical_provider} observation fields (symbol, last_price, bid_price, ask_price, volume_24h)",
+                "provider": canonical_provider,
+            }
+        norm_obs_sym = str(sym_raw).strip().upper().replace("/", "").replace("-", "")
+        norm_mkt_sym = market_key.replace("/", "").replace("-", "")
+        if norm_obs_sym != norm_mkt_sym:
+            return False, "OBSERVATION_MARKET_MISMATCH", None, {
+                "reason": f"{canonical_provider} observation symbol '{sym_raw}' does not match registered market '{market_key}'",
+                "observation_symbol": str(sym_raw),
+                "registered_market": market_key,
+            }
+        lp = _clean_strictly_positive(lp_raw)
+        bp = _clean_strictly_positive(bp_raw)
+        ap = _clean_strictly_positive(ap_raw)
+        vol = _clean_strictly_positive(vol_raw)
+        if lp is None or bp is None or ap is None or vol is None or vol <= 0:
+            return False, "INVALID_CEX_OBSERVATION", None, {
+                "reason": f"{canonical_provider} observation fields must be positive finite numbers, volume > 0",
+                "last_price": lp_raw,
+                "bid_price": bp_raw,
+                "ask_price": ap_raw,
+                "volume_24h": vol_raw,
+            }
+        if bp > ap:
+            return False, "INVALID_CEX_OBSERVATION", None, {
+                "reason": f"crossed/inverted {canonical_provider} ticker: bid_price ({bp}) > ask_price ({ap})",
+                "bid_price": bp,
+                "ask_price": ap,
+            }
+        if abs(lp - clean_price) > max(clean_price * 1e-4, 1e-6):
+            return False, "OBSERVATION_PRICE_DISCREPANCY", None, {
+                "reason": f"{canonical_provider} observation last_price ({lp}) does not match claimed price ({clean_price})",
+                "observation_price": lp,
+                "claimed_price": clean_price,
+            }
+
+    elif canonical_provider in {"defillama", "geckoterminal", "dexscreener"}:
+        p_raw = obs.get("price") if obs.get("price") is not None else obs.get("price_usd")
+        tok_raw = obs.get("token") or obs.get("token_address") or obs.get("address")
+        ch_raw = obs.get("chain")
+        ts_raw = obs.get("timestamp") or obs.get("timestamp_utc") or obs.get("as_of_utc")
+
+        if p_raw is None or tok_raw is None or ch_raw is None or ts_raw is None:
+            return False, "MISSING_PROVIDER_OBSERVATION_FIELDS", None, {
+                "reason": f"missing required {canonical_provider} observation fields (price, token, chain, timestamp)",
+                "provider": canonical_provider,
+            }
+        p_clean = _clean_strictly_positive(p_raw)
+        if p_clean is None:
+            return False, "INVALID_DEX_AGGREGATOR_PAYLOAD", None, {
+                "reason": f"DEX aggregator price must be positive and finite, got {p_raw!r}"
+            }
+        if abs(p_clean - clean_price) > max(clean_price * 1e-4, 1e-6):
+            return False, "OBSERVATION_PRICE_DISCREPANCY", None, {
+                "reason": f"{canonical_provider} payload price ({p_clean}) does not match claimed price ({clean_price})",
+                "observation_price": p_clean,
+                "claimed_price": clean_price,
+            }
+        if not same_address(norm_chain, str(tok_raw).strip(), conv_asset_str):
+            return False, "QUOTE_CONVERSION_ASSET_MISMATCH", None, {
+                "reason": f"{canonical_provider} payload token ({tok_raw}) does not match conversion quote asset ({conv_asset_str})"
+            }
+        if str(ch_raw).strip().lower() != norm_chain:
+            return False, "QUOTE_CONVERSION_CHAIN_MISMATCH", None, {
+                "reason": f"{canonical_provider} payload chain ({ch_raw}) does not match conversion chain ({norm_chain})"
+            }
+
+    # 10. Chained USD Conversion & Multi-leg Path Resolution
+    # Establish whether this observation requires a chained conversion to USD
+    requires_chained = False
+    intermediate_asset_symbol = None
+
+    if canonical_provider == "binance" and market_info.get("quote_currency") == "USDT":
+        requires_chained = True
+        intermediate_asset_symbol = "USDT"
+    elif norm_usd_ref == "USDT":
+        requires_chained = True
+        intermediate_asset_symbol = "USDT"
+    elif canonical_provider == "uniswap_v3_twap":
+        requires_chained = True
+        intermediate_asset_symbol = pool_info.get("intermediate_quote", "USDC")
+    elif canonical_provider in {"defillama", "geckoterminal", "dexscreener"}:
+        requires_chained = True
+        intermediate_asset_symbol = pair_info.get("intermediate_quote", "USDC")
+
+    chained_leg = conversion.get("chained_conversion") or conversion.get("usd_conversion_leg")
+
+    if requires_chained and (not chained_leg or not isinstance(chained_leg, dict)):
+        if intermediate_asset_symbol == "USDT" or norm_usd_ref == "USDT":
+            return False, "MISSING_CHAINED_USD_CONVERSION", None, {
+                "reason": "USDT-denominated valuation requires independently validated chained USDT/USD conversion; never assume a $1.00 peg"
+            }
+        else:
+            return False, "UNVERIFIED_USD_CONVERSION_PATH", None, {
+                "reason": f"{canonical_provider} pair reference represents an on-chain token ratio, not direct USD; requires verified usd_conversion_leg to USD"
+            }
+
+    effective_price_usd = clean_price
+    chained_details_dict = None
+
+    if chained_leg:
+        if not isinstance(chained_leg, dict):
+            return False, "INVALID_CHAINED_USD_CONVERSION", None, {
+                "reason": "chained conversion evidence must be a dictionary"
+            }
+        if _recursion_depth >= 3:
+            return False, "CONVERSION_CHAIN_TOO_DEEP", None, {
+                "reason": "quote conversion chain exceeded maximum allowable depth"
+            }
+
+        ch_stamp = chained_leg.get("timestamp_utc") or chained_leg.get("timestamp") or chained_leg.get("as_of_utc")
+        ch_fresh, ch_fresh_status, ch_age = validate_timestamp_freshness(ch_stamp, as_of_utc, max_conversion_age_seconds)
+        if not ch_fresh:
+            status_code = "STALE_CHAINED_USD_CONVERSION" if ch_fresh_status in ("STALE_QUOTE", "STALE") else "INVALID_QUOTE_CONVERSION_TIMESTAMP"
+            return False, status_code, None, {
+                "reason": f"chained conversion freshness verification failed: {ch_fresh_status}",
+                "age_seconds": ch_age,
+            }
+
+        ch_chain = str(chained_leg.get("chain") or norm_chain).strip().lower()
+        ch_asset = chained_leg.get("quote_asset") or chained_leg.get("token_address")
+
+        if intermediate_asset_symbol == "USDT":
+            known_usdt = {
+                "ethereum": "0xdac17f958d2ee523a2206206994597c13d831ec7",
+                "arbitrum": "0xfd086bc7cd5c481dcc9c85ebe478a1c0b69fcbb9",
+                "base": "0x50c5725949a6f0c72e6c4a641f24049a917db0cb",
+                "solana": "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB",
+            }
+            expected_usdt = known_usdt.get(ch_chain)
+            if expected_usdt and ch_asset and not same_address(ch_chain, str(ch_asset).strip(), expected_usdt):
+                return False, "QUOTE_CONVERSION_ASSET_MISMATCH", None, {
+                    "reason": f"chained conversion asset ({ch_asset}) does not match expected intermediate asset USDT ({expected_usdt}) on chain {ch_chain}"
+                }
+        elif intermediate_asset_symbol == "USDC":
+            known_usdc = {
+                "ethereum": "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48",
+                "arbitrum": "0xaf88d065e77c8cc2239327c5edb3a432268e5831",
+                "base": "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913",
+                "solana": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+            }
+            expected_usdc = known_usdc.get(ch_chain)
+            if expected_usdc and ch_asset and not same_address(ch_chain, str(ch_asset).strip(), expected_usdc):
+                return False, "QUOTE_CONVERSION_ASSET_MISMATCH", None, {
+                    "reason": f"chained conversion asset ({ch_asset}) does not match expected intermediate asset USDC ({expected_usdc}) on chain {ch_chain}"
+                }
+
+        ch_ok, ch_status, ch_rate, ch_details = validate_quote_usd_conversion(
+            chained_leg,
+            expected_chain=chained_leg.get("chain"),
+            as_of_utc=as_of_utc,
+            max_conversion_age_seconds=max_conversion_age_seconds,
+            _recursion_depth=_recursion_depth + 1,
+        )
+        if not ch_ok:
+            return False, ch_status, None, {
+                "reason": f"chained USD conversion validation failed: {ch_details.get('reason')}",
+                "chained_details": ch_details,
+            }
+
+        ch_target = str(ch_details.get("usd_reference_asset") or "").strip().upper()
+        if ch_target not in {"USD", "USD_UNIT", "USD_REFERENCE"}:
+            return False, "UNVERIFIED_USD_CONVERSION_PATH", None, {
+                "reason": f"chained conversion must terminate in direct USD, got '{ch_target}'"
+            }
+
+        effective_price_usd = clean_price * ch_rate
+        chained_details_dict = ch_details
+
+    return True, "CONVERSION_VERIFIED", effective_price_usd, {
+        "price_usd": effective_price_usd,
+        "primary_price": clean_price,
+        "chained_conversion": chained_details_dict,
         "chain": conv_chain,
         "quote_asset": conv_asset_str,
         "usd_reference_asset": norm_usd_ref,
@@ -1195,7 +1568,7 @@ def validate_quote_usd_conversion(
         "valuation_policy": norm_policy,
         "provenance_id": prov_str,
         "age_seconds": round(age, 1) if age is not None else None,
-        "verification_method": f"TRUSTED_{canonical_provider.upper()}_FEED_IDENTITY_BOUND_AND_FRESHNESS_VERIFIED",
+        "verification_method": f"TRUSTED_{canonical_provider.upper()}_FEED_IDENTITY_BOUND_AND_OBSERVATION_VERIFIED",
         "cryptographic_authenticity_verified": False,
     }
 
@@ -1842,6 +2215,9 @@ def simulate_multi_size(
             (quotes.get("quote_usd_conversion") if isinstance(quotes, dict) else None)
         )
 
+    if not expected_token_address and isinstance(source, dict):
+        expected_token_address = source.get("contract_address") or source.get("token_address")
+
     target_chain = (
         expected_chain or
         (book.get("chain") if isinstance(book, dict) else None) or
@@ -2115,11 +2491,25 @@ def simulate_multi_size(
                     "MISSING_CONVERSION_PROVENANCE",
                     "MISSING_USD_REFERENCE_IDENTITY",
                     "MISMATCHED_USD_REFERENCE",
+                    "REFERENCE_CURRENCY_MISMATCH",
+                    "CANNOT_ASSUME_STABLECOIN_PEG",
+                    "MISSING_CHAINED_USD_CONVERSION",
+                    "STALE_CHAINED_USD_CONVERSION",
+                    "UNVERIFIED_USD_CONVERSION_PATH",
                     "UNRECOGNIZED_FEED_ADDRESS",
                     "UNRECOGNIZED_FEED_ID",
                     "UNRECOGNIZED_POOL_IDENTITY",
                     "UNRECOGNIZED_MARKET_IDENTITY",
                     "UNTRUSTED_SOURCE_URL",
+                    "MISSING_PROVIDER_OBSERVATION_FIELDS",
+                    "OBSERVATION_PRICE_DISCREPANCY",
+                    "OBSERVATION_DECIMALS_MISMATCH",
+                    "INVALID_PROVIDER_OBSERVATION",
+                    "INVALID_TWAP_WINDOW",
+                    "INVALID_TWAP_OBSERVATION",
+                    "INVALID_CEX_OBSERVATION",
+                    "OBSERVATION_MARKET_MISMATCH",
+                    "INVALID_DEX_AGGREGATOR_PAYLOAD",
                     "CONFLICTING_PROVIDER_EVIDENCE",
                 ):
                     if code in err_msg:
@@ -2321,11 +2711,25 @@ def simulate_multi_size(
                     "MISSING_CONVERSION_PROVENANCE",
                     "MISSING_USD_REFERENCE_IDENTITY",
                     "MISMATCHED_USD_REFERENCE",
+                    "REFERENCE_CURRENCY_MISMATCH",
+                    "CANNOT_ASSUME_STABLECOIN_PEG",
+                    "MISSING_CHAINED_USD_CONVERSION",
+                    "STALE_CHAINED_USD_CONVERSION",
+                    "UNVERIFIED_USD_CONVERSION_PATH",
                     "UNRECOGNIZED_FEED_ADDRESS",
                     "UNRECOGNIZED_FEED_ID",
                     "UNRECOGNIZED_POOL_IDENTITY",
                     "UNRECOGNIZED_MARKET_IDENTITY",
                     "UNTRUSTED_SOURCE_URL",
+                    "MISSING_PROVIDER_OBSERVATION_FIELDS",
+                    "OBSERVATION_PRICE_DISCREPANCY",
+                    "OBSERVATION_DECIMALS_MISMATCH",
+                    "INVALID_PROVIDER_OBSERVATION",
+                    "INVALID_TWAP_WINDOW",
+                    "INVALID_TWAP_OBSERVATION",
+                    "INVALID_CEX_OBSERVATION",
+                    "OBSERVATION_MARKET_MISMATCH",
+                    "INVALID_DEX_AGGREGATOR_PAYLOAD",
                     "CONFLICTING_PROVIDER_EVIDENCE",
                     "MISSING_AMM_POOL_IDENTITY", "AMM_POOL_MISMATCH",
                     "MISSING_AMM_CHAIN_IDENTITY", "AMM_CHAIN_MISMATCH",

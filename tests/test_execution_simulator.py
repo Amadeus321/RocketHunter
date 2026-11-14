@@ -367,6 +367,12 @@ class AdversarialPhase2ExecutionTests(unittest.TestCase):
             "provider": "chainlink",
             "feed_address": "0x8fa59a53f040d12d26f03bc9920373707c3c4004",
             "valuation_policy": "STABLECOIN_ORACLE_VERIFIED",
+            "observation": {
+                "answer": 100000000,
+                "decimals": 8,
+                "round_id": 1,
+                "updated_at": "2026-11-13T12:00:00Z",
+            },
         }
         self.valid_quote_source = {
             "chain": VALID_EVM_CHAIN,
@@ -1561,6 +1567,12 @@ class AdversarialPhase2ExecutionTests(unittest.TestCase):
             "provider": "chainlink",
             "feed_address": "0x8fa59a53f040d12d26f03bc9920373707c3c4004",
             "valuation_policy": "STABLECOIN_ORACLE_VERIFIED",
+            "observation": {
+                "answer": 100000000,
+                "decimals": 8,
+                "round_id": 1,
+                "updated_at": self.as_of_utc,
+            },
         }
         # Test AMM with verified USD quote asset
         amm_res = simulate_constant_product_amm(
@@ -1597,6 +1609,12 @@ class AdversarialPhase2ExecutionTests(unittest.TestCase):
             "provider": "chainlink",
             "feed_address": "0x5f4ec3df9cbd43714fe2740f5e3616155c5b8419",
             "valuation_policy": "CRYPTO_ORACLE_VERIFIED",
+            "observation": {
+                "answer": 300000000000,
+                "decimals": 8,
+                "round_id": 1,
+                "updated_at": self.as_of_utc,
+            },
         }
         # In this pool, quote reserve is 16.666667 WETH ($50k USD equiv)
         weth_reserve = 50_000.0 / 3000.0
@@ -1869,6 +1887,12 @@ class AdversarialPhase2ExecutionTests(unittest.TestCase):
             "provider": "chainlink",
             "feed_address": "0x8fa59a53f040d12d26f03bc9920373707c3c4004",
             "valuation_policy": "STABLECOIN_ORACLE_VERIFIED",
+            "observation": {
+                "answer": 100000000,
+                "decimals": 8,
+                "round_id": 1,
+                "updated_at": self.as_of_utc,
+            },
         }
         sim_usdc = simulate_constant_product_amm(
             reserve0=10_000.0,
@@ -1897,6 +1921,12 @@ class AdversarialPhase2ExecutionTests(unittest.TestCase):
             "provider": "chainlink",
             "feed_address": "0x5f4ec3df9cbd43714fe2740f5e3616155c5b8419",
             "valuation_policy": "CRYPTO_ORACLE_VERIFIED",
+            "observation": {
+                "answer": 300000000000,
+                "decimals": 8,
+                "round_id": 1,
+                "updated_at": self.as_of_utc,
+            },
         }
         weth_reserve = 50_000.0 / 3000.0
         sim_weth = simulate_constant_product_amm(
@@ -2026,6 +2056,12 @@ class AdversarialPhase2ExecutionTests(unittest.TestCase):
             "provider": "chainlink",
             "feed_address": "0x8fa59a53f040d12d26f03bc9920373707c3c4004",
             "valuation_policy": "STABLECOIN_ORACLE_VERIFIED",
+            "observation": {
+                "answer": 100000000,
+                "decimals": 8,
+                "round_id": 1,
+                "updated_at": self.as_of_utc,
+            },
         }
         ok, status, price, details = validate_quote_usd_conversion(
             valid_conv,
@@ -2274,6 +2310,12 @@ class AdversarialPhase2ExecutionTests(unittest.TestCase):
             "provider": "chainlink",
             "feed_address": "0x8fa59a53f040d12d26f03bc9920373707c3c4004",
             "valuation_policy": "STABLECOIN_ORACLE_VERIFIED",
+            "observation": {
+                "answer": 100000000,
+                "decimals": 8,
+                "round_id": 1,
+                "updated_at": self.as_of_utc,
+            },
         }
         ok, status, price, details = validate_quote_usd_conversion(
             valid_conv,
@@ -2629,6 +2671,12 @@ class AdversarialPhase2ExecutionTests(unittest.TestCase):
             "provider": "chainlink",
             "feed_address": "0x5f4ec3df9cbd43714fe2740f5e3616155c5b8419",
             "valuation_policy": "CRYPTO_ORACLE_VERIFIED",
+            "observation": {
+                "answer": 300000000000,
+                "decimals": 8,
+                "round_id": 1,
+                "updated_at": self.as_of_utc,
+            },
         }
         amm_res = simulate_constant_product_amm(
             reserve0=10_000.0,
@@ -2704,6 +2752,678 @@ class AdversarialPhase2ExecutionTests(unittest.TestCase):
                 quote_usd_price=1.0,
                 require_quote_conversion=True,
             )
+
+    # =========================================================================
+    # MANDATORY REGRESSION TESTS: USD VALUATION INTEGRITY & OBSERVATION CHECKS (16 - 30)
+    # =========================================================================
+
+    # 16. USDT deviating from $1 with chained conversion compounds correctly
+    def test_req16_usdt_deviating_from_one_dollar_chained_conversion(self):
+        # Binance ETHUSDT where ETH = 3000 USDT, chained USDT/USD Chainlink oracle = $0.9850 (depegged from $1.00)
+        eth_usdt_conv = {
+            "price_usd": 3000.0,
+            "chain": "ethereum",
+            "quote_asset": VALID_ALT_QUOTE,  # WETH on Ethereum
+            "reference_asset": "USDT",
+            "timestamp_utc": self.as_of_utc,
+            "source": "binance",
+            "provider": "binance",
+            "market_id": "ETHUSDT",
+            "valuation_policy": "CEX_MARKET_TICKER_VERIFIED",
+            "observation": {
+                "symbol": "ETHUSDT",
+                "last_price": 3000.0,
+                "bid_price": 2999.9,
+                "ask_price": 3000.1,
+                "volume_24h": 150000.0,
+            },
+            "chained_conversion": {
+                "price_usd": 0.9850,
+                "chain": "ethereum",
+                "quote_asset": "0xdac17f958d2ee523a2206206994597c13d831ec7",  # USDT
+                "reference_asset": "USD",
+                "timestamp_utc": self.as_of_utc,
+                "source": "chainlink",
+                "provider": "chainlink",
+                "feed_address": "0x3e7d1eab03480b83a7d35d7647822ec73a6858c6",  # USDT/USD feed
+                "valuation_policy": "STABLECOIN_ORACLE_VERIFIED",
+                "observation": {
+                    "answer": 98500000,  # 0.9850 * 10^8
+                    "decimals": 8,
+                    "round_id": 100,
+                    "updated_at": self.as_of_utc,
+                },
+            },
+        }
+        ok, status, compound_price, details = validate_quote_usd_conversion(
+            eth_usdt_conv,
+            expected_chain="ethereum",
+            expected_quote_asset=VALID_ALT_QUOTE,
+            as_of_utc=self.as_of_utc,
+        )
+        self.assertTrue(ok)
+        self.assertEqual(status, "CONVERSION_VERIFIED")
+        # 3000.0 * 0.9850 = 2955.0 USD (not assuming $3000.00!)
+        self.assertAlmostEqual(compound_price, 2955.0, places=4)
+        self.assertEqual(details["primary_price"], 3000.0)
+        self.assertAlmostEqual(details["chained_conversion"]["price_usd"], 0.9850, places=4)
+
+    # 17. Missing USDT/USD conversion fails closed
+    def test_req17_missing_usdt_usd_conversion_fails_closed(self):
+        eth_usdt_missing_chained = {
+            "price_usd": 3000.0,
+            "chain": "ethereum",
+            "quote_asset": VALID_ALT_QUOTE,
+            "reference_asset": "USDT",
+            "timestamp_utc": self.as_of_utc,
+            "source": "binance",
+            "provider": "binance",
+            "market_id": "ETHUSDT",
+            "valuation_policy": "CEX_MARKET_TICKER_VERIFIED",
+            "observation": {
+                "symbol": "ETHUSDT",
+                "last_price": 3000.0,
+                "bid_price": 2999.9,
+                "ask_price": 3000.1,
+                "volume_24h": 150000.0,
+            },
+            # Missing chained_conversion!
+        }
+        ok, status, price, details = validate_quote_usd_conversion(
+            eth_usdt_missing_chained,
+            expected_chain="ethereum",
+            expected_quote_asset=VALID_ALT_QUOTE,
+            as_of_utc=self.as_of_utc,
+        )
+        self.assertFalse(ok)
+        self.assertEqual(status, "MISSING_CHAINED_USD_CONVERSION")
+        self.assertIsNone(price)
+
+    # 18. Stale USDT/USD conversion fails closed
+    def test_req18_stale_usdt_usd_conversion_fails_closed(self):
+        eth_usdt_stale_chained = {
+            "price_usd": 3000.0,
+            "chain": "ethereum",
+            "quote_asset": VALID_ALT_QUOTE,
+            "reference_asset": "USDT",
+            "timestamp_utc": self.as_of_utc,
+            "source": "binance",
+            "provider": "binance",
+            "market_id": "ETHUSDT",
+            "valuation_policy": "CEX_MARKET_TICKER_VERIFIED",
+            "observation": {
+                "symbol": "ETHUSDT",
+                "last_price": 3000.0,
+                "bid_price": 2999.9,
+                "ask_price": 3000.1,
+                "volume_24h": 150000.0,
+            },
+            "chained_conversion": {
+                "price_usd": 1.0,
+                "chain": "ethereum",
+                "quote_asset": "0xdac17f958d2ee523a2206206994597c13d831ec7",
+                "reference_asset": "USD",
+                "timestamp_utc": "2026-11-13T11:50:00Z",  # 10 minutes old (> 300s)
+                "source": "chainlink",
+                "provider": "chainlink",
+                "feed_address": "0x3e7d1eab03480b83a7d35d7647822ec73a6858c6",
+                "valuation_policy": "STABLECOIN_ORACLE_VERIFIED",
+                "observation": {
+                    "answer": 100000000,
+                    "decimals": 8,
+                    "round_id": 100,
+                    "updated_at": "2026-11-13T11:50:00Z",
+                },
+            },
+        }
+        ok, status, price, details = validate_quote_usd_conversion(
+            eth_usdt_stale_chained,
+            expected_chain="ethereum",
+            expected_quote_asset=VALID_ALT_QUOTE,
+            as_of_utc=self.as_of_utc,
+        )
+        self.assertFalse(ok)
+        self.assertEqual(status, "STALE_CHAINED_USD_CONVERSION")
+        self.assertIsNone(price)
+
+    # 19. Correct chained conversion in multi-size simulation
+    def test_req19_correct_chained_conversion_multi_size_simulation(self):
+        eth_usdt_conv = {
+            "price_usd": 3000.0,
+            "chain": "ethereum",
+            "quote_asset": VALID_ALT_QUOTE,
+            "reference_asset": "USDT",
+            "timestamp_utc": self.as_of_utc,
+            "source": "binance",
+            "provider": "binance",
+            "market_id": "ETHUSDT",
+            "valuation_policy": "CEX_MARKET_TICKER_VERIFIED",
+            "observation": {
+                "symbol": "ETHUSDT",
+                "last_price": 3000.0,
+                "bid_price": 2999.9,
+                "ask_price": 3000.1,
+                "volume_24h": 150000.0,
+            },
+            "chained_conversion": {
+                "price_usd": 0.9990,
+                "chain": "ethereum",
+                "quote_asset": "0xdac17f958d2ee523a2206206994597c13d831ec7",
+                "reference_asset": "USD",
+                "timestamp_utc": self.as_of_utc,
+                "source": "chainlink",
+                "provider": "chainlink",
+                "feed_address": "0x3e7d1eab03480b83a7d35d7647822ec73a6858c6",
+                "valuation_policy": "STABLECOIN_ORACLE_VERIFIED",
+                "observation": {
+                    "answer": 99900000,
+                    "decimals": 8,
+                    "round_id": 100,
+                    "updated_at": self.as_of_utc,
+                },
+            },
+        }
+        res = simulate_multi_size({
+            "chain": "ethereum",
+            "pool_address": VALID_POOL_ADDR,
+            "contract_address": VALID_TOKEN_ADDR,
+            "intended_trade_size_usd": 100.0,
+            "quote_token_address": VALID_ALT_QUOTE,
+            "expected_quote_asset": VALID_ALT_QUOTE,
+            "liquidity_usd": 100_000.0,
+            "final_price_timestamp_utc": self.as_of_utc,
+            "quote_usd_conversion": eth_usdt_conv,
+            "amm_reserves": {
+                "chain": "ethereum",
+                "pool_address": VALID_POOL_ADDR,
+                "token0": VALID_TOKEN_ADDR,
+                "token1": VALID_ALT_QUOTE,
+                "reserve0": 100_000.0,
+                "reserve1": 50.0,  # 50 WETH
+                "timestamp_utc": self.as_of_utc,
+                "fee_bps": 30.0,
+            },
+        }, as_of_utc=self.as_of_utc)
+        self.assertEqual(res["size_evaluations"]["$100"]["status"], "EXECUTABLE_AMM_ROUTE_AVAILABLE")
+        # Compound price: 3000 * 0.9990 = 2997.0
+        self.assertAlmostEqual(res["size_evaluations"]["$100"]["quote_usd_price"], 2997.0, places=3)
+
+    # 20. Incorrect conversion asset in chained leg fails closed
+    def test_req20_incorrect_conversion_asset_in_chained_leg_fails_closed(self):
+        # Chained conversion for USDT/USD accidentally specifies an ETH quote asset address
+        eth_usdt_bad_chained_asset = {
+            "price_usd": 3000.0,
+            "chain": "ethereum",
+            "quote_asset": VALID_ALT_QUOTE,
+            "reference_asset": "USDT",
+            "timestamp_utc": self.as_of_utc,
+            "source": "binance",
+            "provider": "binance",
+            "market_id": "ETHUSDT",
+            "valuation_policy": "CEX_MARKET_TICKER_VERIFIED",
+            "observation": {
+                "symbol": "ETHUSDT",
+                "last_price": 3000.0,
+                "bid_price": 2999.9,
+                "ask_price": 3000.1,
+                "volume_24h": 150000.0,
+            },
+            "chained_conversion": {
+                "price_usd": 3000.0,
+                "chain": "ethereum",
+                "quote_asset": VALID_ALT_QUOTE,  # WETH instead of USDT!
+                "reference_asset": "USD",
+                "timestamp_utc": self.as_of_utc,
+                "source": "chainlink",
+                "provider": "chainlink",
+                "feed_address": "0x5f4ec3df9cbd43714fe2740f5e3616155c5b8419",
+                "valuation_policy": "CRYPTO_ORACLE_VERIFIED",
+                "observation": {
+                    "answer": 300000000000,
+                    "decimals": 8,
+                    "round_id": 100,
+                    "updated_at": self.as_of_utc,
+                },
+            },
+        }
+        ok, status, price, details = validate_quote_usd_conversion(
+            eth_usdt_bad_chained_asset,
+            expected_chain="ethereum",
+            expected_quote_asset=VALID_ALT_QUOTE,
+            as_of_utc=self.as_of_utc,
+        )
+        self.assertFalse(ok)
+        self.assertEqual(status, "QUOTE_CONVERSION_ASSET_MISMATCH")
+        self.assertIsNone(price)
+
+    # 21. Candidate that attempts to label USDT as USD fails closed
+    def test_req21_candidate_attempting_to_label_usdt_as_usd_fails_closed(self):
+        # Binance USDCUSDT quotes in USDT, but evidence attempts to label reference_asset as USD
+        binance_label_usdt_as_usd = {
+            "price_usd": 1.0,
+            "chain": "ethereum",
+            "quote_asset": VALID_QUOTE_ADDR,
+            "reference_asset": "USD",  # False labeling of USDT market!
+            "timestamp_utc": self.as_of_utc,
+            "source": "binance",
+            "provider": "binance",
+            "market_id": "USDCUSDT",
+            "valuation_policy": "CEX_MARKET_TICKER_VERIFIED",
+            "observation": {
+                "symbol": "USDCUSDT",
+                "last_price": 1.0,
+                "bid_price": 0.9999,
+                "ask_price": 1.0001,
+                "volume_24h": 50000000.0,
+            },
+        }
+        ok, status, price, details = validate_quote_usd_conversion(
+            binance_label_usdt_as_usd,
+            expected_chain="ethereum",
+            expected_quote_asset=VALID_QUOTE_ADDR,
+            as_of_utc=self.as_of_utc,
+        )
+        self.assertFalse(ok)
+        self.assertEqual(status, "REFERENCE_CURRENCY_MISMATCH")
+        self.assertIn("quotes in USDT, not USD", details["reason"])
+
+        # And production qualification gate rejects it
+        cand = copy.deepcopy(self.valid_quote_source)
+        cand["quote_usd_conversion"] = binance_label_usdt_as_usd
+        cand["amm_reserves"] = {
+            "chain": VALID_EVM_CHAIN,
+            "pool_address": VALID_POOL_ADDR,
+            "token0": VALID_TOKEN_ADDR,
+            "token1": VALID_QUOTE_ADDR,
+            "reserve0": 100_000.0,
+            "reserve1": 50_000.0,
+            "timestamp_utc": self.as_of_utc,
+            "fee_bps": 30.0,
+        }
+        qualified = v425.qualify_final_actionable_candidates([cand], self.now_dt)
+        self.assertEqual(len(qualified), 0)
+        self.assertTrue(any("REFERENCE_CURRENCY_MISMATCH" in b for b in cand["qualification_blockers"]))
+
+    # 22. Registered feed ID with fabricated price rejected (OBSERVATION_PRICE_DISCREPANCY)
+    def test_req22_registered_feed_with_fabricated_price_rejected(self):
+        # Claimed price is $1.00, but Chainlink returned answer is 200000000 ($2.00)
+        conv_price_discrepancy = {
+            "price_usd": 1.0,
+            "chain": VALID_EVM_CHAIN,
+            "quote_asset": VALID_QUOTE_ADDR,
+            "reference_asset": "USD",
+            "timestamp_utc": self.as_of_utc,
+            "source": "chainlink",
+            "provider": "chainlink",
+            "feed_address": "0x8fa59a53f040d12d26f03bc9920373707c3c4004",
+            "valuation_policy": "STABLECOIN_ORACLE_VERIFIED",
+            "observation": {
+                "answer": 200000000,  # $2.00, does not match claimed $1.00!
+                "decimals": 8,
+                "round_id": 5,
+                "updated_at": self.as_of_utc,
+            },
+        }
+        ok, status, price, details = validate_quote_usd_conversion(
+            conv_price_discrepancy,
+            expected_chain=VALID_EVM_CHAIN,
+            expected_quote_asset=VALID_QUOTE_ADDR,
+            as_of_utc=self.as_of_utc,
+        )
+        self.assertFalse(ok)
+        self.assertEqual(status, "OBSERVATION_PRICE_DISCREPANCY")
+        self.assertIn("does not match claimed price", details["reason"])
+
+    # 23. Registered feed ID with incorrect returned asset rejected (QUOTE_CONVERSION_ASSET_MISMATCH)
+    def test_req23_registered_feed_with_incorrect_returned_asset_rejected(self):
+        # Genuine feed 0x5f4ec3df9cbd43714fe2740f5e3616155c5b8419 (ETH/USD), but quote asset is USDC
+        conv_asset_mismatch = {
+            "price_usd": 3000.0,
+            "chain": VALID_EVM_CHAIN,
+            "quote_asset": VALID_QUOTE_ADDR,  # USDC
+            "reference_asset": "USD",
+            "timestamp_utc": self.as_of_utc,
+            "source": "chainlink",
+            "provider": "chainlink",
+            "feed_address": "0x5f4ec3df9cbd43714fe2740f5e3616155c5b8419",  # ETH/USD feed
+            "valuation_policy": "CRYPTO_ORACLE_VERIFIED",
+            "observation": {
+                "answer": 300000000000,
+                "decimals": 8,
+                "round_id": 1,
+                "updated_at": self.as_of_utc,
+            },
+        }
+        ok, status, price, details = validate_quote_usd_conversion(
+            conv_asset_mismatch,
+            expected_chain=VALID_EVM_CHAIN,
+            expected_quote_asset=VALID_QUOTE_ADDR,
+            as_of_utc=self.as_of_utc,
+        )
+        self.assertFalse(ok)
+        self.assertEqual(status, "QUOTE_CONVERSION_ASSET_MISMATCH")
+
+    # 24. Valid provider responses pass across oracles and CEX
+    def test_req24_valid_provider_responses_pass(self):
+        # 24a. Chainlink Ethereum USDC/USD
+        cl_conv = {
+            "price_usd": 1.0,
+            "chain": "ethereum",
+            "quote_asset": "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48",
+            "reference_asset": "USD",
+            "timestamp_utc": self.as_of_utc,
+            "source": "chainlink",
+            "provider": "chainlink",
+            "feed_address": "0x8fa59a53f040d12d26f03bc9920373707c3c4004",
+            "valuation_policy": "STABLECOIN_ORACLE_VERIFIED",
+            "observation": {
+                "answer": 100000000,
+                "decimals": 8,
+                "round_id": 42,
+                "updated_at": self.as_of_utc,
+            },
+        }
+        ok_cl, status_cl, price_cl, _ = validate_quote_usd_conversion(cl_conv, as_of_utc=self.as_of_utc)
+        self.assertTrue(ok_cl)
+        self.assertEqual(status_cl, "CONVERSION_VERIFIED")
+        self.assertEqual(price_cl, 1.0)
+
+        # 24b. Pyth Solana USDC/USD
+        pyth_conv = {
+            "price_usd": 1.0,
+            "chain": "solana",
+            "quote_asset": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+            "reference_asset": "USD",
+            "timestamp_utc": self.as_of_utc,
+            "source": "pyth",
+            "provider": "pyth",
+            "feed_id": "0xeaa020c61cc479712813461ce153894a96a6c00b21ed0cfc2798d1f9a9e9c94a",
+            "valuation_policy": "STABLECOIN_ORACLE_VERIFIED",
+            "observation": {
+                "price": 100000000,
+                "expo": -8,
+                "publish_time": self.as_of_utc,
+            },
+        }
+        ok_py, status_py, price_py, _ = validate_quote_usd_conversion(pyth_conv, as_of_utc=self.as_of_utc)
+        self.assertTrue(ok_py)
+        self.assertEqual(status_py, "CONVERSION_VERIFIED")
+        self.assertEqual(price_py, 1.0)
+
+        # 24c. Coinbase USDC-USD
+        cb_conv = {
+            "price_usd": 1.0,
+            "chain": "ethereum",
+            "quote_asset": "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48",
+            "reference_asset": "USD",
+            "timestamp_utc": self.as_of_utc,
+            "source": "coinbase",
+            "provider": "coinbase",
+            "market_id": "USDC-USD",
+            "valuation_policy": "CEX_MARKET_TICKER_VERIFIED",
+            "observation": {
+                "symbol": "USDC-USD",
+                "last_price": 1.0,
+                "bid_price": 0.9999,
+                "ask_price": 1.0001,
+                "volume_24h": 45000000.0,
+            },
+        }
+        ok_cb, status_cb, price_cb, _ = validate_quote_usd_conversion(cb_conv, as_of_utc=self.as_of_utc)
+        self.assertTrue(ok_cb)
+        self.assertEqual(status_cb, "CONVERSION_VERIFIED")
+        self.assertEqual(price_cb, 1.0)
+
+    # 25. Registered pool with fabricated TWAP rejected
+    def test_req25_registered_pool_with_fabricated_twap_rejected(self):
+        # 25a. Window < 60s rejected
+        twap_short_window = {
+            "price_usd": 3000.0,
+            "chain": "ethereum",
+            "quote_asset": VALID_ALT_QUOTE,
+            "reference_asset": "USDC",
+            "timestamp_utc": self.as_of_utc,
+            "source": "uniswap_v3_twap",
+            "provider": "uniswap_v3_twap",
+            "pool_address": "0x88e6a0c2ddd26feeb64f039a2c41296fcb3f5640",
+            "valuation_policy": "ON_CHAIN_TWAP_VERIFIED",
+            "observation": {
+                "twap_window_seconds": 30,  # Below minimum 60s
+            },
+            "usd_conversion_leg": self.valid_quote_conversion,
+        }
+        ok_win, status_win, _, _ = validate_quote_usd_conversion(twap_short_window, as_of_utc=self.as_of_utc)
+        self.assertFalse(ok_win)
+        self.assertEqual(status_win, "INVALID_TWAP_WINDOW")
+
+        # 25b. TWAP price discrepancy rejected
+        twap_discrepancy = {
+            "price_usd": 3000.0,
+            "chain": "ethereum",
+            "quote_asset": VALID_ALT_QUOTE,
+            "reference_asset": "USDC",
+            "timestamp_utc": self.as_of_utc,
+            "source": "uniswap_v3_twap",
+            "provider": "uniswap_v3_twap",
+            "pool_address": "0x88e6a0c2ddd26feeb64f039a2c41296fcb3f5640",
+            "valuation_policy": "ON_CHAIN_TWAP_VERIFIED",
+            "observation": {
+                "twap_window_seconds": 180,
+                "twap_price": 1500.0,  # Discrepant from claimed 3000.0
+            },
+            "usd_conversion_leg": self.valid_quote_conversion,
+        }
+        ok_disc, status_disc, _, _ = validate_quote_usd_conversion(twap_discrepancy, as_of_utc=self.as_of_utc)
+        self.assertFalse(ok_disc)
+        self.assertEqual(status_disc, "OBSERVATION_PRICE_DISCREPANCY")
+
+    # 26. Recognized CEX market with fabricated response rejected
+    def test_req26_recognized_cex_market_with_fabricated_response_rejected(self):
+        # 26a. Crossed/inverted market: bid > ask
+        cex_crossed = {
+            "price_usd": 1.0,
+            "chain": "ethereum",
+            "quote_asset": VALID_QUOTE_ADDR,
+            "reference_asset": "USD",
+            "timestamp_utc": self.as_of_utc,
+            "source": "coinbase",
+            "provider": "coinbase",
+            "market_id": "USDC-USD",
+            "valuation_policy": "CEX_MARKET_TICKER_VERIFIED",
+            "observation": {
+                "symbol": "USDC-USD",
+                "last_price": 1.0,
+                "bid_price": 1.05,
+                "ask_price": 0.95,  # Crossed: bid > ask
+                "volume_24h": 1000000.0,
+            },
+        }
+        ok_inv, status_inv, _, details_inv = validate_quote_usd_conversion(cex_crossed, as_of_utc=self.as_of_utc)
+        self.assertFalse(ok_inv)
+        self.assertEqual(status_inv, "INVALID_CEX_OBSERVATION")
+        self.assertIn("crossed/inverted", details_inv["reason"])
+
+        # 26b. Non-positive volume rejected
+        cex_zero_vol = copy.deepcopy(cex_crossed)
+        cex_zero_vol["observation"]["bid_price"] = 0.9999
+        cex_zero_vol["observation"]["ask_price"] = 1.0001
+        cex_zero_vol["observation"]["volume_24h"] = 0.0  # Zero volume
+        ok_vol, status_vol, _, _ = validate_quote_usd_conversion(cex_zero_vol, as_of_utc=self.as_of_utc)
+        self.assertFalse(ok_vol)
+        self.assertEqual(status_vol, "INVALID_CEX_OBSERVATION")
+
+        # 26c. Observation market symbol mismatch rejected
+        cex_mismatched_sym = copy.deepcopy(cex_crossed)
+        cex_mismatched_sym["observation"]["bid_price"] = 0.9999
+        cex_mismatched_sym["observation"]["ask_price"] = 1.0001
+        cex_mismatched_sym["observation"]["symbol"] = "ETH-USD"  # Registered is USDC-USD
+        ok_sym, status_sym, _, _ = validate_quote_usd_conversion(cex_mismatched_sym, as_of_utc=self.as_of_utc)
+        self.assertFalse(ok_sym)
+        self.assertEqual(status_sym, "OBSERVATION_MARKET_MISMATCH")
+
+    # 27. DEX pair ID cannot independently prove USD conversion (UNVERIFIED_USD_CONVERSION_PATH)
+    def test_req27_dex_pair_id_cannot_independently_prove_usd_conversion(self):
+        # GeckoTerminal pool represents USDC/WETH ratio on-chain, NOT direct USD
+        gecko_pair_without_leg = {
+            "price_usd": 1.0,
+            "chain": "ethereum",
+            "quote_asset": VALID_QUOTE_ADDR,
+            "reference_asset": "USDC",
+            "timestamp_utc": self.as_of_utc,
+            "source": "geckoterminal",
+            "provider": "geckoterminal",
+            "feed_id": "eth_0x88e6a0c2ddd26feeb64f039a2c41296fcb3f5640",
+            "valuation_policy": "DEX_AGGREGATOR_VERIFIED",
+            "observation": {
+                "price": 1.0,
+                "token": VALID_QUOTE_ADDR,
+                "chain": "ethereum",
+                "timestamp": self.as_of_utc,
+            },
+            # Missing usd_conversion_leg!
+        }
+        ok, status, price, details = validate_quote_usd_conversion(gecko_pair_without_leg, as_of_utc=self.as_of_utc)
+        self.assertFalse(ok)
+        self.assertEqual(status, "UNVERIFIED_USD_CONVERSION_PATH")
+        self.assertIn("requires verified usd_conversion_leg to USD", details["reason"])
+
+        # With verified usd_conversion_leg, it passes and compounds
+        gecko_pair_with_leg = copy.deepcopy(gecko_pair_without_leg)
+        gecko_pair_with_leg["usd_conversion_leg"] = self.valid_quote_conversion
+        ok_leg, status_leg, price_leg, details_leg = validate_quote_usd_conversion(gecko_pair_with_leg, as_of_utc=self.as_of_utc)
+        self.assertTrue(ok_leg)
+        self.assertEqual(status_leg, "CONVERSION_VERIFIED")
+        self.assertEqual(price_leg, 1.0)
+
+    # 28. USDT never silently treated as USD
+    def test_req28_usdt_never_silently_treated_as_usd(self):
+        # 28a. reference_asset='USDT' rejected without chained conversion
+        usdt_bare_ref = {
+            "price_usd": 1.0,
+            "chain": "ethereum",
+            "quote_asset": "0xdac17f958d2ee523a2206206994597c13d831ec7",
+            "reference_asset": "USDT",
+            "timestamp_utc": self.as_of_utc,
+            "source": "chainlink",
+            "provider": "chainlink",
+            "feed_address": "0x3e7d1eab03480b83a7d35d7647822ec73a6858c6",
+            "valuation_policy": "STABLECOIN_ORACLE_VERIFIED",
+            "observation": {
+                "answer": 100000000,
+                "decimals": 8,
+                "round_id": 1,
+                "updated_at": self.as_of_utc,
+            },
+        }
+        ok, status, _, details = validate_quote_usd_conversion(usdt_bare_ref, as_of_utc=self.as_of_utc)
+        self.assertFalse(ok)
+        self.assertEqual(status, "MISSING_CHAINED_USD_CONVERSION")
+
+        # 28b. Binance SOLUSDT claiming reference_asset='USD' rejected
+        binance_sol_usd = {
+            "price_usd": 150.0,
+            "chain": "solana",
+            "quote_asset": "So11111111111111111111111111111111111111112",
+            "reference_asset": "USD",  # Wrong! Market quotes in USDT!
+            "timestamp_utc": self.as_of_utc,
+            "source": "binance",
+            "provider": "binance",
+            "market_id": "SOLUSDT",
+            "valuation_policy": "CEX_MARKET_TICKER_VERIFIED",
+            "observation": {
+                "symbol": "SOLUSDT",
+                "last_price": 150.0,
+                "bid_price": 149.9,
+                "ask_price": 150.1,
+                "volume_24h": 200000.0,
+            },
+        }
+        ok_sol, status_sol, _, details_sol = validate_quote_usd_conversion(binance_sol_usd, as_of_utc=self.as_of_utc)
+        self.assertFalse(ok_sol)
+        self.assertEqual(status_sol, "REFERENCE_CURRENCY_MISMATCH")
+
+    # 29. All conversion paths fail closed when any leg is missing or stale
+    def test_req29_all_conversion_paths_fail_closed_when_any_leg_is_missing_or_stale(self):
+        # Uniswap v3 TWAP with stale chained conversion leg
+        twap_stale_leg = {
+            "price_usd": 3000.0,
+            "chain": "ethereum",
+            "quote_asset": VALID_ALT_QUOTE,
+            "reference_asset": "USDC",
+            "timestamp_utc": self.as_of_utc,
+            "source": "uniswap_v3_twap",
+            "provider": "uniswap_v3_twap",
+            "pool_address": "0x88e6a0c2ddd26feeb64f039a2c41296fcb3f5640",
+            "valuation_policy": "ON_CHAIN_TWAP_VERIFIED",
+            "observation": {
+                "twap_window_seconds": 180,
+                "twap_price": 3000.0,
+            },
+            "usd_conversion_leg": {
+                "price_usd": 1.0,
+                "chain": "ethereum",
+                "quote_asset": VALID_QUOTE_ADDR,
+                "reference_asset": "USD",
+                "timestamp_utc": "2026-11-13T11:40:00Z",  # Stale: 20 minutes old
+                "source": "chainlink",
+                "provider": "chainlink",
+                "feed_address": "0x8fa59a53f040d12d26f03bc9920373707c3c4004",
+                "valuation_policy": "STABLECOIN_ORACLE_VERIFIED",
+                "observation": {
+                    "answer": 100000000,
+                    "decimals": 8,
+                    "round_id": 1,
+                    "updated_at": "2026-11-13T11:40:00Z",
+                },
+            },
+        }
+        ok, status, price, details = validate_quote_usd_conversion(twap_stale_leg, as_of_utc=self.as_of_utc)
+        self.assertFalse(ok)
+        self.assertEqual(status, "STALE_CHAINED_USD_CONVERSION")
+
+    # 30. Pyth observation price discrepancy and missing fields
+    def test_req30_pyth_observation_price_discrepancy_and_missing_fields(self):
+        # 30a. Missing expo
+        pyth_missing_expo = {
+            "price_usd": 1.0,
+            "chain": "solana",
+            "quote_asset": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+            "reference_asset": "USD",
+            "timestamp_utc": self.as_of_utc,
+            "source": "pyth",
+            "provider": "pyth",
+            "feed_id": "0xeaa020c61cc479712813461ce153894a96a6c00b21ed0cfc2798d1f9a9e9c94a",
+            "valuation_policy": "STABLECOIN_ORACLE_VERIFIED",
+            "observation": {
+                "price": 100000000,
+                # Missing expo!
+                "publish_time": self.as_of_utc,
+            },
+        }
+        ok_exp, status_exp, _, _ = validate_quote_usd_conversion(pyth_missing_expo, as_of_utc=self.as_of_utc)
+        self.assertFalse(ok_exp)
+        self.assertEqual(status_exp, "MISSING_PROVIDER_OBSERVATION_FIELDS")
+
+        # 30b. Price discrepancy
+        pyth_discrepancy = {
+            "price_usd": 1.0,
+            "chain": "solana",
+            "quote_asset": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+            "reference_asset": "USD",
+            "timestamp_utc": self.as_of_utc,
+            "source": "pyth",
+            "provider": "pyth",
+            "feed_id": "0xeaa020c61cc479712813461ce153894a96a6c00b21ed0cfc2798d1f9a9e9c94a",
+            "valuation_policy": "STABLECOIN_ORACLE_VERIFIED",
+            "observation": {
+                "price": 95000000,  # 0.95, not matching claimed 1.0
+                "expo": -8,
+                "publish_time": self.as_of_utc,
+            },
+        }
+        ok_disc, status_disc, _, _ = validate_quote_usd_conversion(pyth_discrepancy, as_of_utc=self.as_of_utc)
+        self.assertFalse(ok_disc)
+        self.assertEqual(status_disc, "OBSERVATION_PRICE_DISCREPANCY")
 
 
 if __name__ == "__main__":
