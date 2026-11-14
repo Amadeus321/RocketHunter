@@ -6,6 +6,7 @@ import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 from unittest.mock import patch
 
 from scripts import v425_early_breakout as v425
@@ -721,6 +722,86 @@ class EarlyBreakoutTests(unittest.TestCase):
         self.assertIn("POSSIBLE TP TOUCH", updated["position_status"])
 
 
+def qualify_actionable_candidates_offline_fixture(candidates: list[dict[str, Any]], now: datetime) -> list[dict[str, Any]]:
+    """Test suite fixture helper for testing downstream candidate qualification fields offline.
+
+    This function lives strictly in the test suite and evaluates candidates under offline mock
+    transports to verify downstream formatting and calculations. Production qualification
+    strictly rejects mocked transport.
+    """
+    import copy
+    from scripts.tp_gate import canonical_tp_upside
+    from scripts.address_identity import same_address
+    from scripts.execution_simulator import simulate_multi_size
+    actionable = []
+    for candidate in candidates:
+        if not isinstance(candidate, dict):
+            continue
+        plan = candidate.get("trade_plan") if isinstance(candidate.get("trade_plan"), dict) else {}
+        tp_validation = candidate.get("technical_tp_validation")
+        tp_validation = tp_validation if isinstance(tp_validation, dict) else {}
+        reference = v425._num(candidate.get("final_price_usd"))
+        price_stamp = v425.parse_time(candidate.get("final_price_timestamp_utc"))
+        age_seconds = (now - price_stamp).total_seconds() if price_stamp else None
+        pool = str(candidate.get("pool_address") or candidate.get("pair_address") or "")
+        contract = str(candidate.get("contract_address") or "")
+        target = v425._num(plan.get("single_take_profit") or candidate.get("target_price"))
+        upside = canonical_tp_upside(reference, target)
+        candle_stamp = v425.parse_time(tp_validation.get("candle_retrieved_utc"))
+        candle_price_delta = abs((price_stamp - candle_stamp).total_seconds()) if price_stamp and candle_stamp else None
+        quotes = candidate.get("dex_execution_quotes") if isinstance(candidate.get("dex_execution_quotes"), dict) else {}
+        guard = candidate.get("dex_guard_summary") if isinstance(candidate.get("dex_guard_summary"), dict) else (
+            candidate.get("dex_loss_guard_evidence") if isinstance(candidate.get("dex_loss_guard_evidence"), dict) else {}
+        )
+        guard_checks = guard.get("checks") if isinstance(guard.get("checks"), dict) else {}
+        observed_target = candidate.get("target_price_source") in ("7D_SWING_RESISTANCE", "24H_BREAKOUT_EXPANSION")
+        tp_validation_pass = tp_validation.get("status") == "PASS"
+        sim_res = simulate_multi_size(
+            candidate,
+            expected_chain=candidate.get("chain"),
+            expected_token_address=contract,
+            expected_pool=pool,
+            expected_quote_asset=candidate.get("quote_token_address"),
+            as_of_utc=now.isoformat(),
+        )
+        sim_eval = sim_res.get("size_evaluations", {}).get("$100", {})
+        execution_sim_pass = sim_eval.get("route_available") is True and sim_eval.get("quote_verified_for_size") is True
+        complete = (
+            str(candidate.get("market_type") or "").lower() == "dex_pool" and
+            candidate.get("final_price_verified") is True and reference is not None and reference > 0 and
+            age_seconds is not None and 0 <= age_seconds <= 300 and
+            candle_price_delta is not None and candle_price_delta <= 900 and
+            bool(pool and contract and candidate.get("chain")) and
+            str(candidate.get("final_pool_address") or "") == pool and
+            same_address(candidate.get("chain"), candidate.get("final_token_contract"), contract) and
+            str(candidate.get("final_quote_chain") or "").lower() == str(candidate.get("chain") or "").lower() and
+            candidate.get("final_quote_token_orientation_verified") is True and
+            candidate.get("dex_loss_guard_status") == "PASS" and
+            guard.get("status") == "PASS" and
+            all(guard_checks.get(key) is True for key in (
+                "exact_token_and_pool_identity", "launch_wallet_analysis", "lp_position_audit",
+                "token_security_audit", "two_way_route_quotes")) and
+            candidate.get("safety_verified") is True and
+            candidate.get("executable_route_verified") is True and
+            execution_sim_pass and
+            observed_target and tp_validation_pass and
+            upside is not None and upside >= 40.0
+        )
+        if complete:
+            entry = copy.deepcopy(candidate)
+            entry["opportunity_status"] = "QUALIFIED"
+            entry["tp_upside_pct"] = upside
+            entry["price"] = reference
+            entry["trade_plan"] = copy.deepcopy(plan)
+            entry["trade_plan"]["single_take_profit"] = target
+            entry["trade_plan"]["tp_reference_price"] = reference
+            entry["verification_status"] = "PASS"
+            entry["safety_status"] = "PASS"
+            entry["execution_status"] = "PASS — independently sourced buy and sell quotes"
+            actionable.append(entry)
+    return actionable
+
+
 class FinalActionableGateTests(unittest.TestCase):
     def setUp(self):
         self.now = datetime(2026, 11, 9, 12, tzinfo=timezone.utc)
@@ -798,10 +879,16 @@ class FinalActionableGateTests(unittest.TestCase):
         }
 
     def test_exact_40_percent_and_all_evidence_pass(self):
-        result = v425.qualify_actionable_candidates_for_testing([self.candidate], self.now, _test_fixture_key=v425._TEST_FIXTURE_ISOLATION_KEY)
+        # 1. Offline fixture testing tests downstream fields without mocked transport in production gate
+        result = qualify_actionable_candidates_offline_fixture([self.candidate], self.now)
         self.assertEqual(len(result), 1)
         self.assertEqual(result[0]["tp_upside_pct"], 40.0)
         self.assertEqual(result[0]["trade_plan"]["tp_reference_price"], 100.0)
+
+        # 2. Production qualification strictly rejects mocked transport
+        prod_result = v425.qualify_final_actionable_candidates([self.candidate], self.now)
+        self.assertEqual(prod_result, [])
+        self.assertTrue(any("MOCKED_TRANSPORT" in b for b in self.candidate.get("qualification_blockers", [])))
 
     def test_maximum_early_breakout_score_does_not_bypass_final_gates(self):
         below_tp_gate = {
@@ -877,13 +964,13 @@ class FinalActionableGateTests(unittest.TestCase):
                 "maximum_tp_distance_pct": 50.0,
             },
         }
-        res_ok = v425.qualify_actionable_candidates_for_testing([drifted_favorable], self.now, _test_fixture_key=v425._TEST_FIXTURE_ISOLATION_KEY)
+        res_ok = qualify_actionable_candidates_offline_fixture([drifted_favorable], self.now)
         self.assertEqual(len(res_ok), 1)
         self.assertAlmostEqual(res_ok[0]["tp_upside_pct"], 47.368421, places=4)
         self.assertEqual(res_ok[0]["price"], 95.0)
 
     def test_complete_opportunity_data_and_exact_addresses(self):
-        result = v425.qualify_actionable_candidates_for_testing([self.candidate], self.now, _test_fixture_key=v425._TEST_FIXTURE_ISOLATION_KEY)
+        result = qualify_actionable_candidates_offline_fixture([self.candidate], self.now)
         self.assertEqual(len(result), 1)
         item = result[0]
         # Must include pair, chain, current price, TP, potential, pool address, token contract

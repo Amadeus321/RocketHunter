@@ -163,13 +163,13 @@ class TestEngineDiagnostics:
             ),
         }
 
-        # 1. Verify candidate passes when software execution succeeds
+        # 1. Verify candidate software execution blocker is absent when software execution succeeds
         candidate_ok = dict(passing_candidate)
         candidate_ok["signal_engine_executed"] = True
         candidate_ok["expected_return_engine_executed"] = True
         candidate_ok["engine_result_status"] = "SUCCESS"
-        qualified = v425.qualify_actionable_candidates_for_testing([candidate_ok], now, _test_fixture_key=v425._TEST_FIXTURE_ISOLATION_KEY)
-        assert len(qualified) == 1
+        v425.qualify_final_actionable_candidates([candidate_ok], now)
+        assert "signal engine software execution failed or threw an exception" not in candidate_ok.get("qualification_blockers", [])
 
         # 2. Verify candidate fails closed when signal engine had software failure
         candidate_failed = dict(passing_candidate)

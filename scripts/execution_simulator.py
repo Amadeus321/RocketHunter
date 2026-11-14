@@ -1033,45 +1033,93 @@ def _canonical_observation_payload(
     reference_asset: str,
     valuation_policy: str,
     price_usd: float,
-    observation: dict[str, Any],
+    observation: dict[str, Any] | None,
     observation_timestamp: str,
     retrieval_timestamp_utc: str,
     http_status: int,
     rpc_method: str | None,
-    raw_payload: str,
-    response_sha256: str,
+    raw_payload: str | None,
+    response_sha256: str | None,
     transport_type: str,
     acquisition_method: str,
-    request_url: str = "",
+    request_url: str | None = None,
     cryptographic_signature_verified: bool = False,
     feed_id: str | None = None,
     market_id: str | None = None,
     pool_address: str | None = None,
 ) -> bytes:
+    # 1. Exact finite numeric price representation without rounding
+    if price_usd is None or isinstance(price_usd, bool):
+        raise ValueError("price_usd must be a non-null numeric value")
+    val_price = float(price_usd)
+    if not math.isfinite(val_price) or val_price <= 0.0:
+        raise ValueError(f"price_usd must be positive and finite, got {price_usd!r}")
+
+    # 2. Strict HTTP status code validation (reject 0, None, < 100, > 599)
+    if http_status is None or isinstance(http_status, bool) or not isinstance(http_status, int):
+        raise ValueError(f"http_status must be a valid integer status code, got {http_status!r}")
+    if http_status < 100 or http_status > 599:
+        raise ValueError(f"http_status must be in the range [100, 599], got {http_status!r}")
+    val_http_status = int(http_status)
+
+    # 3. Explicit None handling for required fields
+    if acquisition_method is None:
+        raise ValueError("acquisition_method must not be None")
+    if chain is None:
+        raise ValueError("chain must not be None")
+    if chain_id is None:
+        raise ValueError("chain_id must not be None")
+    if feed_or_pool_id is None:
+        raise ValueError("feed_or_pool_id must not be None")
+    if observation_timestamp is None:
+        raise ValueError("observation_timestamp must not be None")
+    if provider is None:
+        raise ValueError("provider must not be None")
+    if provider_identifier is None:
+        raise ValueError("provider_identifier must not be None")
+    if quote_asset is None:
+        raise ValueError("quote_asset must not be None")
+    if reference_asset is None:
+        raise ValueError("reference_asset must not be None")
+    if retrieval_timestamp_utc is None:
+        raise ValueError("retrieval_timestamp_utc must not be None")
+    if transport_type is None:
+        raise ValueError("transport_type must not be None")
+    if valuation_policy is None:
+        raise ValueError("valuation_policy must not be None")
+
+    # 4. Deterministic observation data handling
+    if observation is None:
+        val_observation = {}
+    elif isinstance(observation, dict):
+        val_observation = copy.deepcopy(observation)
+    else:
+        raise ValueError(f"observation must be a dictionary or None, got {type(observation)}")
+
     canonical_dict = {
-        "acquisition_method": str(acquisition_method or "").strip(),
-        "chain": str(chain or "").lower().strip(),
-        "chain_id": str(chain_id or "").strip(),
-        "cryptographic_signature_verified": bool(cryptographic_signature_verified),
-        "feed_id": str(feed_id or "").lower().strip(),
-        "feed_or_pool_id": str(feed_or_pool_id or "").lower().strip(),
-        "http_status": int(http_status or 200),
-        "market_id": str(market_id or "").strip(),
-        "observation": observation or {},
-        "observation_timestamp": str(observation_timestamp or "").strip(),
-        "pool_address": str(pool_address or "").lower().strip(),
-        "price_usd": round(float(price_usd), 8) if price_usd is not None else 0.0,
-        "provider": str(provider or "").lower().strip(),
-        "provider_identifier": str(provider_identifier or "").lower().strip(),
-        "quote_asset": str(quote_asset or "").lower().strip(),
-        "raw_payload": str(raw_payload or ""),
-        "raw_payload_sha256": str(response_sha256 or "").lower().strip(),
-        "reference_asset": str(reference_asset or "").strip().upper(),
-        "request_url": str(request_url or "").strip(),
-        "retrieval_timestamp_utc": str(retrieval_timestamp_utc or "").strip(),
-        "rpc_method": str(rpc_method or "").strip(),
-        "transport_type": str(transport_type or "").strip(),
-        "valuation_policy": str(valuation_policy or "").strip(),
+        "acquisition_method": str(acquisition_method).strip(),
+        "chain": str(chain).strip().lower(),
+        "chain_id": str(chain_id).strip(),
+        "cryptographic_signature_verified": bool(cryptographic_signature_verified) if cryptographic_signature_verified is not None else False,
+        "feed_id": str(feed_id).strip().lower() if feed_id is not None else "",
+        "feed_or_pool_id": str(feed_or_pool_id).strip().lower(),
+        "http_status": val_http_status,
+        "market_id": str(market_id).strip() if market_id is not None else "",
+        "observation": val_observation,
+        "observation_timestamp": str(observation_timestamp).strip(),
+        "pool_address": str(pool_address).strip().lower() if pool_address is not None else "",
+        "price_usd": val_price,
+        "provider": str(provider).strip().lower(),
+        "provider_identifier": str(provider_identifier).strip().lower(),
+        "quote_asset": str(quote_asset).strip().lower(),
+        "raw_payload": str(raw_payload) if raw_payload is not None else "",
+        "raw_payload_sha256": str(response_sha256).strip().lower() if response_sha256 is not None else "",
+        "reference_asset": str(reference_asset).strip().upper(),
+        "request_url": str(request_url).strip() if request_url is not None else "",
+        "retrieval_timestamp_utc": str(retrieval_timestamp_utc).strip(),
+        "rpc_method": str(rpc_method).strip() if rpc_method is not None else "",
+        "transport_type": str(transport_type).strip(),
+        "valuation_policy": str(valuation_policy).strip(),
     }
     canonical_json = json.dumps(canonical_dict, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
     return canonical_json.encode("utf-8")
@@ -1080,13 +1128,18 @@ def _canonical_observation_payload(
 def _generate_provenance_token(payload_bytes: bytes) -> str:
     """Generate an internal HMAC-SHA256 authentication token for canonical observation bytes.
 
-    SECURITY LIMITATION NOTE:
-    This token provides strictly internal in-memory anti-tampering and structural integrity
-    verification within the running Python process. It guarantees that an AcquiredProviderObservation
-    object created by genuine acquisition adapters has not been mutated or forged after creation.
-    It does NOT provide external cryptographic proof of provider origin (such as an on-chain oracle
-    signature or TLS notary proof), nor can it protect against an adversary with arbitrary in-process
-    code execution or a compromised Python runtime.
+    SECURITY ARCHITECTURE & LIMITATION NOTE:
+    This token detects field mutation and accidental in-memory tampering within a trusted
+    Python process.
+
+    CRITICAL SECURITY LIMITATIONS:
+    1. In-process scope: HMAC detects mutations within the boundaries of a trusted, uncompromised
+       Python runtime. It does NOT protect against arbitrary in-process code execution, process memory
+       injection, or an adversary who has compromised the host runtime environment.
+    2. No external provider proof: In-process HMAC does NOT independently prove the external provider's
+       cryptographic origin (it is not an on-chain oracle signature or TLS notary proof from Chainlink/Pyth).
+       External authenticity relies on genuine HTTP/RPC responses from trusted endpoints, while HMAC
+       solely verifies that the in-memory representation has not been altered after acquisition.
     """
     return hmac.new(_PROVENANCE_SECRET, payload_bytes, hashlib.sha256).hexdigest()
 
@@ -1094,12 +1147,18 @@ def _generate_provenance_token(payload_bytes: bytes) -> str:
 def _verify_provenance_token(obs: Any) -> bool:
     """Verify internal HMAC-SHA256 authentication token for an AcquiredProviderObservation.
 
+    SECURITY LIMITATION NOTE:
+    Detects in-memory mutation within a trusted process. Does not protect against arbitrary code
+    execution or a compromised runtime, and does not independently prove external provider origin.
+
     Validates that:
     1. The object is a genuine AcquiredProviderObservation instance.
     2. The object was sealed by the genuine adapter factory, not instantiated by caller code.
     3. The internal _auth_token is present.
-    4. If raw_payload is present, its SHA-256 matches response_sha256.
-    5. The canonical bytes of all 23 security-relevant fields match the HMAC token exactly.
+    4. http_status is a valid integer HTTP status code [100, 599].
+    5. price_usd is a positive finite numeric value.
+    6. If raw_payload is present, its SHA-256 matches response_sha256.
+    7. The canonical bytes of all 23 security-relevant fields match the HMAC token exactly.
     """
     if not isinstance(obs, AcquiredProviderObservation):
         return False
@@ -1107,12 +1166,27 @@ def _verify_provenance_token(obs: Any) -> bool:
         return False
     if not getattr(obs, "_auth_token", None):
         return False
+    if obs.http_status is None or isinstance(obs.http_status, bool) or not isinstance(obs.http_status, int):
+        return False
+    if obs.http_status < 100 or obs.http_status > 599:
+        return False
+    if obs.price_usd is None or isinstance(obs.price_usd, bool):
+        return False
+    try:
+        val_price = float(obs.price_usd)
+        if not math.isfinite(val_price) or val_price <= 0.0:
+            return False
+    except (ValueError, TypeError):
+        return False
     # Validate raw_payload sha256 consistency
     if obs.raw_payload:
         actual_hash = hashlib.sha256(obs.raw_payload.encode("utf-8")).hexdigest()
-        if actual_hash.lower() != obs.response_sha256.lower():
+        if actual_hash.lower() != str(obs.response_sha256 or "").lower():
             return False
-    canonical_bytes = obs.canonical_bytes()
+    try:
+        canonical_bytes = obs.canonical_bytes()
+    except (ValueError, TypeError):
+        return False
     expected = _generate_provenance_token(canonical_bytes)
     return hmac.compare_digest(obs._auth_token, expected)
 
@@ -1161,22 +1235,22 @@ class AcquiredProviderObservation:
         self.chain_id = chain_id
         self.quote_asset = str(quote_asset).strip()
         self.reference_asset = str(reference_asset).strip().upper()
-        self.price_usd = float(price_usd)
-        self.retrieval_time_utc = str(retrieval_time_utc).strip()
-        self.request_url = str(request_url).strip()
-        self.rpc_method = str(rpc_method).strip() if rpc_method else None
-        self.http_status = int(http_status)
-        self.raw_payload = str(raw_payload)
-        self.response_sha256 = str(response_sha256 or (hashlib.sha256(raw_payload.encode("utf-8")).hexdigest() if raw_payload else "")).lower().strip()
-        self.observation = copy.deepcopy(observation) if observation else {}
+        self.price_usd = float(price_usd) if price_usd is not None and not isinstance(price_usd, bool) else price_usd
+        self.retrieval_time_utc = str(retrieval_time_utc).strip() if retrieval_time_utc is not None else None
+        self.request_url = str(request_url).strip() if request_url is not None else ""
+        self.rpc_method = str(rpc_method).strip() if rpc_method is not None else None
+        self.http_status = int(http_status) if isinstance(http_status, int) and not isinstance(http_status, bool) else http_status
+        self.raw_payload = str(raw_payload) if raw_payload is not None else ""
+        self.response_sha256 = str(response_sha256 or (hashlib.sha256(self.raw_payload.encode("utf-8")).hexdigest() if self.raw_payload else "")).lower().strip()
+        self.observation = copy.deepcopy(observation) if observation is not None else {}
         self.feed_id = str(feed_id).strip() if feed_id else None
         self.market_id = str(market_id).strip() if market_id else None
         self.pool_address = str(pool_address).strip() if pool_address else None
-        self.valuation_policy = str(valuation_policy).strip()
-        self.transport_type = str(transport_type).strip()
-        self.acquisition_method = str(acquisition_method).strip()
-        self.observation_timestamp = str(observation_timestamp or retrieval_time_utc).strip()
-        self.cryptographic_signature_verified = bool(cryptographic_signature_verified)
+        self.valuation_policy = str(valuation_policy).strip() if valuation_policy is not None else None
+        self.transport_type = str(transport_type).strip() if transport_type is not None else None
+        self.acquisition_method = str(acquisition_method).strip() if acquisition_method is not None else None
+        self.observation_timestamp = str(observation_timestamp or retrieval_time_utc).strip() if (observation_timestamp or retrieval_time_utc) is not None else None
+        self.cryptographic_signature_verified = bool(cryptographic_signature_verified) if cryptographic_signature_verified is not None else False
 
         # Reject caller-created observation objects that bypass genuine adapter factory
         if _internal_seal is not _ADAPTER_FACTORY_SECRET:
@@ -1187,7 +1261,10 @@ class AcquiredProviderObservation:
         if _auth_token is not None:
             self._auth_token = _auth_token
         else:
-            self._auth_token = _generate_provenance_token(self.canonical_bytes())
+            try:
+                self._auth_token = _generate_provenance_token(self.canonical_bytes())
+            except Exception:
+                self._auth_token = None
 
     @classmethod
     def _create(cls, **kwargs: Any) -> "AcquiredProviderObservation":
@@ -2084,7 +2161,7 @@ def validate_quote_usd_conversion(
                 "reason": "observation HMAC signature verification failed; observation data was tampered or mutated"
             }
         # Check dictionary mutations vs actual_obs
-        if abs(clean_price - actual_obs.price_usd) > 1e-6:
+        if clean_price != actual_obs.price_usd:
             return False, "OBSERVATION_MUTATION_DETECTED", None, {
                 "reason": f"conversion dict price ({clean_price}) does not match authenticated observation ({actual_obs.price_usd})"
             }
@@ -2967,7 +3044,7 @@ def validate_quote_usd_conversion(
             }
 
         # Check for mutation between conversion dict and authenticated actual_obs
-        if abs(clean_price - actual_obs.price_usd) > 1e-6:
+        if clean_price != actual_obs.price_usd:
             return False, "OBSERVATION_MUTATION_DETECTED", None, {
                 "reason": f"conversion dict price ({clean_price}) does not match authenticated observation ({actual_obs.price_usd})"
             }

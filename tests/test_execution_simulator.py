@@ -23,6 +23,7 @@ from scripts.execution_simulator import (
     AcquiredProviderObservation,
     ProviderUnavailableError,
     _verify_provenance_token,
+    _canonical_observation_payload,
 )
 from scripts import v425_early_breakout as v425
 
@@ -1168,12 +1169,19 @@ class AdversarialPhase2ExecutionTests(unittest.TestCase):
             "dex_execution_quotes": copy.deepcopy(self.valid_quote_source["dex_execution_quotes"]),
         }
 
-        qualified = v425.qualify_actionable_candidates_for_testing([cand], self.now_dt, _test_fixture_key=v425._TEST_FIXTURE_ISOLATION_KEY)
-        self.assertEqual(len(qualified), 1)
-        self.assertEqual(qualified[0]["opportunity_status"], "QUALIFIED")
-        self.assertEqual(qualified[0]["execution_simulation"]["status"], "EXECUTABLE_ROUTE_AVAILABLE")
-        self.assertTrue(qualified[0]["execution_simulation"]["route_available"])
-        self.assertTrue(qualified[0]["execution_simulation"]["quote_verified_for_size"])
+        sim_res = simulate_multi_size(
+            cand,
+            expected_chain=cand["chain"],
+            expected_token_address=cand["contract_address"],
+            expected_pool=cand["pool_address"],
+            as_of_utc=self.as_of_utc,
+        )
+        s100 = sim_res["size_evaluations"]["$100"]
+        self.assertEqual(s100["status"], "EXECUTABLE_ROUTE_AVAILABLE")
+        self.assertTrue(s100["route_available"])
+        self.assertTrue(s100["quote_verified_for_size"])
+        # Production qualification rejects mocked transport
+        self.assertEqual(v425.qualify_final_actionable_candidates([cand], self.now_dt), [])
 
     # 23. AMM reserve orientation: candidate is token0, quote asset is token1
     def test_23_amm_orientation_candidate_is_token0(self):
@@ -1452,14 +1460,21 @@ class AdversarialPhase2ExecutionTests(unittest.TestCase):
             },
         }
 
-        qualified = v425.qualify_actionable_candidates_for_testing([cand_token1], self.now_dt, _test_fixture_key=v425._TEST_FIXTURE_ISOLATION_KEY)
-        self.assertEqual(len(qualified), 1)
-        self.assertEqual(qualified[0]["opportunity_status"], "QUALIFIED")
-        self.assertEqual(qualified[0]["execution_simulation"]["status"], "EXECUTABLE_AMM_ROUTE_AVAILABLE")
-        self.assertTrue(qualified[0]["execution_simulation"]["route_available"])
-        self.assertFalse(qualified[0]["execution_simulation"]["token0_is_candidate"])
-        self.assertEqual(qualified[0]["execution_simulation"]["reserve_base"], 10_000.0)
-        self.assertEqual(qualified[0]["execution_simulation"]["reserve_quote"], 50_000.0)
+        sim_res = simulate_multi_size(
+            cand_token1,
+            expected_chain=cand_token1["chain"],
+            expected_token_address=cand_token1["contract_address"],
+            expected_pool=cand_token1["pool_address"],
+            as_of_utc=self.as_of_utc,
+        )
+        s100 = sim_res["size_evaluations"]["$100"]
+        self.assertEqual(s100["status"], "EXECUTABLE_AMM_ROUTE_AVAILABLE")
+        self.assertTrue(s100["route_available"])
+        self.assertFalse(s100["token0_is_candidate"])
+        self.assertEqual(s100["reserve_base"], 10_000.0)
+        self.assertEqual(s100["reserve_quote"], 50_000.0)
+        # Production qualification rejects mocked transport
+        self.assertEqual(v425.qualify_final_actionable_candidates([cand_token1], self.now_dt), [])
 
     # 29. AMM ambiguous base_token/quote_token aliases cannot silently establish orientation
     def test_29_amm_ambiguous_aliases_cannot_establish_orientation(self):
@@ -2762,7 +2777,7 @@ class AdversarialPhase2ExecutionTests(unittest.TestCase):
                 "feed_address": "0x9999999999999999999999999999999999999999",  # Fabricated feed
             },
         })
-        qualified = v425.qualify_actionable_candidates_for_testing([cand], self.now_dt, _test_fixture_key=v425._TEST_FIXTURE_ISOLATION_KEY)
+        qualified = v425.qualify_final_actionable_candidates([cand], self.now_dt)
         self.assertEqual(len(qualified), 0)
         self.assertTrue(any("quote-asset USD conversion verification failed: UNRECOGNIZED_FEED_ADDRESS" in b for b in cand["qualification_blockers"]))
 
@@ -3127,7 +3142,7 @@ class AdversarialPhase2ExecutionTests(unittest.TestCase):
             "timestamp_utc": self.as_of_utc,
             "fee_bps": 30.0,
         }
-        qualified = v425.qualify_actionable_candidates_for_testing([cand], self.now_dt, _test_fixture_key=v425._TEST_FIXTURE_ISOLATION_KEY)
+        qualified = v425.qualify_final_actionable_candidates([cand], self.now_dt)
         self.assertEqual(len(qualified), 0)
         self.assertTrue(any("REFERENCE_CURRENCY_MISMATCH" in b for b in cand["qualification_blockers"]))
 
@@ -3980,7 +3995,7 @@ class AdversarialPhase2ExecutionTests(unittest.TestCase):
         # Candidate fails closed at production qualification gate
         cand = copy.deepcopy(self.valid_quote_source)
         cand["quote_usd_conversion"] = fake_acquired
-        qualified = v425.qualify_actionable_candidates_for_testing([cand], self.now_dt, _test_fixture_key=v425._TEST_FIXTURE_ISOLATION_KEY)
+        qualified = v425.qualify_final_actionable_candidates([cand], self.now_dt)
         self.assertEqual(len(qualified), 0)
         self.assertTrue(any("STRUCTURALLY_CONSISTENT_UNVERIFIED_PROVENANCE" in b for b in cand["qualification_blockers"]))
 
@@ -4290,7 +4305,7 @@ class AdversarialPhase2ExecutionTests(unittest.TestCase):
                 "updated_at": self.as_of_utc,
             },
         }
-        res_unverif = v425.qualify_actionable_candidates_for_testing([cand_unverif], self.now_dt, _test_fixture_key=v425._TEST_FIXTURE_ISOLATION_KEY)
+        res_unverif = v425.qualify_final_actionable_candidates([cand_unverif], self.now_dt)
         self.assertEqual(len(res_unverif), 0)
         self.assertTrue(any("STRUCTURALLY_CONSISTENT_UNVERIFIED_PROVENANCE" in b for b in cand_unverif["qualification_blockers"]))
 
@@ -4300,13 +4315,6 @@ class AdversarialPhase2ExecutionTests(unittest.TestCase):
         res_prod = v425.qualify_final_actionable_candidates([cand_auth], self.now_dt)
         self.assertEqual(len(res_prod), 0)
         self.assertTrue(any("MOCKED_TRANSPORT" in b for b in cand_auth["qualification_blockers"]))
-
-        # In offline unit test mode with test fixture key, candidate passes:
-        cand_auth_test = copy.deepcopy(cand)
-        cand_auth_test["quote_usd_conversion"] = self.valid_quote_conversion
-        res_auth = v425.qualify_actionable_candidates_for_testing([cand_auth_test], self.now_dt, _test_fixture_key=v425._TEST_FIXTURE_ISOLATION_KEY)
-        self.assertEqual(len(res_auth), 1)
-        self.assertEqual(cand_auth_test["qualification_blockers"], [])
 
 
 class ProvenanceIntegrityAdversarialTests(unittest.TestCase):
@@ -4508,12 +4516,6 @@ class ProvenanceIntegrityAdversarialTests(unittest.TestCase):
         self.assertEqual(len(qualified_prod), 0)
         self.assertTrue(any("MOCKED_TRANSPORT" in b for b in cand["qualification_blockers"]))
 
-        # Offline testing explicit opt-in via private test fixture key
-        cand_test = copy.deepcopy(self.base_candidate)
-        qualified_test = v425.qualify_actionable_candidates_for_testing([cand_test], self.now_dt, _test_fixture_key=v425._TEST_FIXTURE_ISOLATION_KEY)
-        self.assertEqual(len(qualified_test), 1)
-        self.assertEqual(cand_test["qualification_blockers"], [])
-
     # 9. Caller-supplied transport cannot claim live provenance
     def test_09_caller_supplied_transport_cannot_claim_live_provenance(self):
         # 1. Adapter call with transport parameter is marked MOCKED_TRANSPORT
@@ -4668,14 +4670,14 @@ class ProvenanceIntegrityAdversarialTests(unittest.TestCase):
         # Case A: Mutated price
         cand_a = copy.deepcopy(self.base_candidate)
         cand_a["quote_usd_conversion"]["price_usd"] = 999.0
-        res_a = v425.qualify_actionable_candidates_for_testing([cand_a], self.now_dt, _test_fixture_key=v425._TEST_FIXTURE_ISOLATION_KEY)
+        res_a = v425.qualify_final_actionable_candidates([cand_a], self.now_dt)
         self.assertEqual(len(res_a), 0)
         self.assertTrue(any("OBSERVATION_MUTATION_DETECTED" in b for b in cand_a["qualification_blockers"]))
 
         # Case B: Mutated chain
         cand_b = copy.deepcopy(self.base_candidate)
         cand_b["quote_usd_conversion"]["chain"] = "arbitrum"
-        res_b = v425.qualify_actionable_candidates_for_testing([cand_b], self.now_dt, _test_fixture_key=v425._TEST_FIXTURE_ISOLATION_KEY)
+        res_b = v425.qualify_final_actionable_candidates([cand_b], self.now_dt)
         self.assertEqual(len(res_b), 0)
         self.assertTrue(any("QUOTE_CONVERSION_CHAIN_MISMATCH" in b or "OBSERVATION_MUTATION_DETECTED" in b for b in cand_b["qualification_blockers"]))
 
@@ -4690,7 +4692,7 @@ class ProvenanceIntegrityAdversarialTests(unittest.TestCase):
             retrieval_time_utc=self.as_of_utc,
         )
         cand_c["quote_usd_conversion"] = caller_obs
-        res_c = v425.qualify_actionable_candidates_for_testing([cand_c], self.now_dt, _test_fixture_key=v425._TEST_FIXTURE_ISOLATION_KEY)
+        res_c = v425.qualify_final_actionable_candidates([cand_c], self.now_dt)
         self.assertEqual(len(res_c), 0)
         self.assertTrue(any("CALLER_CREATED_OBSERVATION_OBJECT" in b for b in cand_c["qualification_blockers"]))
 
@@ -4852,22 +4854,123 @@ class ProductionGateHardeningTests(ProvenanceIntegrityAdversarialTests):
         self.assertFalse(ok)
         self.assertEqual(status, "INVALID_PROVENANCE_SIGNATURE")
 
-    # 10. Test-only helper cannot be reached without isolation key
-    def test_10_test_only_helper_cannot_be_reached_without_isolation_key(self):
+    # 10. Production module exposes no mock override or test helper
+    def test_10_production_module_exposes_no_mock_override_or_test_helper(self):
+        self.assertFalse(hasattr(v425, "qualify_actionable_candidates_for_testing"))
+        self.assertFalse(hasattr(v425, "_TEST_FIXTURE_ISOLATION_KEY"))
+        self.assertFalse(hasattr(v425, "_qualify_actionable_candidates_core"))
         cand = copy.deepcopy(self.base_candidate)
-        # Calling without _test_fixture_key raises TypeError
         with self.assertRaises(TypeError):
-            v425.qualify_actionable_candidates_for_testing([cand], self.now_dt)
-        # Calling with wrong key raises PermissionError
-        with self.assertRaises(PermissionError):
-            v425.qualify_actionable_candidates_for_testing([cand], self.now_dt, _test_fixture_key="wrong_secret")
-        # Calling with another object raises PermissionError
-        with self.assertRaises(PermissionError):
-            v425.qualify_actionable_candidates_for_testing([cand], self.now_dt, _test_fixture_key=object())
-        # Calling with genuine private token succeeds
-        res = v425.qualify_actionable_candidates_for_testing([cand], self.now_dt, _test_fixture_key=v425._TEST_FIXTURE_ISOLATION_KEY)
-        self.assertEqual(len(res), 1)
-        self.assertEqual(res[0]["opportunity_status"], "QUALIFIED")
+            v425.qualify_final_actionable_candidates([cand], self.now_dt, allow_mocked_transport=True)
+        with self.assertRaises(TypeError):
+            v425.qualify_final_actionable_candidates([cand], self.now_dt, _allow_mocked_transport=True)
+        # Mocked transport candidate unconditionally rejected
+        res = v425.qualify_final_actionable_candidates([cand], self.now_dt)
+        self.assertEqual(res, [])
+        self.assertTrue(any("MOCKED_TRANSPORT" in b for b in cand["qualification_blockers"]))
+
+    # 11. Tiny price mutation (0.000000001) invalidates signature
+    def test_11_tiny_price_mutation_invalidates_signature(self):
+        obs = ChainlinkRpcAdapter.fetch(
+            VALID_QUOTE_ADDR,
+            VALID_EVM_CHAIN,
+            as_of_utc=self.as_of_utc,
+            transport=self.mock_cl_transport,
+        )
+        self.assertTrue(_verify_provenance_token(obs))
+        obs.price_usd += 0.000000001
+        self.assertFalse(_verify_provenance_token(obs))
+        ok, status, _, _ = validate_quote_usd_conversion(obs, as_of_utc=self.as_of_utc)
+        self.assertFalse(ok)
+        self.assertEqual(status, "INVALID_PROVENANCE_SIGNATURE")
+
+    # 12. HTTP status mutation to 0 rejected
+    def test_12_http_status_mutation_to_zero_rejected(self):
+        obs = ChainlinkRpcAdapter.fetch(
+            VALID_QUOTE_ADDR,
+            VALID_EVM_CHAIN,
+            as_of_utc=self.as_of_utc,
+            transport=self.mock_cl_transport,
+        )
+        self.assertTrue(_verify_provenance_token(obs))
+        obs.http_status = 0
+        self.assertFalse(_verify_provenance_token(obs))
+        ok, status, _, _ = validate_quote_usd_conversion(obs, as_of_utc=self.as_of_utc)
+        self.assertFalse(ok)
+        self.assertEqual(status, "INVALID_PROVENANCE_SIGNATURE")
+
+    # 13. HTTP status mutation to None rejected
+    def test_13_http_status_mutation_to_none_rejected(self):
+        obs = ChainlinkRpcAdapter.fetch(
+            VALID_QUOTE_ADDR,
+            VALID_EVM_CHAIN,
+            as_of_utc=self.as_of_utc,
+            transport=self.mock_cl_transport,
+        )
+        self.assertTrue(_verify_provenance_token(obs))
+        obs.http_status = None
+        self.assertFalse(_verify_provenance_token(obs))
+        ok, status, _, _ = validate_quote_usd_conversion(obs, as_of_utc=self.as_of_utc)
+        self.assertFalse(ok)
+        self.assertEqual(status, "INVALID_PROVENANCE_SIGNATURE")
+
+    # 14. Exact price preservation for very small token prices
+    def test_14_exact_price_preservation_for_very_small_token_prices(self):
+        small_price = 0.00000000123456789
+        canonical = _canonical_observation_payload(
+            provider="chainlink",
+            provider_identifier="0x8fa59a53f040d12d26f03bc9920373707c3c4004",
+            chain="ethereum",
+            chain_id=1,
+            quote_asset="0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48",
+            feed_or_pool_id="0x8fa59a53f040d12d26f03bc9920373707c3c4004",
+            reference_asset="USD",
+            valuation_policy="STABLECOIN_ORACLE_VERIFIED",
+            price_usd=small_price,
+            observation={"answer": 100000000},
+            observation_timestamp="2026-11-13T12:00:00Z",
+            retrieval_timestamp_utc="2026-11-13T12:00:00Z",
+            http_status=200,
+            rpc_method="eth_call",
+            raw_payload="{}",
+            response_sha256="e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            transport_type="LIVE_NETWORK_ACQUISITION",
+            acquisition_method="GENUINE_READ_ONLY_RPC",
+        )
+        parsed = json.loads(canonical.decode("utf-8"))
+        self.assertEqual(parsed["price_usd"], small_price)
+        self.assertNotEqual(parsed["price_usd"], 0.0)
+
+    # 15. Nested observation data mutation invalidates signature
+    def test_15_nested_observation_data_mutation_invalidates_signature(self):
+        obs = ChainlinkRpcAdapter.fetch(
+            VALID_QUOTE_ADDR,
+            VALID_EVM_CHAIN,
+            as_of_utc=self.as_of_utc,
+            transport=self.mock_cl_transport,
+        )
+        self.assertTrue(_verify_provenance_token(obs))
+        # Mutate nested observation key
+        obs.observation["answer"] = 999999999
+        self.assertFalse(_verify_provenance_token(obs))
+        ok, status, _, _ = validate_quote_usd_conversion(obs, as_of_utc=self.as_of_utc)
+        self.assertFalse(ok)
+        self.assertEqual(status, "INVALID_PROVENANCE_SIGNATURE")
+
+    # 16. Valid observations pass verification
+    def test_16_valid_observations_pass_verification(self):
+        obs = ChainlinkRpcAdapter.fetch(
+            VALID_QUOTE_ADDR,
+            VALID_EVM_CHAIN,
+            as_of_utc=self.as_of_utc,
+            transport=self.mock_cl_transport,
+        )
+        self.assertTrue(_verify_provenance_token(obs))
+        ok, status, price, details = validate_quote_usd_conversion(obs, as_of_utc=self.as_of_utc)
+        self.assertTrue(ok)
+        self.assertEqual(status, "TEST_MOCKED_OBSERVATION_VALIDATED")
+        self.assertEqual(price, 1.0)
+        self.assertTrue(details["provider_acquired"])
 
 
 class TestLiveProviderIntegrations(unittest.TestCase):
