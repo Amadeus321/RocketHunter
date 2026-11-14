@@ -117,11 +117,14 @@ class TestEngineDiagnostics:
             },
             "safety_verified": True,
             "executable_route_verified": True,
+            "intended_trade_size_usd": 100.0,
+            "liquidity_usd": 50000.0,
             "dex_execution_quotes": {
                 "provider": "uniswap_v3",
+                "notional_size_usd": 100.0,
                 "timestamp_utc": now.isoformat(),
-                "buy_quote": {"amount_out": 100},
-                "sell_quote": {"amount_out": 95},
+                "buy_quote": {"amount_out": 100, "notional_size_usd": 100.0},
+                "sell_quote": {"amount_out": 95, "notional_size_usd": 100.0},
             },
         }
 

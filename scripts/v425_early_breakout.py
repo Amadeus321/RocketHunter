@@ -1781,9 +1781,11 @@ def qualify_final_actionable_candidates(candidates: list[dict[str, Any]], now: d
     try:
         from scripts.tp_gate import canonical_tp_upside
         from scripts.address_identity import same_address
+        from scripts.execution_simulator import simulate_multi_size
     except ImportError:
         from tp_gate import canonical_tp_upside
         from address_identity import same_address
+        from execution_simulator import simulate_multi_size
     actionable = []
     for candidate in candidates:
         if not isinstance(candidate, dict):
@@ -1855,6 +1857,71 @@ def qualify_final_actionable_candidates(candidates: list[dict[str, Any]], now: d
             "SOFTWARE_ERROR_SIGNAL_ENGINES_INCOMPLETE" in (candidate.get("early_breakout_risk_flags") or []) or
             "SOFTWARE_ERROR_SIGNAL_ENGINES_INCOMPLETE" in (candidate.get("risk_flags") or [])
         )
+
+        # Execution Simulation Integration
+        intended_size = _num(
+            candidate.get("intended_trade_size_usd") or
+            plan.get("intended_trade_size_usd") or
+            quotes.get("notional_size_usd") or
+            (quotes.get("buy_quote") or {}).get("notional_size_usd") or
+            (quotes.get("buy_quote") or {}).get("in_amount") or
+            (quotes.get("sell_quote") or {}).get("output_amount")
+        )
+
+        sim_eval = None
+        execution_sim_pass = False
+        sim_blockers: list[str] = []
+
+        if intended_size is None or intended_size <= 0:
+            sim_blockers.append("intended trade size is missing or unconfigured for execution simulation")
+        else:
+            sim_now_iso = (
+                now.isoformat().replace("+00:00", "Z")
+                if now.tzinfo else
+                now.replace(tzinfo=timezone.utc).isoformat().replace("+00:00", "Z")
+            )
+            sim_res = simulate_multi_size(
+                candidate,
+                sizes_usd=[intended_size],
+                fee_bps=float(candidate.get("fee_bps", 30.0) or 30.0),
+                gas_usd=_num(candidate.get("gas_usd")),
+                as_of_utc=sim_now_iso,
+                max_quote_age_seconds=300.0,
+                target_upside_pct=upside,
+                expected_token_address=contract,
+                expected_chain=candidate.get("chain"),
+                expected_pool=pool,
+            )
+            size_key = f"${int(intended_size) if intended_size.is_integer() else intended_size}"
+            sim_eval = sim_res.get("size_evaluations", {}).get(size_key) or {}
+
+            candidate["execution_simulation"] = sim_eval
+            candidate["execution_adjusted_return_pct"] = sim_eval.get("execution_adjusted_return_pct")
+            candidate["estimated_round_trip_cost_pct"] = sim_eval.get("estimated_round_trip_cost_pct")
+
+            sim_route_ok = sim_eval.get("route_available") is True
+            sim_fresh_ok = sim_eval.get("quote_freshness") == "FRESH"
+            sim_size_ok = sim_eval.get("quote_verified_for_size") is True
+            sim_buy_ok = sim_eval.get("buy", {}).get("status") in {"AVAILABLE", "COMPLETE"}
+            sim_sell_ok = sim_eval.get("sell", {}).get("status") in {"AVAILABLE", "COMPLETE"}
+
+            execution_sim_pass = (
+                sim_route_ok and sim_fresh_ok and sim_size_ok and sim_buy_ok and sim_sell_ok
+            )
+
+            if not sim_fresh_ok:
+                sim_blockers.append("buy/sell quotes are stale, future-dated, or missing a timestamp")
+            if not sim_size_ok:
+                sim_blockers.append(f"execution quote is not verified for intended trade size ${intended_size:.0f}")
+            if sim_eval.get("status") == "INSUFFICIENT_LIQUIDITY":
+                sim_blockers.append("insufficient liquidity for intended trade size")
+            if not sim_buy_ok:
+                sim_blockers.append("execution simulation buy route unavailable")
+            if not sim_sell_ok:
+                sim_blockers.append("execution simulation sell route unavailable")
+            if not sim_route_ok:
+                sim_blockers.append("execution-route verification did not pass")
+
         complete = (
             not software_failure and
             str(candidate.get("market_type") or "").lower() == "dex_pool" and
@@ -1873,6 +1940,7 @@ def qualify_final_actionable_candidates(candidates: list[dict[str, Any]], now: d
                 "token_security_audit", "two_way_route_quotes")) and
             candidate.get("safety_verified") is True and
             candidate.get("executable_route_verified") is True and
+            execution_sim_pass and
             bool(quotes.get("provider") and isinstance(quotes.get("buy_quote"), dict) and quotes.get("buy_quote") and
                  isinstance(quotes.get("sell_quote"), dict) and quotes.get("sell_quote")) and
             quote_age_seconds is not None and 0 <= quote_age_seconds <= 300 and
@@ -1933,6 +2001,7 @@ def qualify_final_actionable_candidates(candidates: list[dict[str, Any]], now: d
         if not (quotes.get("provider") and quotes.get("buy_quote") and quotes.get("sell_quote") and
                 quote_age_seconds is not None and 0 <= quote_age_seconds <= 300):
             blockers.append("fresh two-way execution quotes are missing")
+        blockers.extend(sim_blockers)
         candidate["qualification_blockers"] = list(dict.fromkeys(blockers))
         candidate["opportunity_status"] = "QUALIFIED" if complete else "NOT QUALIFIED"
         candidate["entry_decision"] = "QUALIFIED" if complete else "NOT QUALIFIED"
@@ -1947,10 +2016,14 @@ def qualify_final_actionable_candidates(candidates: list[dict[str, Any]], now: d
             entry["trade_plan"] = plan
             entry["price"] = reference
             entry["tp_upside_pct"] = round(upside, 8)
+            entry["technical_tp_upside_pct"] = round(upside, 8)
+            if sim_eval:
+                entry["execution_adjusted_return_pct"] = sim_eval.get("execution_adjusted_return_pct")
             entry["verification_status"] = "PASS"
             entry["safety_status"] = "PASS"
             entry["execution_status"] = "PASS — independently sourced buy and sell quotes"
             actionable.append(entry)
+    return actionable
     return actionable
 
 
