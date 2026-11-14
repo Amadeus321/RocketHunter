@@ -12,6 +12,7 @@ from scripts.execution_simulator import (
     validate_timestamp_freshness,
     is_valid_address,
 )
+from scripts import v425_early_breakout as v425
 
 # Realistic, syntactically valid blockchain test addresses (42 chars, valid hexadecimal)
 VALID_EVM_CHAIN = "ethereum"
@@ -1015,6 +1016,291 @@ class AdversarialPhase2ExecutionTests(unittest.TestCase):
         self.assertEqual(qualified[0]["execution_simulation"]["status"], "EXECUTABLE_ROUTE_AVAILABLE")
         self.assertTrue(qualified[0]["execution_simulation"]["route_available"])
         self.assertTrue(qualified[0]["execution_simulation"]["quote_verified_for_size"])
+
+    # 23. AMM reserve orientation: candidate is token0, quote asset is token1
+    def test_23_amm_orientation_candidate_is_token0(self):
+        src = {
+            "chain": VALID_EVM_CHAIN,
+            "pool_address": VALID_POOL_ADDR,
+            "contract_address": VALID_TOKEN_ADDR,
+            "liquidity_usd": 100_000.0,
+            "amm_reserves": {
+                "chain": VALID_EVM_CHAIN,
+                "pool_address": VALID_POOL_ADDR,
+                "token0": VALID_TOKEN_ADDR,   # Candidate is token0
+                "token1": VALID_QUOTE_ADDR,   # Quote asset is token1
+                "reserve0": 10_000.0,         # Candidate reserve
+                "reserve1": 50_000.0,         # Quote asset reserve
+                "timestamp_utc": self.as_of_utc,
+            },
+        }
+        res = simulate_multi_size(
+            src,
+            sizes_usd=[100.0],
+            as_of_utc=self.as_of_utc,
+            expected_token_address=VALID_TOKEN_ADDR,
+            expected_pool=VALID_POOL_ADDR,
+            expected_chain=VALID_EVM_CHAIN,
+            expected_quote_asset=VALID_QUOTE_ADDR,
+        )
+        s100 = res["size_evaluations"]["$100"]
+        self.assertTrue(s100["route_available"])
+        self.assertEqual(s100["status"], "EXECUTABLE_AMM_ROUTE_AVAILABLE")
+        self.assertTrue(s100["token0_is_candidate"])
+        self.assertEqual(s100["reserve_base"], 10_000.0)
+        self.assertEqual(s100["reserve_quote"], 50_000.0)
+        self.assertAlmostEqual(s100["buy"]["filled_quote_usd"], 100.0, places=2)
+        self.assertTrue(s100["buy"]["filled_quantity"] > 0)
+        self.assertTrue(s100["sell"]["filled_quote_usd"] > 0)
+
+    # 24. AMM reserve orientation: candidate is token1, quote asset is token0
+    def test_24_amm_orientation_candidate_is_token1(self):
+        src = {
+            "chain": VALID_EVM_CHAIN,
+            "pool_address": VALID_POOL_ADDR,
+            "contract_address": VALID_TOKEN_ADDR,
+            "liquidity_usd": 100_000.0,
+            "amm_reserves": {
+                "chain": VALID_EVM_CHAIN,
+                "pool_address": VALID_POOL_ADDR,
+                "token0": VALID_QUOTE_ADDR,   # Quote asset is token0
+                "token1": VALID_TOKEN_ADDR,   # Candidate is token1
+                "reserve0": 50_000.0,         # Quote asset reserve
+                "reserve1": 10_000.0,         # Candidate reserve
+                "timestamp_utc": self.as_of_utc,
+            },
+        }
+        res = simulate_multi_size(
+            src,
+            sizes_usd=[100.0],
+            as_of_utc=self.as_of_utc,
+            expected_token_address=VALID_TOKEN_ADDR,
+            expected_pool=VALID_POOL_ADDR,
+            expected_chain=VALID_EVM_CHAIN,
+            expected_quote_asset=VALID_QUOTE_ADDR,
+        )
+        s100 = res["size_evaluations"]["$100"]
+        self.assertTrue(s100["route_available"])
+        self.assertEqual(s100["status"], "EXECUTABLE_AMM_ROUTE_AVAILABLE")
+        self.assertFalse(s100["token0_is_candidate"])
+        self.assertEqual(s100["reserve_base"], 10_000.0)
+        self.assertEqual(s100["reserve_quote"], 50_000.0)
+        self.assertAlmostEqual(s100["buy"]["filled_quote_usd"], 100.0, places=2)
+        self.assertTrue(s100["buy"]["filled_quantity"] > 0)
+        self.assertTrue(s100["sell"]["filled_quote_usd"] > 0)
+
+    # 25. Both orientations produce economically equivalent results for identical pool economics
+    def test_25_amm_both_orientations_produce_economically_equivalent_results(self):
+        # Pool A: token0 is candidate, token1 is quote
+        src_a = {
+            "chain": VALID_EVM_CHAIN,
+            "pool_address": VALID_POOL_ADDR,
+            "contract_address": VALID_TOKEN_ADDR,
+            "liquidity_usd": 100_000.0,
+            "amm_reserves": {
+                "chain": VALID_EVM_CHAIN,
+                "pool_address": VALID_POOL_ADDR,
+                "token0": VALID_TOKEN_ADDR,
+                "token1": VALID_QUOTE_ADDR,
+                "reserve0": 10_000.0,
+                "reserve1": 50_000.0,
+                "timestamp_utc": self.as_of_utc,
+            },
+        }
+
+        # Pool B: token0 is quote, token1 is candidate (swapped ordering & swapped reserves)
+        src_b = {
+            "chain": VALID_EVM_CHAIN,
+            "pool_address": VALID_POOL_ADDR,
+            "contract_address": VALID_TOKEN_ADDR,
+            "liquidity_usd": 100_000.0,
+            "amm_reserves": {
+                "chain": VALID_EVM_CHAIN,
+                "pool_address": VALID_POOL_ADDR,
+                "token0": VALID_QUOTE_ADDR,
+                "token1": VALID_TOKEN_ADDR,
+                "reserve0": 50_000.0,
+                "reserve1": 10_000.0,
+                "timestamp_utc": self.as_of_utc,
+            },
+        }
+
+        sizes = [100.0, 500.0, 1000.0]
+        res_a = simulate_multi_size(
+            src_a, sizes_usd=sizes, as_of_utc=self.as_of_utc,
+            expected_token_address=VALID_TOKEN_ADDR, expected_pool=VALID_POOL_ADDR,
+            expected_chain=VALID_EVM_CHAIN, expected_quote_asset=VALID_QUOTE_ADDR,
+        )
+        res_b = simulate_multi_size(
+            src_b, sizes_usd=sizes, as_of_utc=self.as_of_utc,
+            expected_token_address=VALID_TOKEN_ADDR, expected_pool=VALID_POOL_ADDR,
+            expected_chain=VALID_EVM_CHAIN, expected_quote_asset=VALID_QUOTE_ADDR,
+        )
+
+        for s in ["$100", "$500", "$1000"]:
+            eval_a = res_a["size_evaluations"][s]
+            eval_b = res_b["size_evaluations"][s]
+            self.assertTrue(eval_a["route_available"])
+            self.assertTrue(eval_b["route_available"])
+            self.assertAlmostEqual(eval_a["buy"]["filled_quantity"], eval_b["buy"]["filled_quantity"], places=9)
+            self.assertAlmostEqual(eval_a["sell"]["filled_quote_usd"], eval_b["sell"]["filled_quote_usd"], places=9)
+            self.assertAlmostEqual(eval_a["buy"]["vwap"], eval_b["buy"]["vwap"], places=9)
+            self.assertAlmostEqual(eval_a["sell"]["vwap"], eval_b["sell"]["vwap"], places=9)
+            self.assertAlmostEqual(eval_a["estimated_round_trip_cost_pct"], eval_b["estimated_round_trip_cost_pct"], places=4)
+            self.assertAlmostEqual(eval_a["round_trip_cost_usd"], eval_b["round_trip_cost_usd"], places=4)
+
+    # 26. Incorrect reserve orientation is rejected or fails closed
+    def test_26_amm_incorrect_reserve_orientation_rejected(self):
+        # Conflicting explicit reserve_base with oriented token reserve
+        src_inconsistent = {
+            "chain": VALID_EVM_CHAIN,
+            "pool_address": VALID_POOL_ADDR,
+            "contract_address": VALID_TOKEN_ADDR,
+            "liquidity_usd": 100_000.0,
+            "amm_reserves": {
+                "chain": VALID_EVM_CHAIN,
+                "pool_address": VALID_POOL_ADDR,
+                "token0": VALID_QUOTE_ADDR,   # token0 is quote asset
+                "token1": VALID_TOKEN_ADDR,   # token1 is candidate token
+                "reserve0": 50_000.0,         # quote reserve = 50,000
+                "reserve1": 10_000.0,         # candidate reserve = 10,000
+                "reserve_base": 50_000.0,     # Contradicts candidate reserve (claims base is 50,000)
+                "reserve_quote": 10_000.0,
+                "timestamp_utc": self.as_of_utc,
+            },
+        }
+        res = simulate_multi_size(
+            src_inconsistent, sizes_usd=[100.0], as_of_utc=self.as_of_utc,
+            expected_token_address=VALID_TOKEN_ADDR, expected_quote_asset=VALID_QUOTE_ADDR,
+        )
+        self.assertFalse(res["size_evaluations"]["$100"]["route_available"])
+        self.assertEqual(res["size_evaluations"]["$100"]["status"], "INCONSISTENT_AMM_RESERVES")
+
+    # 27. Missing token identity and invalid reserves fail closed
+    def test_27_amm_missing_identity_and_invalid_reserves_fail_closed(self):
+        # 1. Missing token identity when reserve0/reserve1 are provided
+        with self.assertRaises(ValueError) as cm:
+            simulate_constant_product_amm(
+                buy_notional_usd=100.0,
+                reserve0=10000.0,
+                reserve1=50000.0,
+                require_reserve_identity=False,
+            )
+        self.assertIn("MISSING_AMM_TOKEN_IDENTITY", str(cm.exception))
+
+        # 2. Same address for token0 and token1
+        with self.assertRaises(ValueError) as cm:
+            simulate_constant_product_amm(
+                buy_notional_usd=100.0,
+                chain=VALID_EVM_CHAIN,
+                pool_address=VALID_POOL_ADDR,
+                token0=VALID_TOKEN_ADDR,
+                token1=VALID_TOKEN_ADDR,
+                expected_token_address=VALID_TOKEN_ADDR,
+                reserve0=10000.0,
+                reserve1=50000.0,
+            )
+        self.assertIn("INVALID_AMM_RESERVES", str(cm.exception))
+
+        # 3. Negative, zero, NaN, Inf reserves
+        for bad in [-100.0, 0.0, float("nan"), float("inf")]:
+            with self.assertRaises(ValueError) as cm:
+                simulate_constant_product_amm(
+                    buy_notional_usd=100.0,
+                    chain=VALID_EVM_CHAIN,
+                    pool_address=VALID_POOL_ADDR,
+                    token0=VALID_TOKEN_ADDR,
+                    token1=VALID_QUOTE_ADDR,
+                    expected_token_address=VALID_TOKEN_ADDR,
+                    reserve0=bad,
+                    reserve1=50000.0,
+                )
+            self.assertIn("INVALID_AMM_RESERVES", str(cm.exception))
+
+        # 4. Partial reserves (reserve0 given without reserve1)
+        with self.assertRaises(ValueError) as cm:
+            simulate_constant_product_amm(
+                buy_notional_usd=100.0,
+                chain=VALID_EVM_CHAIN,
+                pool_address=VALID_POOL_ADDR,
+                token0=VALID_TOKEN_ADDR,
+                token1=VALID_QUOTE_ADDR,
+                expected_token_address=VALID_TOKEN_ADDR,
+                reserve0=10000.0,
+                reserve1=None,
+            )
+        self.assertIn("INVALID_AMM_RESERVES", str(cm.exception))
+
+    # 28. Production gate correctly qualifies candidates with oriented AMM reserves
+    def test_28_production_gate_with_oriented_reserves(self):
+        cand_token1 = {
+            "chain": VALID_EVM_CHAIN,
+            "pool_address": VALID_POOL_ADDR,
+            "contract_address": VALID_TOKEN_ADDR,
+            "final_pool_address": VALID_POOL_ADDR,
+            "final_token_contract": VALID_TOKEN_ADDR,
+            "final_quote_chain": VALID_EVM_CHAIN,
+            "final_quote_token_orientation_verified": True,
+            "final_price_verified": True,
+            "token_symbol": "ROCKET",
+            "market_type": "dex_pool",
+            "expected_quote_asset": VALID_QUOTE_ADDR,
+            "quote_token_address": VALID_QUOTE_ADDR,
+            "final_price_usd": 5.0,
+            "target_price": 7.0,  # +40.0% upside
+            "target_price_source": "7D_SWING_RESISTANCE",
+            "final_price_timestamp_utc": self.as_of_utc,
+            "intended_trade_size_usd": 100.0,
+            "liquidity_usd": 100_000.0,
+            "fee_bps": 30.0,
+            "technical_tp_validation": {
+                "status": "PASS",
+                "chain": VALID_EVM_CHAIN,
+                "pool_address": VALID_POOL_ADDR,
+                "token_address": VALID_TOKEN_ADDR,
+                "token_orientation_verified": True,
+                "target_price": 7.0,
+                "target_price_source": "7D_SWING_RESISTANCE",
+                "current_price": 5.0,
+                "atr_1h_pct": 10.0,
+                "maximum_tp_distance_pct": 40.0,
+                "candle_retrieved_utc": self.as_of_utc,
+            },
+            "trade_plan": {"single_take_profit": 7.0, "intended_trade_size_usd": 100.0, "quote_token_address": VALID_QUOTE_ADDR},
+            "dex_loss_guard_status": "PASS",
+            "dex_loss_guard_evidence": {
+                "status": "PASS",
+                "checks": {
+                    "exact_token_and_pool_identity": True,
+                    "launch_wallet_analysis": True,
+                    "lp_position_audit": True,
+                    "token_security_audit": True,
+                    "two_way_route_quotes": True,
+                },
+            },
+            "safety_verified": True,
+            "executable_route_verified": True,
+            "dex_execution_quotes": copy.deepcopy(self.valid_quote_source["dex_execution_quotes"]),
+            # AMM snapshot where candidate is token1 and quote asset is token0
+            "amm_reserves": {
+                "chain": VALID_EVM_CHAIN,
+                "pool_address": VALID_POOL_ADDR,
+                "token0": VALID_QUOTE_ADDR,
+                "token1": VALID_TOKEN_ADDR,
+                "reserve0": 50_000.0,
+                "reserve1": 10_000.0,
+                "timestamp_utc": self.as_of_utc,
+            },
+        }
+
+        qualified = v425.qualify_final_actionable_candidates([cand_token1], self.now_dt)
+        self.assertEqual(len(qualified), 1)
+        self.assertEqual(qualified[0]["opportunity_status"], "QUALIFIED")
+        self.assertEqual(qualified[0]["execution_simulation"]["status"], "EXECUTABLE_AMM_ROUTE_AVAILABLE")
+        self.assertTrue(qualified[0]["execution_simulation"]["route_available"])
+        self.assertFalse(qualified[0]["execution_simulation"]["token0_is_candidate"])
+        self.assertEqual(qualified[0]["execution_simulation"]["reserve_base"], 10_000.0)
+        self.assertEqual(qualified[0]["execution_simulation"]["reserve_quote"], 50_000.0)
 
 
 if __name__ == "__main__":

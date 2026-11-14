@@ -1956,7 +1956,7 @@ def qualify_final_actionable_candidates(candidates: list[dict[str, Any]], now: d
             if sim_status in {"MISSING_BOOK_IDENTITY", "MISSING_BOOK_CHAIN_IDENTITY", "MISSING_BOOK_POOL_IDENTITY", "MISSING_BOOK_TOKEN_IDENTITY", "BOOK_CHAIN_MISMATCH", "BOOK_POOL_MISMATCH", "BOOK_TOKEN_MISMATCH"}:
                 sim_blockers.append(f"order book identity verification failed: {sim_status}")
 
-            if sim_status in {"MISSING_AMM_POOL_IDENTITY", "MISSING_AMM_CHAIN_IDENTITY", "MISSING_AMM_TOKEN_IDENTITY", "AMM_POOL_MISMATCH", "AMM_CHAIN_MISMATCH", "AMM_TOKEN_MISMATCH", "INVALID_AMM_RESERVES"}:
+            if sim_status in {"MISSING_AMM_POOL_IDENTITY", "MISSING_AMM_CHAIN_IDENTITY", "MISSING_AMM_TOKEN_IDENTITY", "AMM_POOL_MISMATCH", "AMM_CHAIN_MISMATCH", "AMM_TOKEN_MISMATCH", "INVALID_AMM_RESERVES", "INCONSISTENT_AMM_RESERVES", "MISSING_AMM_RESERVES"}:
                 sim_blockers.append(f"AMM reserve verification failed: {sim_status}")
 
             if sim_status in {"INVALID_BUY_QUOTE_AMOUNTS", "INVALID_SELL_QUOTE_AMOUNTS"}:

@@ -560,11 +560,13 @@ def validate_two_way_quotes(
 
 
 def simulate_constant_product_amm(
-    reserve_base: float,
-    reserve_quote: float,
-    buy_notional_usd: float,
+    reserve_base: float | None = None,
+    reserve_quote: float | None = None,
+    buy_notional_usd: float = 0.0,
     fee_bps: float = 30.0,
     *,
+    reserve0: float | None = None,
+    reserve1: float | None = None,
     chain: str | None = None,
     pool_address: str | None = None,
     token0: str | None = None,
@@ -576,19 +578,34 @@ def simulate_constant_product_amm(
     expected_quote_asset: str | None = None,
     require_reserve_identity: bool = True,
 ) -> dict[str, Any]:
-    """Exact constant-product AMM (x * y = k) simulation with reserve tracking, fees, and identity verification."""
-    fee = validate_fee_bps(fee_bps)
+    """Exact constant-product AMM (x * y = k) simulation with reserve tracking, fees, and identity verification.
 
-    rb = _clean_strictly_positive(reserve_base)
-    rq = _clean_strictly_positive(reserve_quote)
-    if rb is None or rq is None:
-        raise ValueError("INVALID_AMM_RESERVES: AMM reserves must be positive and finite")
+    Associates reserve0 exclusively with token0 and reserve1 exclusively with token1.
+    Determines whether candidate token is token0 or token1 to select the correct base and quote reserves.
+    Rejects missing, zero, negative, non-finite, or inconsistent reserve data.
+    Fails closed on any incomplete identity or orientation ambiguity.
+    """
+    fee = validate_fee_bps(fee_bps)
 
     buy_usd = _clean_strictly_positive(buy_notional_usd)
     if buy_usd is None:
         raise ValueError("buy_notional_usd must be positive and finite")
 
-    # Reserve identity verification directly from reserve evidence
+    def _check_reserve(val: Any, name: str) -> float:
+        if val is None:
+            raise ValueError(f"MISSING_AMM_RESERVES: {name} is missing")
+        num = _clean_strictly_positive(val)
+        if num is None:
+            raise ValueError(f"INVALID_AMM_RESERVES: {name} must be positive and finite, got {val!r}")
+        return num
+
+    token0_is_candidate = None
+    effective_base_reserve = None
+    effective_quote_reserve = None
+    r0 = None
+    r1 = None
+
+    # Step 1: Validate identity and determine token orientation
     if require_reserve_identity:
         if not chain:
             raise ValueError("MISSING_AMM_CHAIN_IDENTITY: reserve snapshot missing chain identity")
@@ -604,22 +621,100 @@ def simulate_constant_product_amm(
         if not is_valid_address(chain, token1):
             raise ValueError(f"INVALID_TOKEN_ADDRESS: invalid AMM token1 address format: {token1}")
 
+        if same_address(chain, token0, token1):
+            raise ValueError("INVALID_AMM_RESERVES: token0 and token1 cannot be the same address")
+
         if expected_chain and str(chain).strip().lower() != str(expected_chain).strip().lower():
             raise ValueError("AMM_CHAIN_MISMATCH: reserve snapshot chain does not match expected chain")
         if expected_pool and not same_address(expected_chain or chain, pool_address, expected_pool):
             raise ValueError("AMM_POOL_MISMATCH: reserve pool does not match expected pool")
 
-        if expected_token_address:
-            match0 = same_address(expected_chain or chain, token0, expected_token_address)
-            match1 = same_address(expected_chain or chain, token1, expected_token_address)
+        if not expected_token_address:
+            raise ValueError("MISSING_TOKEN_ADDRESS: expected_token_address is required to determine reserve orientation")
+        if not is_valid_address(expected_chain or chain, expected_token_address):
+            raise ValueError(f"INVALID_TOKEN_ADDRESS: invalid expected candidate token address format: {expected_token_address}")
+
+        match0 = same_address(expected_chain or chain, token0, expected_token_address)
+        match1 = same_address(expected_chain or chain, token1, expected_token_address)
+        if not match0 and not match1:
+            raise ValueError("AMM_TOKEN_MISMATCH: neither reserve token matches expected candidate token")
+        if match0 and match1:
+            raise ValueError("INVALID_AMM_RESERVES: candidate token matches both token0 and token1")
+
+        token0_is_candidate = match0
+        pool_quote_token = token1 if token0_is_candidate else token0
+
+        if expected_quote_asset:
+            if not is_valid_address(expected_chain or chain, expected_quote_asset):
+                raise ValueError(f"INVALID_TOKEN_ADDRESS: invalid expected quote asset format: {expected_quote_asset}")
+            if not same_address(expected_chain or chain, pool_quote_token, expected_quote_asset):
+                raise ValueError("QUOTE_ASSET_MISMATCH: reserve pool quote token does not match expected quote asset")
+    else:
+        if token0 and token1 and expected_token_address:
+            eff_chain = chain or "evm"
+            if same_address(eff_chain, token0, token1):
+                raise ValueError("INVALID_AMM_RESERVES: token0 and token1 cannot be the same address")
+            match0 = same_address(eff_chain, token0, expected_token_address)
+            match1 = same_address(eff_chain, token1, expected_token_address)
             if not match0 and not match1:
                 raise ValueError("AMM_TOKEN_MISMATCH: neither reserve token matches expected candidate token")
-            if expected_quote_asset:
-                quote_match0 = same_address(expected_chain or chain, token0, expected_quote_asset)
-                quote_match1 = same_address(expected_chain or chain, token1, expected_quote_asset)
-                if not (match0 and quote_match1) and not (match1 and quote_match0):
-                    raise ValueError("QUOTE_ASSET_MISMATCH: reserve tokens do not match candidate and quote asset pair")
+            token0_is_candidate = match0
 
+    # Step 2: Validate and associate reserves
+    has_r0_r1 = (reserve0 is not None or reserve1 is not None)
+    has_rb_rq = (reserve_base is not None or reserve_quote is not None)
+
+    if not has_r0_r1 and not has_rb_rq:
+        raise ValueError("MISSING_AMM_RESERVES: AMM reserve evidence missing")
+
+    if has_r0_r1:
+        if reserve0 is None or reserve1 is None:
+            raise ValueError("INVALID_AMM_RESERVES: both reserve0 and reserve1 must be provided")
+        r0 = _check_reserve(reserve0, "reserve0")
+        r1 = _check_reserve(reserve1, "reserve1")
+
+        if token0_is_candidate is None:
+            raise ValueError("MISSING_AMM_TOKEN_IDENTITY: cannot associate reserve0/reserve1 without token orientation evidence")
+
+        # Associate reserve0 exclusively with token0 and reserve1 exclusively with token1
+        if token0_is_candidate:
+            effective_base_reserve = r0
+            effective_quote_reserve = r1
+        else:
+            effective_base_reserve = r1
+            effective_quote_reserve = r0
+
+    if has_rb_rq:
+        if reserve_base is None or reserve_quote is None:
+            raise ValueError("INVALID_AMM_RESERVES: both reserve_base and reserve_quote must be provided")
+        rb_val = _check_reserve(reserve_base, "reserve_base")
+        rq_val = _check_reserve(reserve_quote, "reserve_quote")
+
+        if has_r0_r1:
+            tol = 1e-6
+            if abs(rb_val - effective_base_reserve) > tol * max(rb_val, effective_base_reserve):
+                raise ValueError(
+                    f"INCONSISTENT_AMM_RESERVES: reserve_base ({rb_val}) does not match oriented candidate reserve ({effective_base_reserve})"
+                )
+            if abs(rq_val - effective_quote_reserve) > tol * max(rq_val, effective_quote_reserve):
+                raise ValueError(
+                    f"INCONSISTENT_AMM_RESERVES: reserve_quote ({rq_val}) does not match oriented quote reserve ({effective_quote_reserve})"
+                )
+        else:
+            effective_base_reserve = rb_val
+            effective_quote_reserve = rq_val
+            if token0_is_candidate is True:
+                r0 = rb_val
+                r1 = rq_val
+            elif token0_is_candidate is False:
+                r0 = rq_val
+                r1 = rb_val
+
+    if effective_base_reserve is None or effective_quote_reserve is None:
+        raise ValueError("INVALID_AMM_RESERVES: could not determine effective base and quote reserves")
+
+    rb = effective_base_reserve
+    rq = effective_quote_reserve
     mid_price = rq / rb
     fee_factor = 1.0 - (fee / 10000.0)
 
@@ -634,6 +729,11 @@ def simulate_constant_product_amm(
             "simulation_method": "CONSTANT_PRODUCT_AMM_SIMULATION",
             "reserve_base": rb,
             "reserve_quote": rq,
+            "reserve0": r0,
+            "reserve1": r1,
+            "token0": token0,
+            "token1": token1,
+            "token0_is_candidate": token0_is_candidate,
             "mid_price": mid_price,
             "buy": {"complete": False, "filled_quote_usd": 0.0, "filled_quantity": 0.0, "vwap": None},
             "immediate_exit": {"complete": False, "filled_quote_usd": 0.0, "filled_quantity": 0.0, "vwap": None},
@@ -660,6 +760,11 @@ def simulate_constant_product_amm(
         "simulation_method": "CONSTANT_PRODUCT_AMM_SIMULATION",
         "reserve_base": rb,
         "reserve_quote": rq,
+        "reserve0": r0,
+        "reserve1": r1,
+        "token0": token0,
+        "token1": token1,
+        "token0_is_candidate": token0_is_candidate,
         "mid_price": mid_price,
         "buy": {
             "complete": True,
@@ -997,13 +1102,18 @@ def simulate_multi_size(
                 continue
 
             try:
-                rb = amm_reserves.get("reserve_base") or amm_reserves.get("reserve_token") or amm_reserves.get("base_reserve") or amm_reserves.get("reserve0")
-                rq = amm_reserves.get("reserve_quote") or amm_reserves.get("reserve_usd") or amm_reserves.get("quote_reserve") or amm_reserves.get("reserve1")
+                r0 = amm_reserves.get("reserve0")
+                r1 = amm_reserves.get("reserve1")
+                rb = amm_reserves.get("reserve_base") or amm_reserves.get("reserve_token") or amm_reserves.get("base_reserve")
+                rq = amm_reserves.get("reserve_quote") or amm_reserves.get("reserve_usd") or amm_reserves.get("quote_reserve")
 
                 amm_sim = simulate_constant_product_amm(
-                    rb, rq,
+                    reserve_base=rb,
+                    reserve_quote=rq,
                     buy_notional_usd=size,
                     fee_bps=validated_fee_bps,
+                    reserve0=r0,
+                    reserve1=r1,
                     chain=res_chain,
                     pool_address=res_pool,
                     token0=res_t0,
@@ -1037,9 +1147,15 @@ def simulate_multi_size(
                     "quote_freshness": "FRESH",
                     "quote_age_seconds": round(res_age, 1) if res_age is not None else None,
                     "available_liquidity_usd": liquidity_usd,
+                    "reserve_base": amm_sim.get("reserve_base"),
+                    "reserve_quote": amm_sim.get("reserve_quote"),
+                    "reserve0": amm_sim.get("reserve0"),
+                    "reserve1": amm_sim.get("reserve1"),
+                    "token0_is_candidate": amm_sim.get("token0_is_candidate"),
                     "buy": {
                         "status": "AVAILABLE" if buy_ok else "UNAVAILABLE",
                         "filled_quote_usd": amm_sim["buy"]["filled_quote_usd"],
+                        "filled_quantity": amm_sim["buy"]["filled_quantity"],
                         "vwap": amm_sim["buy"]["vwap"],
                         "price_impact_bps": amm_sim["buy"].get("price_impact_bps"),
                         "complete": buy_ok,
@@ -1047,6 +1163,7 @@ def simulate_multi_size(
                     "sell": {
                         "status": "AVAILABLE" if sell_ok else "UNAVAILABLE",
                         "filled_quote_usd": amm_sim["immediate_exit"]["filled_quote_usd"],
+                        "filled_quantity": amm_sim["immediate_exit"]["filled_quantity"],
                         "vwap": amm_sim["immediate_exit"]["vwap"],
                         "price_impact_bps": amm_sim["immediate_exit"].get("price_impact_bps"),
                         "complete": sell_ok,
@@ -1061,7 +1178,8 @@ def simulate_multi_size(
                 for code in ("MISSING_AMM_POOL_IDENTITY", "AMM_POOL_MISMATCH",
                              "MISSING_AMM_CHAIN_IDENTITY", "AMM_CHAIN_MISMATCH",
                              "MISSING_AMM_TOKEN_IDENTITY", "AMM_TOKEN_MISMATCH",
-                             "QUOTE_ASSET_MISMATCH", "INVALID_TOKEN_ADDRESS", "INVALID_AMM_RESERVES"):
+                             "QUOTE_ASSET_MISMATCH", "INVALID_TOKEN_ADDRESS",
+                             "INCONSISTENT_AMM_RESERVES", "MISSING_AMM_RESERVES", "INVALID_AMM_RESERVES"):
                     if code in err_msg:
                         status_code = code
                         break
