@@ -1,22 +1,95 @@
-#!/usr/bin/env python3
-"""Estimate marketable spot entry/exit VWAP and book impact from a saved snapshot.
+"""Pre-breakout order book depth and multi-size execution simulator.
 
-This is a read-only order-book simulation. It does not submit orders, predict fills,
-or guarantee that displayed depth will remain available.
+Provides read-only simulation of market impact, slippage, and round-trip execution
+costs across notional trade sizes ($100, $500, $1k, $5k). Distinguishes actual order
+book depth walks, constant-product AMM simulations, and size-verified router quotes
+from approximate linear liquidity heuristics.
+
+Never enables automated execution, signing, private-key handling, or live orders.
+Fails closed whenever quote freshness, identity, size, reserve, or fee evidence is unverified.
 """
 from __future__ import annotations
 
 import argparse
+import copy
 import datetime as _dt
 from datetime import datetime, timezone
 import json
 import math
+import re
 import sys
 from pathlib import Path
 from typing import Any
 
 VERSION = (Path(__file__).resolve().parents[1] / "VERSION").read_text(encoding="utf-8").strip()
 BACKTEST_VERSION = VERSION
+
+try:
+    from scripts.address_identity import same_address
+except ImportError:
+    try:
+        from address_identity import same_address
+    except ImportError:
+        def same_address(chain: Any, left: Any, right: Any) -> bool:
+            return bool(left and right and str(left).strip().lower() == str(right).strip().lower())
+
+
+def validate_fee_bps(fee_bps: Any) -> float:
+    """Validate trading fee in basis points (bps).
+
+    Units: basis points (bps), where 1 bps = 0.01% (100 bps = 1.0%).
+    Valid range: 0.0 <= fee_bps < 10000.0 (i.e. 0% to strictly less than 100%).
+    Rejects None, booleans, non-numeric strings, negative values, NaNs, infinities,
+    and out-of-range values (>= 10000.0 bps).
+    Never clamps or silently defaults invalid fees.
+    """
+    if fee_bps is None or isinstance(fee_bps, bool):
+        raise ValueError("INVALID_FEE_DATA: fee_bps cannot be None or boolean")
+    try:
+        f = float(fee_bps)
+    except (TypeError, ValueError):
+        raise ValueError(f"INVALID_FEE_DATA: fee_bps must be numeric, got {fee_bps!r}")
+    if not math.isfinite(f):
+        raise ValueError(f"INVALID_FEE_DATA: fee_bps must be finite, got {f}")
+    if f < 0.0:
+        raise ValueError(f"INVALID_FEE_DATA: fee_bps cannot be negative, got {f}")
+    if f >= 10000.0:
+        raise ValueError(f"INVALID_FEE_DATA: fee_bps must be less than 10000.0 bps (100%), got {f}")
+    return f
+
+
+def is_valid_address(chain: Any, address: Any) -> bool:
+    """Validate address structure for chain.
+
+    Rejects empty, whitespace, malformed, punctuation-containing strings, and bare symbols.
+    """
+    if not isinstance(address, str) or not address:
+        return False
+    if address.strip() != address:
+        return False
+    # Reject any whitespace or separators/punctuation
+    for ch in (" ", "\t", "\n", "\r", "|", ":", "/", "\\", "?", "#", ";", ","):
+        if ch in address:
+            return False
+
+    chain_key = str(chain or "").strip().lower()
+    if chain_key in {"solana", "sol"}:
+        # Base58 32-44 characters
+        return bool(re.fullmatch(r"^[1-9A-HJ-NP-Za-km-z]{32,44}$", address))
+    elif chain_key in {
+        "ethereum", "eth", "base", "bsc", "bnb", "polygon", "polygon_pos",
+        "arbitrum", "optimism", "avalanche", "avax", "linea", "blast"
+    }:
+        # EVM: 0x followed by alphanumeric hex or identifier, length 4 to 66
+        # Strictly reject bare tickers like "PEPE", "USDC"
+        if not address.startswith("0x") or len(address) < 4 or len(address) > 66:
+            return False
+        return bool(re.fullmatch(r"^0x[0-9a-zA-Z]+$", address))
+    else:
+        # Generic chain
+        if len(address) < 4 or len(address) > 128:
+            return False
+        return bool(re.fullmatch(r"^[0-9a-zA-Z_-]+$", address))
 
 
 def _find_book(obj):
@@ -63,15 +136,15 @@ def _consume(levels, quantity):
 
 
 def simulate(book, buy_notional_usd, fee_bps=0.0):
+    """Simulate order book walk for buy and immediate sell."""
     try:
         buy_notional_usd = float(buy_notional_usd)
-        fee_bps = float(fee_bps)
     except (TypeError, ValueError):
-        raise ValueError("notional and fee_bps must be numeric")
+        raise ValueError("buy_notional_usd must be numeric")
     if not math.isfinite(buy_notional_usd) or buy_notional_usd <= 0:
         raise ValueError("buy_notional_usd must be positive and finite")
-    if not math.isfinite(fee_bps) or fee_bps < 0:
-        raise ValueError("fee_bps must be non-negative and finite")
+
+    fee_bps = validate_fee_bps(fee_bps)
 
     bids = _levels(book.get("bids"), reverse=True)
     asks = _levels(book.get("asks"), reverse=False)
@@ -206,8 +279,8 @@ def validate_timestamp_freshness(
     if as_of_dt is None:
         return False, "INVALID_EVALUATION_TIMESTAMP", None
 
-    if raw_stamp is None:
-        return False, "MISSING_TIMESTAMP", None
+    if raw_stamp is None or raw_stamp == "":
+        return False, "MISSING_EXECUTION_QUOTE_TIMESTAMP", None
 
     quote_dt = _parse_iso_utc(raw_stamp)
     if quote_dt is None:
@@ -218,7 +291,7 @@ def validate_timestamp_freshness(
                     return False, "NAIVE_TIMESTAMP_REJECTED", None
             except Exception:
                 pass
-        return False, "INVALID_QUOTE_TIMESTAMP", None
+        return False, "INVALID_EXECUTION_QUOTE_TIMESTAMP", None
 
     age_seconds = (as_of_dt - quote_dt).total_seconds()
     if age_seconds < -1e-6:
@@ -236,31 +309,153 @@ def validate_two_way_quotes(
     expected_token_address: str | None = None,
     expected_chain: str | None = None,
     expected_pool: str | None = None,
+    expected_quote_asset: str | None = None,
+    require_pool_identity: bool = False,
     target_size_usd: float | None = None,
     size_tolerance_pct: float = 1.0,
     quote_meta: dict[str, Any] | None = None,
 ) -> tuple[bool, str, dict[str, Any]]:
     """Validate both sides of a router trade quote.
 
-    Ensures positive finite inputs/outputs, valid directions, matching contract/chain/pool,
-    and binding to the requested notional size within tolerance.
+    Enforces:
+    - Explicit chain identity on both legs matching expected_chain.
+    - Explicit pool identity on both legs where required/supplied matching expected_pool.
+    - Explicit token addresses on both legs, verified swap directions:
+        buy: expected quote asset -> candidate token
+        sell: candidate token -> expected quote asset
+    - Candidate token != quote asset.
+    - Both buy notional size and sell notional size verified against target_size_usd within tolerance.
     """
     if not isinstance(buy_q, dict) or not buy_q:
-        return False, "MISSING_BUY_ROUTE", {}
+        return False, "MISSING_BUY_ROUTE", {"reason": "missing buy quote"}
     if not isinstance(sell_q, dict) or not sell_q:
-        return False, "MISSING_SELL_ROUTE", {}
+        return False, "MISSING_SELL_ROUTE", {"reason": "missing sell quote"}
 
-    # Buy direction
+    # 1. Chain validation on both legs
+    buy_chain = buy_q.get("chain")
+    sell_chain = sell_q.get("chain")
+    if not buy_chain or not sell_chain:
+        return False, "MISSING_CHAIN_IDENTITY", {
+            "reason": "missing explicit chain identity on quote leg",
+            "buy_chain": buy_chain,
+            "sell_chain": sell_chain,
+        }
+    if str(buy_chain).strip().lower() != str(sell_chain).strip().lower():
+        return False, "CHAIN_MISMATCH", {
+            "reason": "buy and sell quotes specify different chains",
+            "buy_chain": buy_chain,
+            "sell_chain": sell_chain,
+        }
+    effective_chain = str(buy_chain).strip().lower()
+    if expected_chain and effective_chain != str(expected_chain).strip().lower():
+        return False, "CHAIN_MISMATCH", {
+            "reason": "quote chain does not match expected_chain",
+            "expected": expected_chain,
+            "actual": effective_chain,
+        }
+
+    # 2. Expected token address validation
+    if not expected_token_address:
+        return False, "MISSING_TOKEN_ADDRESS", {"reason": "expected_token_address is required for route verification"}
+    if not is_valid_address(effective_chain, expected_token_address):
+        return False, "INVALID_TOKEN_ADDRESS", {"reason": f"invalid expected token address format: {expected_token_address}"}
+
+    # 3. Pool validation
+    buy_pool = buy_q.get("pool_address") or buy_q.get("pool") or buy_q.get("venue")
+    sell_pool = sell_q.get("pool_address") or sell_q.get("pool") or sell_q.get("venue")
+    if require_pool_identity or expected_pool:
+        if not buy_pool or not sell_pool:
+            return False, "MISSING_POOL_IDENTITY", {
+                "reason": "missing pool identity on quote leg",
+                "buy_pool": buy_pool,
+                "sell_pool": sell_pool,
+            }
+    if buy_pool and sell_pool:
+        if not same_address(effective_chain, buy_pool, sell_pool):
+            return False, "POOL_MISMATCH", {
+                "reason": "buy and sell quotes specify different pools",
+                "buy_pool": buy_pool,
+                "sell_pool": sell_pool,
+            }
+    if expected_pool:
+        if buy_pool and not same_address(effective_chain, buy_pool, expected_pool):
+            return False, "POOL_MISMATCH", {
+                "reason": "buy quote pool does not match expected_pool",
+                "expected": expected_pool,
+                "actual": buy_pool,
+            }
+        if sell_pool and not same_address(effective_chain, sell_pool, expected_pool):
+            return False, "POOL_MISMATCH", {
+                "reason": "sell quote pool does not match expected_pool",
+                "expected": expected_pool,
+                "actual": sell_pool,
+            }
+
+    # 4. Token addresses on both legs
+    buy_in_tok = buy_q.get("in_token") or buy_q.get("input_token")
+    buy_out_tok = buy_q.get("out_token") or buy_q.get("output_token")
+    sell_in_tok = sell_q.get("in_token") or sell_q.get("input_token")
+    sell_out_tok = sell_q.get("out_token") or sell_q.get("output_token")
+
+    if not buy_in_tok or not buy_out_tok:
+        return False, "MISSING_TOKEN_ADDRESS", {"reason": "buy quote missing in_token or out_token"}
+    if not sell_in_tok or not sell_out_tok:
+        return False, "MISSING_TOKEN_ADDRESS", {"reason": "sell quote missing in_token or out_token"}
+
+    for addr_label, addr_val in (("buy in_token", buy_in_tok), ("buy out_token", buy_out_tok),
+                                 ("sell in_token", sell_in_tok), ("sell out_token", sell_out_tok)):
+        if not is_valid_address(effective_chain, addr_val):
+            return False, "INVALID_TOKEN_ADDRESS", {"reason": f"invalid token address format for {addr_label}: {addr_val}"}
+
+    # Validate candidate token binding
+    if not same_address(effective_chain, buy_out_tok, expected_token_address):
+        return False, "TOKEN_ADDRESS_MISMATCH", {
+            "reason": "buy out_token does not match candidate token",
+            "expected": expected_token_address,
+            "actual": buy_out_tok,
+        }
+    if not same_address(effective_chain, sell_in_tok, expected_token_address):
+        return False, "TOKEN_ADDRESS_MISMATCH", {
+            "reason": "sell in_token does not match candidate token",
+            "expected": expected_token_address,
+            "actual": sell_in_tok,
+        }
+
+    # Validate quote asset consistency
+    if not same_address(effective_chain, buy_in_tok, sell_out_tok):
+        return False, "QUOTE_ASSET_MISMATCH", {
+            "reason": "buy in_token and sell out_token quote assets differ",
+            "buy_in": buy_in_tok,
+            "sell_out": sell_out_tok,
+        }
+    if expected_quote_asset:
+        if not same_address(effective_chain, buy_in_tok, expected_quote_asset):
+            return False, "QUOTE_ASSET_MISMATCH", {
+                "reason": "buy in_token does not match expected_quote_asset",
+                "expected": expected_quote_asset,
+                "actual": buy_in_tok,
+            }
+        if not same_address(effective_chain, sell_out_tok, expected_quote_asset):
+            return False, "QUOTE_ASSET_MISMATCH", {
+                "reason": "sell out_token does not match expected_quote_asset",
+                "expected": expected_quote_asset,
+                "actual": sell_out_tok,
+            }
+
+    # Candidate token cannot be the quote asset
+    if same_address(effective_chain, buy_out_tok, buy_in_tok):
+        return False, "INVALID_TOKEN_ADDRESS", {"reason": "candidate token and quote asset cannot be the same address"}
+
+    # 5. Swap direction validation
     buy_dir = str(buy_q.get("direction") or "").upper()
     if buy_dir in {"SELL", "EXACT_OUT", "SWAP_OUT"}:
         return False, "DIRECTION_MISMATCH", {"reason": "buy_quote has SELL direction"}
 
-    # Sell direction
     sell_dir = str(sell_q.get("direction") or "").upper()
     if sell_dir in {"BUY", "EXACT_IN", "SWAP_IN"}:
         return False, "DIRECTION_MISMATCH", {"reason": "sell_quote has BUY direction"}
 
-    # Input and output amounts
+    # 6. Output and input amounts
     buy_out = _clean_strictly_positive(
         buy_q.get("out_amount") or buy_q.get("amount_out") or
         buy_q.get("output_amount") or buy_q.get("filled_quantity")
@@ -276,7 +471,6 @@ def validate_two_way_quotes(
     if sell_out is None:
         return False, "INVALID_SELL_QUOTE_AMOUNTS", {"reason": "sell output amount must be positive and finite"}
 
-    # Check for non-finite or negative in amounts if explicitly specified
     for q_side, q_dict, err_name in (("buy", buy_q, "INVALID_BUY_QUOTE_AMOUNTS"), ("sell", sell_q, "INVALID_SELL_QUOTE_AMOUNTS")):
         for key in ("in_amount", "amount_in", "input_amount"):
             if key in q_dict:
@@ -285,56 +479,52 @@ def validate_two_way_quotes(
                 if cleaned is None:
                     return False, err_name, {"reason": f"{q_side} {key} must be positive and finite"}
 
-    # Address validation
-    if expected_token_address:
-        exp_addr = str(expected_token_address).lower()
-        buy_out_tok = buy_q.get("out_token") or buy_q.get("token_address") or buy_q.get("contract_address")
-        if buy_out_tok and str(buy_out_tok).lower() != exp_addr:
-            return False, "TOKEN_ADDRESS_MISMATCH", {"expected": exp_addr, "actual": str(buy_out_tok)}
-        sell_in_tok = sell_q.get("in_token") or sell_q.get("token_address") or sell_q.get("contract_address")
-        if sell_in_tok and str(sell_in_tok).lower() != exp_addr:
-            return False, "TOKEN_ADDRESS_MISMATCH", {"expected": exp_addr, "actual": str(sell_in_tok)}
-
-    # Chain validation
-    if expected_chain:
-        exp_chain = str(expected_chain).lower()
-        q_chain = (quote_meta or {}).get("chain") or buy_q.get("chain") or sell_q.get("chain")
-        if q_chain and str(q_chain).lower() != exp_chain:
-            return False, "CHAIN_MISMATCH", {"expected": exp_chain, "actual": str(q_chain)}
-
-    # Pool validation
-    if expected_pool:
-        exp_pool = str(expected_pool).lower()
-        q_pool = (quote_meta or {}).get("pool_address") or buy_q.get("pool_address") or sell_q.get("pool_address")
-        if q_pool and str(q_pool).lower() != exp_pool:
-            return False, "POOL_MISMATCH", {"expected": exp_pool, "actual": str(q_pool)}
-
-    # Quoted notional size binding
-    quoted_size = (
-        _clean_strictly_positive(buy_q.get("notional_size_usd")) or
-        _clean_strictly_positive(buy_q.get("in_amount")) or
-        _clean_strictly_positive(sell_q.get("notional_size_usd")) or
-        _clean_strictly_positive(sell_q.get("output_amount")) or
-        _clean_strictly_positive((quote_meta or {}).get("notional_size_usd")) or
-        _clean_strictly_positive((quote_meta or {}).get("quote_size_usd"))
-    )
+    # 7. Quoted notional size verification on BOTH legs
+    buy_size = _clean_strictly_positive(buy_q.get("notional_size_usd") or buy_q.get("in_amount"))
+    sell_size = _clean_strictly_positive(sell_q.get("notional_size_usd") or sell_q.get("out_amount") or sell_q.get("output_amount"))
 
     if target_size_usd is not None:
-        if quoted_size is None:
-            return False, "ORDER_SIZE_UNVERIFIED", {"size_bound": False}
-        rel_diff = abs(quoted_size - target_size_usd) / target_size_usd
-        tolerance = size_tolerance_pct / 100.0
-        if rel_diff > tolerance:
-            return False, "ORDER_SIZE_MISMATCH", {
+        if buy_size is None or sell_size is None:
+            return False, "ORDER_SIZE_UNVERIFIED", {
                 "size_bound": False,
-                "quoted_size": quoted_size,
+                "buy_size": buy_size,
+                "sell_size": sell_size,
                 "target_size": target_size_usd,
-                "rel_diff_pct": rel_diff * 100.0,
-                "tolerance_pct": size_tolerance_pct,
+                "reason": "buy or sell quote lacks verified notional size",
             }
 
+        buy_rel_diff = abs(buy_size - target_size_usd) / target_size_usd
+        sell_rel_diff = abs(sell_size - target_size_usd) / target_size_usd
+        tolerance = size_tolerance_pct / 100.0
+
+        if buy_rel_diff > tolerance + 1e-9:
+            return False, "ORDER_SIZE_MISMATCH", {
+                "size_bound": False,
+                "quoted_size": buy_size,
+                "buy_size": buy_size,
+                "sell_size": sell_size,
+                "target_size": target_size_usd,
+                "rel_diff_pct": buy_rel_diff * 100.0,
+                "tolerance_pct": size_tolerance_pct,
+                "leg": "buy",
+            }
+        if sell_rel_diff > tolerance + 1e-9:
+            return False, "ORDER_SIZE_MISMATCH", {
+                "size_bound": False,
+                "quoted_size": sell_size,
+                "buy_size": buy_size,
+                "sell_size": sell_size,
+                "target_size": target_size_usd,
+                "rel_diff_pct": sell_rel_diff * 100.0,
+                "tolerance_pct": size_tolerance_pct,
+                "leg": "sell",
+            }
+
+    quoted_size = buy_size or sell_size
     return True, "TWO_WAY_QUOTE_VERIFIED", {
-        "size_bound": quoted_size is not None,
+        "size_bound": (buy_size is not None and sell_size is not None),
+        "buy_size": buy_size,
+        "sell_size": sell_size,
         "quoted_size": quoted_size,
         "buy_out": buy_out,
         "sell_out": sell_out,
@@ -346,20 +536,51 @@ def simulate_constant_product_amm(
     reserve_quote: float,
     buy_notional_usd: float,
     fee_bps: float = 30.0,
+    *,
+    chain: str | None = None,
+    pool_address: str | None = None,
+    token0: str | None = None,
+    token1: str | None = None,
+    expected_chain: str | None = None,
+    expected_pool: str | None = None,
+    expected_token_address: str | None = None,
+    expected_quote_asset: str | None = None,
+    require_reserve_identity: bool = False,
 ) -> dict[str, Any]:
-    """Exact constant-product AMM (x * y = k) simulation with reserve tracking and fees."""
+    """Exact constant-product AMM (x * y = k) simulation with reserve tracking, fees, and identity verification."""
+    fee = validate_fee_bps(fee_bps)
+
     rb = _clean_strictly_positive(reserve_base)
     rq = _clean_strictly_positive(reserve_quote)
     if rb is None or rq is None:
-        raise ValueError("AMM reserves must be positive and finite")
+        raise ValueError("INVALID_AMM_RESERVES: AMM reserves must be positive and finite")
 
     buy_usd = _clean_strictly_positive(buy_notional_usd)
     if buy_usd is None:
         raise ValueError("buy_notional_usd must be positive and finite")
 
-    fee = _clean_numeric(fee_bps)
-    if fee is None or fee < 0 or fee >= 10000:
-        raise ValueError("fee_bps must be non-negative and finite")
+    # Reserve identity verification
+    if require_reserve_identity or expected_chain or expected_pool or expected_token_address:
+        if not pool_address:
+            raise ValueError("MISSING_AMM_POOL_IDENTITY: reserve snapshot missing pool identity")
+        if expected_pool and not same_address(expected_chain or chain, pool_address, expected_pool):
+            raise ValueError("AMM_POOL_MISMATCH: reserve pool does not match expected pool")
+        if not chain:
+            raise ValueError("MISSING_AMM_CHAIN_IDENTITY: reserve snapshot missing chain identity")
+        if expected_chain and str(chain).strip().lower() != str(expected_chain).strip().lower():
+            raise ValueError("AMM_CHAIN_MISMATCH: reserve chain does not match expected chain")
+        if expected_token_address:
+            if not token0 or not token1:
+                raise ValueError("AMM_TOKEN_MISMATCH: reserve snapshot missing token0 or token1 identity")
+            match0 = same_address(expected_chain or chain, token0, expected_token_address)
+            match1 = same_address(expected_chain or chain, token1, expected_token_address)
+            if not match0 and not match1:
+                raise ValueError("AMM_TOKEN_MISMATCH: neither reserve token matches expected candidate token")
+            if expected_quote_asset:
+                quote_match0 = same_address(expected_chain or chain, token0, expected_quote_asset)
+                quote_match1 = same_address(expected_chain or chain, token1, expected_quote_asset)
+                if not (match0 and quote_match1) and not (match1 and quote_match0):
+                    raise ValueError("AMM_TOKEN_MISMATCH: reserve tokens do not match candidate and quote asset pair")
 
     mid_price = rq / rb
     fee_factor = 1.0 - (fee / 10000.0)
@@ -436,6 +657,9 @@ def simulate_multi_size(
     expected_token_address: str | None = None,
     expected_chain: str | None = None,
     expected_pool: str | None = None,
+    expected_quote_asset: str | None = None,
+    require_pool_identity: bool = False,
+    require_reserve_identity: bool = False,
     size_tolerance_pct: float = 1.0,
 ) -> dict[str, Any]:
     """Evaluate multi-size read-only execution scenarios ($100, $500, $1k, $5k).
@@ -444,19 +668,12 @@ def simulate_multi_size(
     and size-verified router quotes from approximate linear liquidity heuristics.
     Never assumes the same token has identical execution cost across sizes.
     Never assumes a buy quote proves a sell route is possible.
-    Enforces quote freshness verification and size-bound quote validation.
+    Enforces quote freshness verification, size-bound quote validation, AMM reserve identity,
+    and pre-simulation fee validation. Fails closed on any unverified condition.
     """
-    fee_bps_clean = _clean_numeric(fee_bps)
-    fee_bps = max(0.0, fee_bps_clean) if fee_bps_clean is not None else 30.0
-
-    gas_usd_clean = _clean_numeric(gas_usd)
-    gas_usd = max(0.0, gas_usd_clean) if gas_usd_clean is not None else None
-
-    target_upside_clean = _clean_numeric(target_upside_pct)
-    target_upside_pct = target_upside_clean
-
-    max_age_clean = _clean_numeric(max_quote_age_seconds)
-    max_quote_age_seconds = max(1.0, max_age_clean) if max_age_clean is not None else 300.0
+    liquidity_usd = None
+    if isinstance(source, dict):
+        liquidity_usd = _clean_numeric(source.get("liquidity_usd"))
 
     clean_sizes: list[float] = []
     raw_sizes = sizes_usd if isinstance(sizes_usd, (list, tuple, set)) else DEFAULT_RESEARCH_NOTIONAL_SIZES_USD
@@ -467,6 +684,47 @@ def simulate_multi_size(
     if not clean_sizes:
         clean_sizes = list(DEFAULT_RESEARCH_NOTIONAL_SIZES_USD)
 
+    gas_usd_clean = _clean_numeric(gas_usd)
+    gas_usd = max(0.0, gas_usd_clean) if gas_usd_clean is not None else None
+
+    target_upside_pct = _clean_numeric(target_upside_pct)
+
+    max_age_clean = _clean_numeric(max_quote_age_seconds)
+    max_quote_age_seconds = max(1.0, max_age_clean) if max_age_clean is not None else 300.0
+
+    # 1. Fee validation before simulation begins
+    try:
+        validated_fee_bps = validate_fee_bps(fee_bps)
+    except (ValueError, TypeError) as fee_err:
+        size_evaluations = {}
+        for s in clean_sizes:
+            size_key = f"${int(s) if s.is_integer() else s}"
+            size_evaluations[size_key] = {
+                "size_usd": s,
+                "status": "INVALID_FEE_DATA",
+                "simulation_method": "INVALID_FEE_REJECTED",
+                "route_available": False,
+                "quote_verified_for_size": False,
+                "size_verification_status": "ORDER_SIZE_UNVERIFIED_ESTIMATE",
+                "quote_freshness": "UNVERIFIED",
+                "buy": {"status": "UNAVAILABLE", "reason": f"Invalid fee: {fee_err}"},
+                "sell": {"status": "UNAVAILABLE", "reason": f"Invalid fee: {fee_err}"},
+                "estimated_round_trip_cost_pct": None,
+                "execution_adjusted_return_pct": None,
+            }
+        return {
+            "schema": "crypto-prebreakout.multi-size-execution-simulation.v1",
+            "simulator_version": BACKTEST_VERSION if "BACKTEST_VERSION" in globals() else "4.30.0",
+            "execution_enabled": False,
+            "status": "INVALID_FEE_DATA",
+            "available_liquidity_usd": liquidity_usd,
+            "fee_bps": None,
+            "gas_usd": gas_usd,
+            "target_upside_pct": target_upside_pct,
+            "size_evaluations": size_evaluations,
+            "research_disclaimer": "Read-only simulation. Evaluates hypothetical size-dependent price impact and execution drag.",
+        }
+
     book = _find_book(source)
     quotes = source.get("dex_execution_quotes") if isinstance(source.get("dex_execution_quotes"), dict) else (
         source if ("buy_quote" in source or "sell_quote" in source) else None
@@ -475,64 +733,36 @@ def simulate_multi_size(
         source.get("reserves") if isinstance(source.get("reserves"), dict) else None
     )
 
-    liquidity_usd = None
-    if isinstance(source, dict):
-        liquidity_usd = _clean_numeric(source.get("liquidity_usd"))
-
-    # Timestamp freshness evaluation
-    raw_stamp = (
-        (quotes.get("timestamp_utc") if quotes else None) or
-        (book.get("timestamp_utc") if book else None) or
-        (amm_reserves.get("timestamp_utc") if amm_reserves else None) or
-        source.get("quote_timestamp_utc") or
-        source.get("final_price_timestamp_utc")
-    )
-
-    is_fresh, freshness_status, quote_age_seconds = validate_timestamp_freshness(
-        raw_stamp, as_of_utc, max_quote_age_seconds
-    )
-
     size_evaluations: dict[str, Any] = {}
 
     for size in clean_sizes:
         size_key = f"${int(size) if size.is_integer() else size}"
 
-        # If timestamp freshness verification failed, fail closed immediately
-        if not is_fresh:
-            status_map = {
-                "STALE_QUOTE": "STALE_QUOTE",
-                "FUTURE_DATED_QUOTE": "FUTURE_DATED_QUOTE",
-                "MISSING_TIMESTAMP": "UNVERIFIED_TIMESTAMP",
-                "NAIVE_TIMESTAMP_REJECTED": "UNVERIFIED_TIMESTAMP",
-                "INVALID_EVALUATION_TIMESTAMP": "UNVERIFIED_TIMESTAMP",
-                "INVALID_QUOTE_TIMESTAMP": "UNVERIFIED_TIMESTAMP",
-            }
-            status_label = status_map.get(freshness_status, "UNVERIFIED_TIMESTAMP")
-            quote_freshness_label = (
-                "STALE" if freshness_status == "STALE_QUOTE" else
-                "MISSING_TIMESTAMP_UNVERIFIED" if freshness_status == "MISSING_TIMESTAMP" else
-                freshness_status
-            )
-            size_evaluations[size_key] = {
-                "size_usd": size,
-                "status": status_label,
-                "route_available": False,
-                "quote_freshness": quote_freshness_label,
-                "simulation_method": f"{freshness_status}_REJECTED",
-                "quote_verified_for_size": False,
-                "size_verification_status": "ORDER_SIZE_UNVERIFIED_ESTIMATE",
-                "quote_age_seconds": round(quote_age_seconds, 1) if quote_age_seconds is not None else None,
-                "buy": {"status": "UNAVAILABLE", "reason": f"Freshness verification failed: {freshness_status}"},
-                "sell": {"status": "UNAVAILABLE", "reason": f"Freshness verification failed: {freshness_status}"},
-                "estimated_round_trip_cost_pct": None,
-                "execution_adjusted_return_pct": None,
-            }
-            continue
-
         # Case A: Order book depth simulation
         if book:
+            book_stamp = book.get("timestamp_utc") or book.get("timestamp")
+            book_fresh, book_fresh_status, book_age = validate_timestamp_freshness(
+                book_stamp, as_of_utc, max_quote_age_seconds
+            )
+            if not book_fresh:
+                size_evaluations[size_key] = {
+                    "size_usd": size,
+                    "status": book_fresh_status,
+                    "route_available": False,
+                    "quote_freshness": book_fresh_status,
+                    "simulation_method": f"{book_fresh_status}_REJECTED",
+                    "quote_verified_for_size": False,
+                    "size_verification_status": "ORDER_SIZE_UNVERIFIED_ESTIMATE",
+                    "quote_age_seconds": round(book_age, 1) if book_age is not None else None,
+                    "buy": {"status": "UNAVAILABLE", "reason": f"Freshness verification failed: {book_fresh_status}"},
+                    "sell": {"status": "UNAVAILABLE", "reason": f"Freshness verification failed: {book_fresh_status}"},
+                    "estimated_round_trip_cost_pct": None,
+                    "execution_adjusted_return_pct": None,
+                }
+                continue
+
             try:
-                sim = simulate(book, buy_notional_usd=size, fee_bps=fee_bps)
+                sim = simulate(book, buy_notional_usd=size, fee_bps=validated_fee_bps)
                 buy_complete = sim["buy"]["complete"]
                 sell_complete = sim["immediate_exit"]["complete"]
                 buy_impact_bps = sim["buy"]["impact_vs_best_ask_bps"]
@@ -559,7 +789,7 @@ def simulate_multi_size(
                     "size_verification_status": "SIZE_BOUND_ORDER_BOOK_WALK",
                     "route_available": buy_complete and sell_complete,
                     "quote_freshness": "FRESH",
-                    "quote_age_seconds": round(quote_age_seconds, 1) if quote_age_seconds is not None else None,
+                    "quote_age_seconds": round(book_age, 1) if book_age is not None else None,
                     "available_liquidity_usd": liquidity_usd,
                     "buy": {
                         "status": "AVAILABLE" if buy_complete else "PARTIAL_DEPTH_ONLY",
@@ -599,10 +829,49 @@ def simulate_multi_size(
 
         # Case B: Constant-product AMM simulation
         elif amm_reserves:
+            res_stamp = amm_reserves.get("timestamp_utc") or amm_reserves.get("timestamp")
+            res_fresh, res_fresh_status, res_age = validate_timestamp_freshness(
+                res_stamp, as_of_utc, max_quote_age_seconds
+            )
+            if not res_fresh:
+                size_evaluations[size_key] = {
+                    "size_usd": size,
+                    "status": res_fresh_status,
+                    "route_available": False,
+                    "quote_freshness": res_fresh_status,
+                    "simulation_method": f"{res_fresh_status}_REJECTED",
+                    "quote_verified_for_size": False,
+                    "size_verification_status": "ORDER_SIZE_UNVERIFIED_ESTIMATE",
+                    "quote_age_seconds": round(res_age, 1) if res_age is not None else None,
+                    "buy": {"status": "UNAVAILABLE", "reason": f"Freshness verification failed: {res_fresh_status}"},
+                    "sell": {"status": "UNAVAILABLE", "reason": f"Freshness verification failed: {res_fresh_status}"},
+                    "estimated_round_trip_cost_pct": None,
+                    "execution_adjusted_return_pct": None,
+                }
+                continue
+
             try:
-                rb = amm_reserves.get("reserve_base") or amm_reserves.get("reserve_token") or amm_reserves.get("base_reserve")
-                rq = amm_reserves.get("reserve_quote") or amm_reserves.get("reserve_usd") or amm_reserves.get("quote_reserve")
-                amm_sim = simulate_constant_product_amm(rb, rq, buy_notional_usd=size, fee_bps=fee_bps)
+                rb = amm_reserves.get("reserve_base") or amm_reserves.get("reserve_token") or amm_reserves.get("base_reserve") or amm_reserves.get("reserve0")
+                rq = amm_reserves.get("reserve_quote") or amm_reserves.get("reserve_usd") or amm_reserves.get("quote_reserve") or amm_reserves.get("reserve1")
+                res_chain = amm_reserves.get("chain") or (source.get("chain") if isinstance(source, dict) else None)
+                res_pool = amm_reserves.get("pool_address") or amm_reserves.get("pool") or (source.get("pool_address") if isinstance(source, dict) else None)
+                res_t0 = amm_reserves.get("token0") or amm_reserves.get("base_token")
+                res_t1 = amm_reserves.get("token1") or amm_reserves.get("quote_token")
+
+                amm_sim = simulate_constant_product_amm(
+                    rb, rq,
+                    buy_notional_usd=size,
+                    fee_bps=validated_fee_bps,
+                    chain=res_chain,
+                    pool_address=res_pool,
+                    token0=res_t0,
+                    token1=res_t1,
+                    expected_chain=expected_chain,
+                    expected_pool=expected_pool,
+                    expected_token_address=expected_token_address,
+                    expected_quote_asset=expected_quote_asset,
+                    require_reserve_identity=require_reserve_identity or bool(expected_pool or expected_chain or expected_token_address),
+                )
 
                 buy_ok = amm_sim["buy"]["complete"]
                 sell_ok = amm_sim["immediate_exit"]["complete"]
@@ -623,7 +892,7 @@ def simulate_multi_size(
                     "size_verification_status": "AMM_CONSTANT_PRODUCT_CALCULATED",
                     "route_available": route_avail,
                     "quote_freshness": "FRESH",
-                    "quote_age_seconds": round(quote_age_seconds, 1) if quote_age_seconds is not None else None,
+                    "quote_age_seconds": round(res_age, 1) if res_age is not None else None,
                     "available_liquidity_usd": liquidity_usd,
                     "buy": {
                         "status": "AVAILABLE" if buy_ok else "UNAVAILABLE",
@@ -644,17 +913,30 @@ def simulate_multi_size(
                     "execution_adjusted_return_pct": round(adj_return, 2) if adj_return is not None else None,
                 }
             except ValueError as e:
+                err_msg = str(e)
+                status_code = "INVALID_AMM_RESERVES"
+                for code in ("MISSING_AMM_POOL_IDENTITY", "AMM_POOL_MISMATCH",
+                             "MISSING_AMM_CHAIN_IDENTITY", "AMM_CHAIN_MISMATCH",
+                             "AMM_TOKEN_MISMATCH", "INVALID_AMM_RESERVES"):
+                    if code in err_msg:
+                        status_code = code
+                        break
+
                 size_evaluations[size_key] = {
                     "size_usd": size,
-                    "status": "INVALID_AMM_RESERVES",
+                    "status": status_code,
                     "simulation_method": "CONSTANT_PRODUCT_AMM_SIMULATION",
                     "is_depth_walk": False,
                     "quote_verified_for_size": False,
                     "size_verification_status": "ORDER_SIZE_UNVERIFIED_ESTIMATE",
                     "route_available": False,
-                    "reason": str(e),
-                    "buy": {"status": "UNAVAILABLE"},
-                    "sell": {"status": "UNAVAILABLE"},
+                    "quote_freshness": "FRESH",
+                    "quote_age_seconds": round(res_age, 1) if res_age is not None else None,
+                    "reason": err_msg,
+                    "buy": {"status": "UNAVAILABLE", "reason": err_msg},
+                    "sell": {"status": "UNAVAILABLE", "reason": err_msg},
+                    "estimated_round_trip_cost_pct": None,
+                    "execution_adjusted_return_pct": None,
                 }
 
         # Case C: Router quotes evaluation
@@ -662,12 +944,89 @@ def simulate_multi_size(
             buy_q = quotes.get("buy_quote")
             sell_q = quotes.get("sell_quote")
 
+            if not isinstance(buy_q, dict) or not buy_q:
+                size_evaluations[size_key] = {
+                    "size_usd": size,
+                    "status": "MISSING_BUY_ROUTE",
+                    "route_available": False,
+                    "quote_freshness": "UNVERIFIED",
+                    "simulation_method": "MISSING_BUY_ROUTE_REJECTED",
+                    "quote_verified_for_size": False,
+                    "size_verification_status": "ORDER_SIZE_UNVERIFIED_ESTIMATE",
+                    "quote_age_seconds": None,
+                    "buy": {"status": "UNAVAILABLE", "reason": "Missing buy quote route"},
+                    "sell": {"status": "UNAVAILABLE", "reason": "Missing buy quote route"},
+                    "estimated_round_trip_cost_pct": None,
+                    "execution_adjusted_return_pct": None,
+                }
+                continue
+
+            if not isinstance(sell_q, dict) or not sell_q:
+                size_evaluations[size_key] = {
+                    "size_usd": size,
+                    "status": "MISSING_SELL_ROUTE",
+                    "route_available": False,
+                    "quote_freshness": "UNVERIFIED",
+                    "simulation_method": "MISSING_SELL_ROUTE_REJECTED",
+                    "quote_verified_for_size": False,
+                    "size_verification_status": "ORDER_SIZE_UNVERIFIED_ESTIMATE",
+                    "quote_age_seconds": None,
+                    "buy": {"status": "AVAILABLE" if buy_q else "UNAVAILABLE"},
+                    "sell": {"status": "UNAVAILABLE", "reason": "Missing sell quote route"},
+                    "estimated_round_trip_cost_pct": None,
+                    "execution_adjusted_return_pct": None,
+                }
+                continue
+
+            # Validate buy and sell timestamps independently; final_price_timestamp_utc NEVER substitutes!
+            buy_stamp = buy_q.get("timestamp_utc") or buy_q.get("timestamp")
+            sell_stamp = sell_q.get("timestamp_utc") or sell_q.get("timestamp")
+
+            buy_fresh, buy_fresh_status, buy_age = validate_timestamp_freshness(
+                buy_stamp, as_of_utc, max_quote_age_seconds
+            )
+            sell_fresh, sell_fresh_status, sell_age = validate_timestamp_freshness(
+                sell_stamp, as_of_utc, max_quote_age_seconds
+            )
+
+            if not buy_fresh:
+                quote_freshness_status = buy_fresh_status
+                quote_age_seconds = buy_age
+                is_fresh = False
+            elif not sell_fresh:
+                quote_freshness_status = sell_fresh_status
+                quote_age_seconds = sell_age
+                is_fresh = False
+            else:
+                quote_freshness_status = "FRESH"
+                quote_age_seconds = max(buy_age or 0.0, sell_age or 0.0)
+                is_fresh = True
+
+            if not is_fresh:
+                size_evaluations[size_key] = {
+                    "size_usd": size,
+                    "status": quote_freshness_status,
+                    "route_available": False,
+                    "quote_freshness": quote_freshness_status,
+                    "simulation_method": f"{quote_freshness_status}_REJECTED",
+                    "quote_verified_for_size": False,
+                    "size_verification_status": "ORDER_SIZE_UNVERIFIED_ESTIMATE",
+                    "quote_age_seconds": round(quote_age_seconds, 1) if quote_age_seconds is not None else None,
+                    "buy": {"status": "UNAVAILABLE", "reason": f"Freshness verification failed: {quote_freshness_status}"},
+                    "sell": {"status": "UNAVAILABLE", "reason": f"Freshness verification failed: {quote_freshness_status}"},
+                    "estimated_round_trip_cost_pct": None,
+                    "execution_adjusted_return_pct": None,
+                }
+                continue
+
             valid_route, route_reason, route_info = validate_two_way_quotes(
                 buy_q,
                 sell_q,
                 expected_token_address=expected_token_address,
                 expected_chain=expected_chain,
                 expected_pool=expected_pool,
+                expected_quote_asset=expected_quote_asset,
+                require_pool_identity=require_pool_identity,
                 target_size_usd=size,
                 size_tolerance_pct=size_tolerance_pct,
                 quote_meta=quotes,
@@ -693,7 +1052,7 @@ def simulate_multi_size(
                 impact_pct = (size / (liquidity_usd / 2.0)) * 100.0
                 impact_bps = round(impact_pct * 100.0, 1)
 
-            fee_cost = (size * 2.0) * (fee_bps / 10000.0)
+            fee_cost = (size * 2.0) * (validated_fee_bps / 10000.0)
             slip_pct = (impact_bps / 100.0) if impact_bps is not None else 1.5
             gas_adj = (gas_usd / size * 100.0) if gas_usd and size > 0 else 0.0
             total_drag_pct = slip_pct + (fee_cost / size * 100.0) + gas_adj
@@ -719,16 +1078,16 @@ def simulate_multi_size(
                 "quote_age_seconds": round(quote_age_seconds, 1) if quote_age_seconds is not None else None,
                 "available_liquidity_usd": liquidity_usd,
                 "buy": {
-                    "status": "AVAILABLE" if (isinstance(buy_q, dict) and buy_q and status not in {"MISSING_BUY_ROUTE", "BUY_DIRECTION_MISMATCH", "INVALID_BUY_QUOTE_AMOUNTS"}) else "UNAVAILABLE",
+                    "status": "AVAILABLE" if (isinstance(buy_q, dict) and buy_q and valid_route) else "UNAVAILABLE",
                     "provider": quotes.get("provider"),
                     "estimated_price_impact_bps": impact_bps,
                     "reason": route_info.get("reason") if not valid_route else None,
                 },
                 "sell": {
-                    "status": "AVAILABLE" if (isinstance(sell_q, dict) and sell_q and status not in {"MISSING_SELL_ROUTE", "SELL_DIRECTION_MISMATCH", "INVALID_SELL_QUOTE_AMOUNTS"}) else "UNAVAILABLE",
+                    "status": "AVAILABLE" if (isinstance(sell_q, dict) and sell_q and valid_route) else "UNAVAILABLE",
                     "provider": quotes.get("provider"),
                     "estimated_price_impact_bps": impact_bps,
-                    "sell_route_independently_verified": bool(isinstance(sell_q, dict) and sell_q),
+                    "sell_route_independently_verified": bool(isinstance(sell_q, dict) and sell_q and valid_route),
                     "reason": route_info.get("reason") if not valid_route else None,
                 },
                 "trading_fee_usd": round(fee_cost, 2),
@@ -737,12 +1096,12 @@ def simulate_multi_size(
                 "execution_adjusted_return_pct": round(adj_return, 2) if adj_return is not None else None,
             }
 
-        # Case D: Only liquidity or no depth data (fail closed!)
+        # Case D: Only liquidity or no depth data (fail closed)
         else:
             if liquidity_usd and liquidity_usd > 0:
                 impact_pct = (size / (liquidity_usd / 2.0)) * 100.0
                 impact_bps = round(impact_pct * 100.0, 1)
-                fee_cost = (size * 2.0) * (fee_bps / 10000.0)
+                fee_cost = (size * 2.0) * (validated_fee_bps / 10000.0)
                 slip_pct = impact_bps / 100.0
                 gas_adj = (gas_usd / size * 100.0) if gas_usd and size > 0 else 0.0
                 total_drag_pct = slip_pct + (fee_cost / size * 100.0) + gas_adj
@@ -758,8 +1117,8 @@ def simulate_multi_size(
                     "quote_verified_for_size": False,
                     "size_verification_status": "ORDER_SIZE_UNVERIFIED_ESTIMATE",
                     "route_available": False,
-                    "quote_freshness": "FRESH" if quote_age_seconds is not None else "UNVERIFIED_TIMESTAMP",
-                    "quote_age_seconds": round(quote_age_seconds, 1) if quote_age_seconds is not None else None,
+                    "quote_freshness": "UNVERIFIED_TIMESTAMP",
+                    "quote_age_seconds": None,
                     "available_liquidity_usd": liquidity_usd,
                     "buy": {"status": "UNAVAILABLE", "reason": "Approximate heuristic only; no verified route"},
                     "sell": {"status": "UNAVAILABLE", "reason": "Approximate heuristic only; no verified route"},
@@ -775,8 +1134,12 @@ def simulate_multi_size(
                     "quote_verified_for_size": False,
                     "size_verification_status": "ORDER_SIZE_UNVERIFIED_ESTIMATE",
                     "route_available": False,
+                    "quote_freshness": "UNVERIFIED_TIMESTAMP",
+                    "quote_age_seconds": None,
                     "buy": {"status": "UNAVAILABLE", "reason": "No order book depth or route quotes provided"},
                     "sell": {"status": "UNAVAILABLE", "reason": "No order book depth or route quotes provided"},
+                    "estimated_round_trip_cost_pct": None,
+                    "execution_adjusted_return_pct": None,
                 }
 
     return {
@@ -784,7 +1147,7 @@ def simulate_multi_size(
         "simulator_version": BACKTEST_VERSION if "BACKTEST_VERSION" in globals() else "4.30.0",
         "execution_enabled": False,
         "available_liquidity_usd": liquidity_usd,
-        "fee_bps": fee_bps,
+        "fee_bps": validated_fee_bps,
         "gas_usd": gas_usd,
         "target_upside_pct": target_upside_pct,
         "size_evaluations": size_evaluations,
@@ -793,34 +1156,6 @@ def simulate_multi_size(
             "Displayed liquidity is subject to cancellation, front-running, and MEV sandwich attacks."
         ),
     }
-
-
-def main(argv=None):
-    p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("book_json", help="saved JSON order book with bids/asks")
-    p.add_argument("--notional", type=float, required=True, help="requested buy quote notional")
-    p.add_argument("--fee-bps", type=float, default=0.0, help="fee on each side in basis points")
-    p.add_argument("--out", default=None)
-    args = p.parse_args(argv)
-    try:
-        with open(args.book_json, encoding="utf-8") as fh:
-            doc = json.load(fh)
-        book = _find_book(doc)
-        if not book:
-            raise ValueError("input JSON contains no bids/asks order book")
-        result = simulate(book, args.notional, args.fee_bps)
-    except (OSError, json.JSONDecodeError, ValueError) as exc:
-        print("Execution simulation failed: %s" % exc, file=sys.stderr)
-        return 2
-    rendered = json.dumps(result, indent=2)
-    if args.out:
-        Path(args.out).write_text(rendered + "\n", encoding="utf-8")
-    print(rendered)
-    return 0
-
-
-if __name__ == "__main__":
-    raise SystemExit(main())
 
 
 def main(argv=None):

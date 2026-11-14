@@ -1811,7 +1811,9 @@ def qualify_final_actionable_candidates(candidates: list[dict[str, Any]], now: d
         )
         candidate["technical_tp_upside_pct"] = round(upside, 8) if upside is not None else None
         quotes = candidate.get("dex_execution_quotes") if isinstance(candidate.get("dex_execution_quotes"), dict) else {}
-        quote_stamp = parse_time(quotes.get("timestamp_utc"))
+        buy_q_dict = quotes.get("buy_quote") if isinstance(quotes.get("buy_quote"), dict) else {}
+        sell_q_dict = quotes.get("sell_quote") if isinstance(quotes.get("sell_quote"), dict) else {}
+        quote_stamp = parse_time(quotes.get("timestamp_utc") or buy_q_dict.get("timestamp_utc"))
         quote_age_seconds = (now - quote_stamp).total_seconds() if quote_stamp else None
         candle_stamp = parse_time(tp_validation.get("candle_retrieved_utc"))
         candle_price_delta = (
@@ -1859,31 +1861,38 @@ def qualify_final_actionable_candidates(candidates: list[dict[str, Any]], now: d
         )
 
         # Execution Simulation Integration
-        intended_size = _num(
-            candidate.get("intended_trade_size_usd") or
-            plan.get("intended_trade_size_usd") or
-            quotes.get("notional_size_usd") or
-            (quotes.get("buy_quote") or {}).get("notional_size_usd") or
-            (quotes.get("buy_quote") or {}).get("in_amount") or
-            (quotes.get("sell_quote") or {}).get("output_amount")
-        )
+        raw_intended = candidate.get("intended_trade_size_usd")
+        if raw_intended is None:
+            raw_intended = plan.get("intended_trade_size_usd")
+        if raw_intended is None and "configured_trade_size_usd" in candidate:
+            raw_intended = candidate.get("configured_trade_size_usd")
 
         sim_eval = None
         execution_sim_pass = False
         sim_blockers: list[str] = []
 
-        if intended_size is None or intended_size <= 0:
+        if raw_intended is None:
             sim_blockers.append("intended trade size is missing or unconfigured for execution simulation")
+            intended_size = None
         else:
+            intended_num = _num(raw_intended)
+            if intended_num is None or intended_num <= 0:
+                sim_blockers.append("intended trade size must be a positive finite number")
+                intended_size = None
+            else:
+                intended_size = intended_num
+
+        if intended_size is not None:
             sim_now_iso = (
                 now.isoformat().replace("+00:00", "Z")
                 if now.tzinfo else
                 now.replace(tzinfo=timezone.utc).isoformat().replace("+00:00", "Z")
             )
+            sim_fee = candidate.get("fee_bps", 30.0) if "fee_bps" in candidate else 30.0
             sim_res = simulate_multi_size(
                 candidate,
                 sizes_usd=[intended_size],
-                fee_bps=float(candidate.get("fee_bps", 30.0) or 30.0),
+                fee_bps=sim_fee,
                 gas_usd=_num(candidate.get("gas_usd")),
                 as_of_utc=sim_now_iso,
                 max_quote_age_seconds=300.0,
@@ -1891,6 +1900,8 @@ def qualify_final_actionable_candidates(candidates: list[dict[str, Any]], now: d
                 expected_token_address=contract,
                 expected_chain=candidate.get("chain"),
                 expected_pool=pool,
+                require_pool_identity=True,
+                require_reserve_identity=True,
             )
             size_key = f"${int(intended_size) if intended_size.is_integer() else intended_size}"
             sim_eval = sim_res.get("size_evaluations", {}).get(size_key) or {}
@@ -1899,28 +1910,55 @@ def qualify_final_actionable_candidates(candidates: list[dict[str, Any]], now: d
             candidate["execution_adjusted_return_pct"] = sim_eval.get("execution_adjusted_return_pct")
             candidate["estimated_round_trip_cost_pct"] = sim_eval.get("estimated_round_trip_cost_pct")
 
+            sim_status = sim_eval.get("status", "")
             sim_route_ok = sim_eval.get("route_available") is True
             sim_fresh_ok = sim_eval.get("quote_freshness") == "FRESH"
             sim_size_ok = sim_eval.get("quote_verified_for_size") is True
             sim_buy_ok = sim_eval.get("buy", {}).get("status") in {"AVAILABLE", "COMPLETE"}
             sim_sell_ok = sim_eval.get("sell", {}).get("status") in {"AVAILABLE", "COMPLETE"}
-
-            execution_sim_pass = (
-                sim_route_ok and sim_fresh_ok and sim_size_ok and sim_buy_ok and sim_sell_ok
+            sim_method = sim_eval.get("simulation_method", "")
+            heuristic_only = (
+                "APPROXIMATE" in sim_method or
+                "HEURISTIC" in sim_method or
+                (not sim_eval.get("is_depth_walk") and "ROUTER_TWO_WAY_QUOTE_VERIFIED" not in sim_method and "CONSTANT_PRODUCT_AMM" not in sim_method)
             )
 
-            if not sim_fresh_ok:
+            if sim_status in {"MISSING_EXECUTION_QUOTE_TIMESTAMP", "INVALID_EXECUTION_QUOTE_TIMESTAMP", "NAIVE_TIMESTAMP_REJECTED", "FUTURE_DATED_QUOTE", "STALE_QUOTE"}:
                 sim_blockers.append("buy/sell quotes are stale, future-dated, or missing a timestamp")
+            elif not sim_fresh_ok:
+                sim_blockers.append("buy/sell quotes are stale, future-dated, or missing a timestamp")
+
+            if sim_status in {"MISSING_TOKEN_ADDRESS", "INVALID_TOKEN_ADDRESS", "TOKEN_ADDRESS_MISMATCH", "QUOTE_ASSET_MISMATCH", "DIRECTION_MISMATCH", "MISSING_CHAIN_IDENTITY", "CHAIN_MISMATCH", "MISSING_POOL_IDENTITY", "POOL_MISMATCH"}:
+                sim_blockers.append(f"execution identity verification failed: {sim_status}")
+
+            if sim_status in {"MISSING_AMM_POOL_IDENTITY", "MISSING_AMM_CHAIN_IDENTITY", "AMM_POOL_MISMATCH", "AMM_CHAIN_MISMATCH", "AMM_TOKEN_MISMATCH", "INVALID_AMM_RESERVES"}:
+                sim_blockers.append(f"AMM reserve verification failed: {sim_status}")
+
+            if sim_status == "INVALID_FEE_DATA" or sim_res.get("status") == "INVALID_FEE_DATA":
+                sim_blockers.append("invalid fee data in execution simulation")
+
+            if heuristic_only:
+                sim_blockers.append("execution simulation relies only on approximate heuristic")
+
             if not sim_size_ok:
                 sim_blockers.append(f"execution quote is not verified for intended trade size ${intended_size:.0f}")
-            if sim_eval.get("status") == "INSUFFICIENT_LIQUIDITY":
+
+            if sim_status == "INSUFFICIENT_LIQUIDITY":
                 sim_blockers.append("insufficient liquidity for intended trade size")
+
             if not sim_buy_ok:
                 sim_blockers.append("execution simulation buy route unavailable")
+
             if not sim_sell_ok:
                 sim_blockers.append("execution simulation sell route unavailable")
+
             if not sim_route_ok:
                 sim_blockers.append("execution-route verification did not pass")
+
+            execution_sim_pass = (
+                sim_route_ok and sim_fresh_ok and sim_size_ok and sim_buy_ok and sim_sell_ok and
+                not heuristic_only and len(sim_blockers) == 0
+            )
 
         complete = (
             not software_failure and

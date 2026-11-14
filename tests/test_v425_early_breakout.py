@@ -721,21 +721,51 @@ class EarlyBreakoutTests(unittest.TestCase):
 class FinalActionableGateTests(unittest.TestCase):
     def setUp(self):
         self.now = datetime(2026, 11, 9, 12, tzinfo=timezone.utc)
+        now_iso = self.now.isoformat().replace("+00:00", "Z")
         self.candidate = {
             "market_type": "dex_pool", "chain": "ethereum", "pool_address": "0xpool",
             "contract_address": "0xtoken", "final_pool_address": "0xpool",
             "final_token_contract": "0xtoken", "final_quote_chain": "ethereum",
             "final_price_verified": True, "final_price_usd": 100.0,
-            "final_price_timestamp_utc": self.now.isoformat().replace("+00:00", "Z"),
+            "final_price_timestamp_utc": now_iso,
             "final_quote_token_orientation_verified": True,
             "dex_loss_guard_status": "PASS", "safety_verified": True,
             "executable_route_verified": True,
+            "intended_trade_size_usd": 100.0,
+            "fee_bps": 30.0,
             "dex_loss_guard_evidence": {"status": "PASS", "checks": {
                 "exact_token_and_pool_identity": True, "launch_wallet_analysis": True,
                 "lp_position_audit": True, "token_security_audit": True,
                 "two_way_route_quotes": True}},
-            "dex_execution_quotes": {"provider": "test-router", "timestamp_utc": self.now.isoformat().replace("+00:00", "Z"),
-                                     "buy_quote": {"output_amount": "1"}, "sell_quote": {"output_amount": "100"}},
+            "dex_execution_quotes": {
+                "provider": "test-router",
+                "timestamp_utc": now_iso,
+                "chain": "ethereum",
+                "pool_address": "0xpool",
+                "notional_size_usd": 100.0,
+                "buy_quote": {
+                    "direction": "BUY",
+                    "chain": "ethereum",
+                    "pool_address": "0xpool",
+                    "timestamp_utc": now_iso,
+                    "in_token": "0xusdc",
+                    "out_token": "0xtoken",
+                    "in_amount": 100.0,
+                    "out_amount": 1.0,
+                    "notional_size_usd": 100.0,
+                },
+                "sell_quote": {
+                    "direction": "SELL",
+                    "chain": "ethereum",
+                    "pool_address": "0xpool",
+                    "timestamp_utc": now_iso,
+                    "in_token": "0xtoken",
+                    "out_token": "0xusdc",
+                    "in_amount": 1.0,
+                    "out_amount": 100.0,
+                    "notional_size_usd": 100.0,
+                },
+            },
             "liquidity_usd": 150000,
             "target_price": 140.0,
             "target_price_source": "7D_SWING_RESISTANCE",
@@ -747,9 +777,9 @@ class FinalActionableGateTests(unittest.TestCase):
                 "target_price_source": "7D_SWING_RESISTANCE",
                 "atr_1h_pct": 10.0, "maximum_tp_distance_pct": 40.0,
                 "liquidity_usd": 150000,
-                "candle_retrieved_utc": self.now.isoformat().replace("+00:00", "Z"),
+                "candle_retrieved_utc": now_iso,
             },
-            "trade_plan": {"single_take_profit": 140.0},
+            "trade_plan": {"single_take_profit": 140.0, "intended_trade_size_usd": 100.0},
         }
 
     def test_exact_40_percent_and_all_evidence_pass(self):
