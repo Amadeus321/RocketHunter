@@ -66,6 +66,11 @@ class ChronologicalBacktestEvaluator:
             "duplicate_records": 0,
             "successfully_matched_outcomes": 0,
             "unresolved_outcomes": 0,
+            "outcome_identity_missing_records": 0,
+            "outcome_identity_invalid_records": 0,
+            "outcome_identity_mismatch_records": 0,
+            "evidence_conflict_records": 0,
+            "target_outside_window_records": 0,
             "rejected_records": [],
         }
 
@@ -284,6 +289,11 @@ class ChronologicalBacktestEvaluator:
                     "duplicate_records": self.diagnostics.get("duplicate_records", 0),
                     "successfully_matched_outcomes": 0,
                     "unresolved_outcomes": 0,
+                    "outcome_identity_missing_records": self.diagnostics.get("outcome_identity_missing_records", 0),
+                    "outcome_identity_invalid_records": self.diagnostics.get("outcome_identity_invalid_records", 0),
+                    "outcome_identity_mismatch_records": self.diagnostics.get("outcome_identity_mismatch_records", 0),
+                    "evidence_conflict_records": self.diagnostics.get("evidence_conflict_records", 0),
+                    "target_outside_window_records": self.diagnostics.get("target_outside_window_records", 0),
                 },
             }
 
@@ -409,6 +419,11 @@ class ChronologicalBacktestEvaluator:
                 "duplicate_records": self.diagnostics.get("duplicate_records", 0),
                 "successfully_matched_outcomes": self.diagnostics.get("successfully_matched_outcomes", 0),
                 "unresolved_outcomes": self.diagnostics.get("unresolved_outcomes", 0),
+                "outcome_identity_missing_records": self.diagnostics.get("outcome_identity_missing_records", 0),
+                "outcome_identity_invalid_records": self.diagnostics.get("outcome_identity_invalid_records", 0),
+                "outcome_identity_mismatch_records": self.diagnostics.get("outcome_identity_mismatch_records", 0),
+                "evidence_conflict_records": self.diagnostics.get("evidence_conflict_records", 0),
+                "target_outside_window_records": self.diagnostics.get("target_outside_window_records", 0),
             },
             "scientific_integrity_note": (
                 "Zero synthetic labels permitted. Incomplete or unresolved observation windows are "
@@ -419,84 +434,308 @@ class ChronologicalBacktestEvaluator:
     def _resolve_outcome(self, item: dict[str, Any], lookup: dict[str, dict[str, Any]] | None) -> dict[str, Any]:
         """Resolve exact-identity, verified 24-hour outcome without synthetic labels.
 
-        Never estimates MFE, MAE, TP attainment, or touch times from change_24h_pct.
-        Unresolved or incomplete records are marked is_evaluated=False and excluded from performance rates.
-        Enforces exact market identity matching: different pools or tokens cannot share outcomes.
+        Enforces:
+        - Mandatory canonical outcome identity matching forecast market_key.
+        - Strict rejection of missing, invalid, or mismatched outcome identities.
+        - Non-contradictory classification: TARGET_NOT_REACHED can never produce a hit;
+          disagreements between classification and candle evidence trigger OUTCOME_EVIDENCE_CONFLICT.
+        - Verification against frozen detection-time technical target.
+        - Validation of target-touch timestamps within the 24-hour observation window.
+        - Strict separation between market target attainment and executable net profit.
         """
-        # 1. Lookup match
-        if lookup and item["record_id"] in lookup:
+        forecast_canon_id = item.get("market_key")
+
+        # 1. Resolve source outcome record (lookup or embedded raw record)
+        rec = None
+        source_reason = "UNRESOLVED_LOOKUP"
+        is_from_lookup = False
+
+        if lookup is not None and item.get("record_id") in lookup:
             rec = lookup[item["record_id"]]
-            rec_id = rec.get("exact_identity") or rec.get("market_key")
-            # If outcome has an exact identity, it must match the forecast's exact identity
-            if rec_id and rec_id != item["market_key"]:
-                self.diagnostics["conflicting_identity_records"] += 1
+            is_from_lookup = True
+            source_reason = "MATCHED_EXACT_IDENTITY_OUTCOME_LOOKUP"
+
+        if is_from_lookup:
+            if not isinstance(rec, dict):
+                self.diagnostics["outcome_identity_missing_records"] += 1
                 self.diagnostics["unresolved_outcomes"] += 1
                 return {
-                    "outcome_classification": "CONFLICTING_IDENTITY_REJECTED",
+                    "outcome_classification": "OUTCOME_IDENTITY_MISSING",
                     "target_reached": None,
+                    "market_target_reached": None,
                     "mfe_pct": None,
                     "mae_pct": None,
                     "hours_to_target": None,
                     "is_evaluated": False,
-                    "resolution_reason": f"IDENTITY_MISMATCH: forecast={item['market_key']} outcome={rec_id}",
+                    "resolution_reason": "OUTCOME_IDENTITY_MISSING: Outcome record is not a dictionary",
                     "execution_status": "EXECUTION_UNVERIFIED",
+                    "execution_net_return_pct": None,
                 }
 
-            status = rec.get("outcome_classification") or ("TARGET_REACHED" if rec.get("target_reached") else "UNRESOLVED")
-            mfe = _clean_num(rec.get("mfe_pct"))
-            mae = _clean_num(rec.get("mae_pct"))
-            touch_time = _clean_num(rec.get("hours_to_target") or rec.get("first_touch_hours"))
-            is_eval = status in {"TARGET_REACHED", "TARGET_NOT_REACHED"} and mfe is not None
-            if is_eval:
-                self.diagnostics["successfully_matched_outcomes"] += 1
-            else:
+            has_id_indicators = any(
+                rec.get(k) is not None and str(rec.get(k)).strip() != ""
+                for k in (
+                    "market_key", "exact_identity", "identity",
+                    "chain", "token_contract", "contract_address", "token_mint", "address",
+                    "pool_address", "pair_address", "gecko_pool_id",
+                    "exchange", "venue", "trading_pair", "pair", "venue_pair",
+                )
+            ) or (isinstance(rec.get("normalized_record"), dict) and any(rec["normalized_record"].values()))
+
+            if not has_id_indicators:
+                self.diagnostics["outcome_identity_missing_records"] += 1
                 self.diagnostics["unresolved_outcomes"] += 1
+                return {
+                    "outcome_classification": "OUTCOME_IDENTITY_MISSING",
+                    "target_reached": None,
+                    "market_target_reached": None,
+                    "mfe_pct": None,
+                    "mae_pct": None,
+                    "hours_to_target": None,
+                    "is_evaluated": False,
+                    "resolution_reason": "OUTCOME_IDENTITY_MISSING: Outcome record contains no market identity",
+                    "execution_status": "EXECUTION_UNVERIFIED",
+                    "execution_net_return_pct": None,
+                }
+
+            id_res = validate_and_build_identity(rec)
+            if not id_res.get("is_valid"):
+                rej_reason = str(id_res.get("rejection_reason") or "INVALID_IDENTITY")
+                if rej_reason.startswith("MISSING_"):
+                    self.diagnostics["outcome_identity_missing_records"] += 1
+                    self.diagnostics["unresolved_outcomes"] += 1
+                    return {
+                        "outcome_classification": "OUTCOME_IDENTITY_MISSING",
+                        "target_reached": None,
+                        "market_target_reached": None,
+                        "mfe_pct": None,
+                        "mae_pct": None,
+                        "hours_to_target": None,
+                        "is_evaluated": False,
+                        "resolution_reason": f"OUTCOME_IDENTITY_MISSING: {rej_reason}",
+                        "execution_status": "EXECUTION_UNVERIFIED",
+                        "execution_net_return_pct": None,
+                    }
+                else:
+                    self.diagnostics["outcome_identity_invalid_records"] += 1
+                    self.diagnostics["unresolved_outcomes"] += 1
+                    return {
+                        "outcome_classification": "OUTCOME_IDENTITY_INVALID",
+                        "target_reached": None,
+                        "market_target_reached": None,
+                        "mfe_pct": None,
+                        "mae_pct": None,
+                        "hours_to_target": None,
+                        "is_evaluated": False,
+                        "resolution_reason": f"OUTCOME_IDENTITY_INVALID: {rej_reason}",
+                        "execution_status": "EXECUTION_UNVERIFIED",
+                        "execution_net_return_pct": None,
+                    }
+
+            outcome_canon_id = id_res.get("canonical_identity")
+            if outcome_canon_id != forecast_canon_id:
+                self.diagnostics["outcome_identity_mismatch_records"] += 1
+                self.diagnostics["conflicting_identity_records"] += 1
+                self.diagnostics["unresolved_outcomes"] += 1
+                return {
+                    "outcome_classification": "OUTCOME_IDENTITY_MISMATCH",
+                    "target_reached": None,
+                    "market_target_reached": None,
+                    "mfe_pct": None,
+                    "mae_pct": None,
+                    "hours_to_target": None,
+                    "is_evaluated": False,
+                    "resolution_reason": f"OUTCOME_IDENTITY_MISMATCH: forecast={forecast_canon_id} outcome={outcome_canon_id}",
+                    "execution_status": "EXECUTION_UNVERIFIED",
+                    "execution_net_return_pct": None,
+                }
+            outcome_data = rec
+        else:
+            raw = item.get("raw_record") or {}
+            outcome_data = raw.get("outcome") if isinstance(raw.get("outcome"), dict) else raw
+            source_reason = "EMBEDDED_VERIFIED_OUTCOME"
+
+        # 2. Extract outcome fields
+        outcome_status = outcome_data.get("outcome_classification")
+        if not outcome_status:
+            if outcome_data.get("target_reached") is True:
+                outcome_status = "TARGET_REACHED"
+            elif outcome_data.get("target_reached") is False:
+                outcome_status = "TARGET_NOT_REACHED"
+            else:
+                outcome_status = "INCOMPLETE_OBSERVATION"
+
+        mfe_pct = _clean_num(outcome_data.get("mfe_pct"))
+        mae_pct = _clean_num(outcome_data.get("mae_pct"))
+        claimed_target_reached = outcome_data.get("target_reached")
+        touch_time = _clean_num(
+            outcome_data.get("hours_to_target") or outcome_data.get("first_touch_hours") or outcome_data.get("target_touch_time_hours")
+        )
+        touch_dt = _parse_utc(
+            outcome_data.get("touch_timestamp_utc") or outcome_data.get("target_touch_utc") or outcome_data.get("first_touch_utc")
+        )
+        detection_dt = item.get("timestamp")
+
+        exec_status = str(outcome_data.get("execution_status") or "EXECUTION_UNVERIFIED")
+        exec_net_return = _clean_num(outcome_data.get("execution_net_return_pct") or outcome_data.get("net_pnl_pct"))
+
+        # Frozen detection-time target threshold (minimum +40.0% single TP)
+        frozen_tp_pct = _clean_num(item.get("technical_tp_pct"))
+        effective_target_pct = max(MANDATORY_TARGET_PCT, frozen_tp_pct if frozen_tp_pct is not None else MANDATORY_TARGET_PCT)
+
+        # 3. Handle unresolved, censored, or gap records
+        if outcome_status not in {"TARGET_REACHED", "TARGET_NOT_REACHED"}:
+            censored = bool(outcome_data.get("censored") or outcome_status in {"UNKNOWN_DUE_TO_GAP", "PRICE_SOURCE_CONFLICT", "EXPIRED"})
+            classification = outcome_status or ("CENSORED" if censored else "INCOMPLETE_OBSERVATION")
+            self.diagnostics["unresolved_outcomes"] += 1
             return {
-                "outcome_classification": status,
-                "target_reached": rec.get("target_reached") if is_eval else None,
-                "mfe_pct": mfe if is_eval else None,
-                "mae_pct": mae if is_eval else None,
-                "hours_to_target": touch_time if is_eval else None,
-                "is_evaluated": is_eval,
-                "resolution_reason": "MATCHED_EXACT_IDENTITY_OUTCOME_LOOKUP" if is_eval else "UNRESOLVED_LOOKUP",
-                "execution_status": rec.get("execution_status", "EXECUTION_UNVERIFIED"),
+                "outcome_classification": classification,
+                "target_reached": None,
+                "market_target_reached": None,
+                "mfe_pct": None,
+                "mae_pct": None,
+                "hours_to_target": None,
+                "is_evaluated": False,
+                "resolution_reason": "UNRESOLVED_INCOMPLETE_OR_CENSORED",
+                "execution_status": exec_status,
+                "execution_net_return_pct": exec_net_return,
             }
 
-        # 2. Raw record attributes
-        raw = item["raw_record"]
-        outcome_status = raw.get("outcome_classification")
-        mfe_pct = _clean_num(raw.get("mfe_pct"))
-        mae_pct = _clean_num(raw.get("mae_pct"))
-        touch_time = _clean_num(raw.get("hours_to_target") or raw.get("first_touch_hours") or raw.get("target_touch_time_hours"))
-
-        # Exact verified candle trace: only consider evaluated if verified status and real MFE are present
-        if outcome_status in {"TARGET_REACHED", "TARGET_NOT_REACHED"} and mfe_pct is not None:
-            hit_tp = bool(outcome_status == "TARGET_REACHED" or mfe_pct >= MANDATORY_TARGET_PCT)
-            self.diagnostics["successfully_matched_outcomes"] += 1
+        # 4. Require verified candle evidence (real MFE)
+        if mfe_pct is None:
+            self.diagnostics["unresolved_outcomes"] += 1
             return {
-                "outcome_classification": outcome_status,
-                "target_reached": hit_tp,
-                "mfe_pct": mfe_pct,
-                "mae_pct": mae_pct,
-                "hours_to_target": touch_time if hit_tp else None,
-                "is_evaluated": True,
-                "resolution_reason": "EMBEDDED_VERIFIED_OUTCOME",
-                "execution_status": raw.get("execution_status", "EXECUTION_UNVERIFIED"),
+                "outcome_classification": "INCOMPLETE_OBSERVATION",
+                "target_reached": None,
+                "market_target_reached": None,
+                "mfe_pct": None,
+                "mae_pct": None,
+                "hours_to_target": None,
+                "is_evaluated": False,
+                "resolution_reason": "MISSING_MFE_EVIDENCE: verified candle trace missing mfe_pct",
+                "execution_status": exec_status,
+                "execution_net_return_pct": exec_net_return,
             }
 
-        # 3. If exact-identity verified 24h outcome is unavailable, classify as INCOMPLETE / UNRESOLVED
-        censored = bool(raw.get("censored") or outcome_status in {"UNKNOWN_DUE_TO_GAP", "PRICE_SOURCE_CONFLICT", "EXPIRED"})
-        classification = outcome_status or ("CENSORED" if censored else "INCOMPLETE_OBSERVATION")
-        self.diagnostics["unresolved_outcomes"] += 1
+        # 5. Check for contradictory outcome classification vs candle evidence
+        # Case A: status is TARGET_NOT_REACHED, but evidence says target was hit
+        if outcome_status == "TARGET_NOT_REACHED":
+            if claimed_target_reached is True or mfe_pct >= effective_target_pct:
+                self.diagnostics["evidence_conflict_records"] += 1
+                self.diagnostics["unresolved_outcomes"] += 1
+                return {
+                    "outcome_classification": "OUTCOME_EVIDENCE_CONFLICT",
+                    "target_reached": None,
+                    "market_target_reached": None,
+                    "mfe_pct": mfe_pct,
+                    "mae_pct": mae_pct,
+                    "hours_to_target": None,
+                    "is_evaluated": False,
+                    "resolution_reason": f"OUTCOME_EVIDENCE_CONFLICT: status is TARGET_NOT_REACHED but mfe_pct={mfe_pct}% >= {effective_target_pct}% or claimed target_reached=True",
+                    "execution_status": exec_status,
+                    "execution_net_return_pct": exec_net_return,
+                }
+
+        # Case B: status is TARGET_REACHED, but evidence says target was NOT hit
+        if outcome_status == "TARGET_REACHED":
+            if claimed_target_reached is False or mfe_pct < effective_target_pct:
+                self.diagnostics["evidence_conflict_records"] += 1
+                self.diagnostics["unresolved_outcomes"] += 1
+                return {
+                    "outcome_classification": "OUTCOME_EVIDENCE_CONFLICT",
+                    "target_reached": None,
+                    "market_target_reached": None,
+                    "mfe_pct": mfe_pct,
+                    "mae_pct": mae_pct,
+                    "hours_to_target": None,
+                    "is_evaluated": False,
+                    "resolution_reason": f"OUTCOME_EVIDENCE_CONFLICT: status is TARGET_REACHED but mfe_pct={mfe_pct}% < {effective_target_pct}% or claimed target_reached=False",
+                    "execution_status": exec_status,
+                    "execution_net_return_pct": exec_net_return,
+                }
+
+            # 6. Validate touch timestamp and 24-hour observation window for TARGET_REACHED
+            if touch_dt is not None and detection_dt is not None:
+                elapsed_hours = (touch_dt - detection_dt).total_seconds() / 3600.0
+                if elapsed_hours < 0.0:
+                    self.diagnostics["evidence_conflict_records"] += 1
+                    self.diagnostics["unresolved_outcomes"] += 1
+                    return {
+                        "outcome_classification": "INVALID_TOUCH_TIMESTAMP",
+                        "target_reached": None,
+                        "market_target_reached": None,
+                        "mfe_pct": mfe_pct,
+                        "mae_pct": mae_pct,
+                        "hours_to_target": elapsed_hours,
+                        "is_evaluated": False,
+                        "resolution_reason": f"INVALID_TOUCH_TIMESTAMP: touch timestamp {touch_dt} occurred before detection {detection_dt}",
+                        "execution_status": exec_status,
+                        "execution_net_return_pct": exec_net_return,
+                    }
+                if elapsed_hours > 24.0:
+                    self.diagnostics["target_outside_window_records"] += 1
+                    self.diagnostics["unresolved_outcomes"] += 1
+                    return {
+                        "outcome_classification": "TARGET_TOUCH_OUTSIDE_WINDOW",
+                        "target_reached": None,
+                        "market_target_reached": None,
+                        "mfe_pct": mfe_pct,
+                        "mae_pct": mae_pct,
+                        "hours_to_target": elapsed_hours,
+                        "is_evaluated": False,
+                        "resolution_reason": f"TARGET_TOUCH_OUTSIDE_WINDOW: touch elapsed {elapsed_hours:.2f}h exceeds 24.0h observation window",
+                        "execution_status": exec_status,
+                        "execution_net_return_pct": exec_net_return,
+                    }
+                if touch_time is None:
+                    touch_time = elapsed_hours
+
+            if touch_time is not None:
+                if touch_time < 0.0:
+                    self.diagnostics["evidence_conflict_records"] += 1
+                    self.diagnostics["unresolved_outcomes"] += 1
+                    return {
+                        "outcome_classification": "INVALID_TOUCH_TIMESTAMP",
+                        "target_reached": None,
+                        "market_target_reached": None,
+                        "mfe_pct": mfe_pct,
+                        "mae_pct": mae_pct,
+                        "hours_to_target": touch_time,
+                        "is_evaluated": False,
+                        "resolution_reason": f"INVALID_TOUCH_TIMESTAMP: touch time {touch_time} is negative",
+                        "execution_status": exec_status,
+                        "execution_net_return_pct": exec_net_return,
+                    }
+                if touch_time > 24.0:
+                    self.diagnostics["target_outside_window_records"] += 1
+                    self.diagnostics["unresolved_outcomes"] += 1
+                    return {
+                        "outcome_classification": "TARGET_TOUCH_OUTSIDE_WINDOW",
+                        "target_reached": None,
+                        "market_target_reached": None,
+                        "mfe_pct": mfe_pct,
+                        "mae_pct": mae_pct,
+                        "hours_to_target": touch_time,
+                        "is_evaluated": False,
+                        "resolution_reason": f"TARGET_TOUCH_OUTSIDE_WINDOW: touch time {touch_time:.2f}h exceeds 24.0h observation window",
+                        "execution_status": exec_status,
+                        "execution_net_return_pct": exec_net_return,
+                    }
+
+        # 7. Valid, non-contradictory verified outcome
+        market_target_reached = bool(outcome_status == "TARGET_REACHED")
+        self.diagnostics["successfully_matched_outcomes"] += 1
         return {
-            "outcome_classification": classification,
-            "target_reached": None,
-            "mfe_pct": None,
-            "mae_pct": None,
-            "hours_to_target": None,
-            "is_evaluated": False,
-            "resolution_reason": "UNRESOLVED_INCOMPLETE_OR_CENSORED",
-            "execution_status": "EXECUTION_UNVERIFIED",
+            "outcome_classification": outcome_status,
+            "target_reached": market_target_reached,
+            "market_target_reached": market_target_reached,
+            "mfe_pct": mfe_pct,
+            "mae_pct": mae_pct,
+            "hours_to_target": touch_time if market_target_reached else None,
+            "is_evaluated": True,
+            "resolution_reason": source_reason,
+            "execution_status": exec_status,
+            "execution_net_return_pct": exec_net_return,
         }
 
     def _calculate_metrics(self, evaluations: list[dict[str, Any]]) -> dict[str, Any]:

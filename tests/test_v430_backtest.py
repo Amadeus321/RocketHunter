@@ -1,6 +1,7 @@
 import datetime as dt
 import pytest
 from scripts.chronological_backtest import ChronologicalBacktestEvaluator
+from scripts.address_identity import validate_and_build_identity
 
 
 class TestChronologicalBacktest:
@@ -209,8 +210,8 @@ class TestChronologicalBacktest:
 
         res_b = evaluator._resolve_outcome(item_pool_b, outcome_lookup)
         assert res_b["is_evaluated"] is False
-        assert res_b["outcome_classification"] == "CONFLICTING_IDENTITY_REJECTED"
-        assert "IDENTITY_MISMATCH" in res_b["resolution_reason"]
+        assert res_b["outcome_classification"] == "OUTCOME_IDENTITY_MISMATCH"
+        assert "OUTCOME_IDENTITY_MISMATCH" in res_b["resolution_reason"]
 
     def test_two_tokens_with_same_symbol_cannot_share_outcomes(self):
         """Regression 2: Two different tokens with the same symbol (e.g. PEPE) have different contracts and cannot share outcomes."""
@@ -330,3 +331,262 @@ class TestChronologicalBacktest:
         assert len(dataset) == 0
         assert evaluator.diagnostics["conflicting_identity_records"] == 1
         assert evaluator.diagnostics["missing_identity_by_reason"]["CONFLICTING_TOKEN_IDENTITY"] == 1
+
+    def test_outcome_identity_missing_rejected(self):
+        """Regression 9: Outcome record without canonical identity is rejected with OUTCOME_IDENTITY_MISSING."""
+        evaluator = ChronologicalBacktestEvaluator([])
+        item = {
+            "record_id": "rec_outcome_missing_id",
+            "market_key": "dex:solana:TokenX:PoolA",
+            "timestamp_utc": "2026-11-01T12:00:00Z",
+            "detection_price": 1.0,
+            "raw_record": {},
+        }
+        # Outcome has matching record_id but NO identity fields at all
+        outcome_lookup = {
+            "rec_outcome_missing_id": {
+                "outcome_classification": "TARGET_REACHED",
+                "target_reached": True,
+                "mfe_pct": 50.0,
+            }
+        }
+        res = evaluator._resolve_outcome(item, outcome_lookup)
+        assert res["is_evaluated"] is False
+        assert res["outcome_classification"] == "OUTCOME_IDENTITY_MISSING"
+        assert "OUTCOME_IDENTITY_MISSING" in res["resolution_reason"]
+        assert evaluator.diagnostics["outcome_identity_missing_records"] == 1
+        assert evaluator.diagnostics["unresolved_outcomes"] == 1
+
+    def test_outcome_identity_invalid_rejected(self):
+        """Regression 10: Outcome record with malformed/conflicting identity is rejected with OUTCOME_IDENTITY_INVALID."""
+        evaluator = ChronologicalBacktestEvaluator([])
+        item = {
+            "record_id": "rec_outcome_invalid_id",
+            "market_key": "dex:solana:TokenX:PoolA",
+            "timestamp_utc": "2026-11-01T12:00:00Z",
+            "detection_price": 1.0,
+            "raw_record": {},
+        }
+        # Outcome has conflicting pool representation in normalized_record
+        outcome_lookup = {
+            "rec_outcome_invalid_id": {
+                "chain": "solana",
+                "contract_address": "TokenX",
+                "pool_address": "PoolA",
+                "normalized_record": {
+                    "pool_address": "PoolConflicting",
+                },
+                "outcome_classification": "TARGET_REACHED",
+                "target_reached": True,
+                "mfe_pct": 50.0,
+            }
+        }
+        res = evaluator._resolve_outcome(item, outcome_lookup)
+        assert res["is_evaluated"] is False
+        assert res["outcome_classification"] == "OUTCOME_IDENTITY_INVALID"
+        assert "OUTCOME_IDENTITY_INVALID" in res["resolution_reason"]
+        assert evaluator.diagnostics["outcome_identity_invalid_records"] == 1
+        assert evaluator.diagnostics["unresolved_outcomes"] == 1
+
+    def test_outcome_identity_mismatch_rejected(self):
+        """Regression 11: Outcome record with valid identity that does not match forecast is rejected with OUTCOME_IDENTITY_MISMATCH."""
+        evaluator = ChronologicalBacktestEvaluator([])
+        item = {
+            "record_id": "rec_outcome_mismatch",
+            "market_key": "dex:solana:TokenX:PoolA",
+            "timestamp_utc": "2026-11-01T12:00:00Z",
+            "detection_price": 1.0,
+            "raw_record": {},
+        }
+        # Outcome has valid identity for PoolB instead of PoolA
+        outcome_lookup = {
+            "rec_outcome_mismatch": {
+                "chain": "solana",
+                "contract_address": "TokenX",
+                "pool_address": "PoolB",
+                "outcome_classification": "TARGET_REACHED",
+                "target_reached": True,
+                "mfe_pct": 50.0,
+            }
+        }
+        res = evaluator._resolve_outcome(item, outcome_lookup)
+        assert res["is_evaluated"] is False
+        assert res["outcome_classification"] == "OUTCOME_IDENTITY_MISMATCH"
+        assert "OUTCOME_IDENTITY_MISMATCH" in res["resolution_reason"]
+        assert evaluator.diagnostics["outcome_identity_mismatch_records"] == 1
+        assert evaluator.diagnostics["conflicting_identity_records"] == 1
+        assert evaluator.diagnostics["unresolved_outcomes"] == 1
+
+    def test_contradictory_tp40_not_reached_with_high_mfe_rejected(self):
+        """Regression 12: TARGET_NOT_REACHED with MFE >= 40% is contradictory and marked OUTCOME_EVIDENCE_CONFLICT."""
+        evaluator = ChronologicalBacktestEvaluator([])
+        item = {
+            "record_id": "rec_contradictory_1",
+            "market_key": "dex:solana:TokenX:PoolA",
+            "timestamp_utc": "2026-11-01T12:00:00Z",
+            "detection_price": 1.0,
+            "technical_tp_pct": 40.0,
+            "raw_record": {
+                "outcome_classification": "TARGET_NOT_REACHED",
+                "mfe_pct": 52.0,  # Contradicts TARGET_NOT_REACHED!
+                "mae_pct": -5.0,
+            },
+        }
+        res = evaluator._resolve_outcome(item, lookup=None)
+        assert res["is_evaluated"] is False
+        assert res["target_reached"] is None
+        assert res["outcome_classification"] == "OUTCOME_EVIDENCE_CONFLICT"
+        assert evaluator.diagnostics["evidence_conflict_records"] == 1
+        assert evaluator.diagnostics["unresolved_outcomes"] == 1
+
+    def test_contradictory_tp40_reached_with_low_mfe_rejected(self):
+        """Regression 13: TARGET_REACHED with MFE < 40% is contradictory and marked OUTCOME_EVIDENCE_CONFLICT."""
+        evaluator = ChronologicalBacktestEvaluator([])
+        item = {
+            "record_id": "rec_contradictory_2",
+            "market_key": "dex:solana:TokenX:PoolA",
+            "timestamp_utc": "2026-11-01T12:00:00Z",
+            "detection_price": 1.0,
+            "technical_tp_pct": 40.0,
+            "raw_record": {
+                "outcome_classification": "TARGET_REACHED",
+                "mfe_pct": 18.0,  # Contradicts TARGET_REACHED!
+                "mae_pct": -5.0,
+            },
+        }
+        res = evaluator._resolve_outcome(item, lookup=None)
+        assert res["is_evaluated"] is False
+        assert res["target_reached"] is None
+        assert res["outcome_classification"] == "OUTCOME_EVIDENCE_CONFLICT"
+        assert evaluator.diagnostics["evidence_conflict_records"] == 1
+        assert evaluator.diagnostics["unresolved_outcomes"] == 1
+
+    def test_target_touch_outside_24h_window_rejected(self):
+        """Regression 14: Target touch occurring beyond the 24-hour window is rejected as TARGET_TOUCH_OUTSIDE_WINDOW."""
+        evaluator = ChronologicalBacktestEvaluator([])
+        # Case A: hours_to_target > 24.0
+        item_a = {
+            "record_id": "rec_touch_outside_a",
+            "market_key": "dex:solana:TokenX:PoolA",
+            "timestamp_utc": "2026-11-01T12:00:00Z",
+            "detection_price": 1.0,
+            "technical_tp_pct": 40.0,
+            "raw_record": {
+                "outcome_classification": "TARGET_REACHED",
+                "mfe_pct": 60.0,
+                "hours_to_target": 27.5,  # > 24.0h!
+            },
+        }
+        res_a = evaluator._resolve_outcome(item_a, lookup=None)
+        assert res_a["is_evaluated"] is False
+        assert res_a["outcome_classification"] == "TARGET_TOUCH_OUTSIDE_WINDOW"
+        assert evaluator.diagnostics["target_outside_window_records"] == 1
+
+        # Case B: touch timestamp > 24.0h after detection timestamp
+        item_b = {
+            "record_id": "rec_touch_outside_b",
+            "market_key": "dex:solana:TokenX:PoolA",
+            "timestamp": dt.datetime(2026, 11, 1, 12, 0, tzinfo=dt.timezone.utc),
+            "timestamp_utc": "2026-11-01T12:00:00Z",
+            "detection_price": 1.0,
+            "technical_tp_pct": 40.0,
+            "raw_record": {
+                "outcome_classification": "TARGET_REACHED",
+                "mfe_pct": 60.0,
+                "touch_timestamp_utc": "2026-11-02T16:00:00Z",  # 28 hours later!
+            },
+        }
+        res_b = evaluator._resolve_outcome(item_b, lookup=None)
+        assert res_b["is_evaluated"] is False
+        assert res_b["outcome_classification"] == "TARGET_TOUCH_OUTSIDE_WINDOW"
+        assert evaluator.diagnostics["target_outside_window_records"] == 2
+
+    def test_invalid_touch_timestamp_rejected(self):
+        """Regression 15: Target touch occurring before detection time is rejected as INVALID_TOUCH_TIMESTAMP."""
+        evaluator = ChronologicalBacktestEvaluator([])
+        item = {
+            "record_id": "rec_touch_invalid",
+            "market_key": "dex:solana:TokenX:PoolA",
+            "timestamp": dt.datetime(2026, 11, 1, 12, 0, tzinfo=dt.timezone.utc),
+            "timestamp_utc": "2026-11-01T12:00:00Z",
+            "detection_price": 1.0,
+            "technical_tp_pct": 40.0,
+            "raw_record": {
+                "outcome_classification": "TARGET_REACHED",
+                "mfe_pct": 60.0,
+                "touch_timestamp_utc": "2026-11-01T10:00:00Z",  # 2 hours before detection!
+            },
+        }
+        res = evaluator._resolve_outcome(item, lookup=None)
+        assert res["is_evaluated"] is False
+        assert res["outcome_classification"] == "INVALID_TOUCH_TIMESTAMP"
+        assert evaluator.diagnostics["evidence_conflict_records"] == 1
+
+    def test_frozen_detection_target_evaluated_not_recalculated_target(self):
+        """Regression 16: Evaluates against the frozen detection-time target (+50%), not a lower recalculated target (+40%)."""
+        evaluator = ChronologicalBacktestEvaluator([])
+        item = {
+            "record_id": "rec_frozen_target",
+            "market_key": "dex:solana:TokenX:PoolA",
+            "timestamp_utc": "2026-11-01T12:00:00Z",
+            "detection_price": 1.0,
+            "technical_tp_pct": 50.0,  # Frozen target was +50.0%
+            "raw_record": {
+                "outcome_classification": "TARGET_REACHED",  # Provider claims reached based on +40%
+                "mfe_pct": 45.0,  # Reached 45%, which is < frozen 50% target!
+            },
+        }
+        res = evaluator._resolve_outcome(item, lookup=None)
+        assert res["is_evaluated"] is False
+        assert res["outcome_classification"] == "OUTCOME_EVIDENCE_CONFLICT"
+
+    def test_dex_record_with_venue_never_becomes_cex_when_pool_missing(self):
+        """Regression 17: A DEX record with a venue/provider field and missing pool must NEVER become CEX."""
+        rec = {
+            "chain": "solana",
+            "token_mint": "TokenA11111111111111111111111111111111111111",
+            "venue": "raydium",  # Venue metadata present
+            "source": "gecko",
+            # pool_address is missing!
+        }
+        res = validate_and_build_identity(rec)
+        assert res["is_valid"] is False
+        assert res["market_type"] == "dex"
+        assert res["rejection_reason"] == "MISSING_POOL"
+
+    def test_ambiguous_market_type_strictly_rejected(self):
+        """Regression 18: Records with contradictory DEX and CEX indicators are rejected as AMBIGUOUS_MARKET_TYPE."""
+        rec = {
+            "chain": "ethereum",
+            "contract_address": "0x1111111111111111111111111111111111111111",
+            "pool_address": "0x2222222222222222222222222222222222222222",
+            "market_type": "cex_spot",  # Contradicts DEX fields!
+        }
+        res = validate_and_build_identity(rec)
+        assert res["is_valid"] is False
+        assert res["market_type"] == "ambiguous"
+        assert res["rejection_reason"] == "AMBIGUOUS_MARKET_TYPE"
+
+    def test_market_target_touch_separated_from_execution_net_profit(self):
+        """Regression 19: Market target touch (+40%) is reported separately from executable net profit."""
+        evaluator = ChronologicalBacktestEvaluator([])
+        item = {
+            "record_id": "rec_exec_sep",
+            "market_key": "dex:solana:TokenX:PoolA",
+            "timestamp_utc": "2026-11-01T12:00:00Z",
+            "detection_price": 1.0,
+            "technical_tp_pct": 40.0,
+            "raw_record": {
+                "outcome_classification": "TARGET_REACHED",
+                "mfe_pct": 45.0,
+                "hours_to_target": 4.0,
+                "execution_status": "EXECUTABLE",
+                "execution_net_return_pct": 36.2,  # Net return after slippage and gas fees
+            },
+        }
+        res = evaluator._resolve_outcome(item, lookup=None)
+        assert res["is_evaluated"] is True
+        assert res["market_target_reached"] is True
+        assert res["target_reached"] is True
+        assert res["execution_status"] == "EXECUTABLE"
+        assert res["execution_net_return_pct"] == 36.2
