@@ -5,7 +5,9 @@ from unittest.mock import patch
 
 from scripts import v425_early_breakout as v425
 from scripts.breakout_signal_engines import BreakoutSignalEngines
+from scripts.execution_simulator import acquire_provider_observation
 from scripts.expected_return_engine import ExpectedReturnEngine
+from tests.test_execution_simulator import make_mock_chainlink_rpc_transport
 
 
 class TestEngineDiagnostics:
@@ -152,31 +154,13 @@ class TestEngineDiagnostics:
                     "notional_size_usd": 100.0,
                 },
             },
-            "quote_usd_conversion": {
-                "price_usd": 1.0,
-                "chain": "ethereum",
-                "quote_asset": "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48",
-                "reference_asset": "USD",
-                "timestamp_utc": now.isoformat(),
-                "source": "chainlink_oracle_usd",
-                "provider": "chainlink",
-                "feed_address": "0x8fa59a53f040d12d26f03bc9920373707c3c4004",
-                "valuation_policy": "STABLECOIN_ORACLE_VERIFIED",
-                "provider_acquired": True,
-                "request_url": "https://rpc.ethereum.chainlink.org/v1/0x8fa59a53f040d12d26f03bc9920373707c3c4004/latestRoundData",
-                "rpc_method": "eth_call:latestRoundData()",
-                "retrieval_time_utc": now.isoformat(),
-                "raw_payload": '{"roundId":1,"answer":100000000,"startedAt":1794571200,"updatedAt":1794571200,"answeredInRound":1}',
-                "response_sha256": hashlib.sha256('{"roundId":1,"answer":100000000,"startedAt":1794571200,"updatedAt":1794571200,"answeredInRound":1}'.encode("utf-8")).hexdigest(),
-                "observation": {
-                    "answer": 100000000,
-                    "decimals": 8,
-                    "round_id": 1,
-                    "answered_in_round": 1,
-                    "chain_id": 1,
-                    "updated_at": now.isoformat(),
-                },
-            },
+            "quote_usd_conversion": acquire_provider_observation(
+                "chainlink",
+                "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48",
+                "ethereum",
+                as_of_utc=now.isoformat(),
+                transport=make_mock_chainlink_rpc_transport(updated_at=int(now.timestamp())),
+            ),
         }
 
         # 1. Verify candidate passes when software execution succeeds

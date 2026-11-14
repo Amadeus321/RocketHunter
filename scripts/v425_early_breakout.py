@@ -2006,6 +2006,8 @@ def qualify_final_actionable_candidates(candidates: list[dict[str, Any]], now: d
                 "FABRICATED_PROVIDER_RESPONSE",
                 "UNVERIFIED_PROVIDER_OBSERVATION",
                 "STRUCTURALLY_CONSISTENT_UNVERIFIED_PROVENANCE",
+                "PROVIDER_DATA_UNAVAILABLE",
+                "PROVIDER_RESPONSE_INVALID",
             }
             if sim_status in conv_error_codes or sim_res.get("status") in conv_error_codes:
                 err_code = sim_status if sim_status in conv_error_codes else sim_res.get("status")
