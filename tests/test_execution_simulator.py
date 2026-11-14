@@ -24,6 +24,7 @@ from scripts.execution_simulator import (
     ProviderUnavailableError,
     _verify_provenance_token,
     _canonical_observation_payload,
+    _generate_provenance_token,
 )
 from scripts import v425_early_breakout as v425
 
@@ -4971,6 +4972,534 @@ class ProductionGateHardeningTests(ProvenanceIntegrityAdversarialTests):
         self.assertEqual(status, "TEST_MOCKED_OBSERVATION_VALIDATED")
         self.assertEqual(price, 1.0)
         self.assertTrue(details["provider_acquired"])
+
+    # 17. All 23 canonical fields tested for mutation
+    def test_17_all_23_fields_tested_for_mutation(self):
+        all_23_mutations = [
+            ("acquisition_method", "MUTATED_ACQUISITION_METHOD"),
+            ("chain", "arbitrum"),
+            ("chain_id", "42161"),
+            ("cryptographic_signature_verified", True),
+            ("feed_id", "0x0000000000000000000000000000000000000099"),
+            ("http_status", 500),
+            ("market_id", "MUTATED_MARKET_ID"),
+            ("observation", {"mutated_observation_key": "val"}),
+            ("observation_timestamp", "2026-01-01T00:00:00Z"),
+            ("pool_address", "0x0000000000000000000000000000000000000088"),
+            ("price_usd", 999.0),
+            ("provider", "binance"),
+            ("quote_asset", "0x0000000000000000000000000000000000000077"),
+            ("raw_payload", '{"mutated_raw_payload": true}'),
+            ("response_sha256", "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"),
+            ("reference_asset", "EUR"),
+            ("request_url", "https://mutated-rpc.example.com"),
+            ("retrieval_time_utc", "2026-01-01T00:00:00Z"),
+            ("rpc_method", "eth_mutatedMethod"),
+            ("transport_type", "LIVE_NETWORK_ACQUISITION"),
+            ("valuation_policy", "CRYPTO_ORACLE_VERIFIED"),
+        ]
+        for field_name, mutated_val in all_23_mutations:
+            with self.subTest(field=field_name):
+                obs = ChainlinkRpcAdapter.fetch(
+                    VALID_QUOTE_ADDR,
+                    VALID_EVM_CHAIN,
+                    as_of_utc=self.as_of_utc,
+                    transport=self.mock_cl_transport,
+                )
+                self.assertTrue(_verify_provenance_token(obs))
+                setattr(obs, field_name, mutated_val)
+                self.assertFalse(_verify_provenance_token(obs), f"Mutating '{field_name}' did not invalidate HMAC signature!")
+                ok, status, _, _ = validate_quote_usd_conversion(obs, as_of_utc=self.as_of_utc)
+                self.assertFalse(ok, f"Mutating '{field_name}' passed validate_quote_usd_conversion!")
+
+        # Explicitly verify provider_identifier and feed_or_pool_id in canonical payload
+        base_canonical = _canonical_observation_payload(
+            provider="chainlink",
+            provider_identifier="0x8fa59a53f040d12d26f03bc9920373707c3c4004",
+            chain="ethereum",
+            chain_id=1,
+            quote_asset="0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48",
+            feed_or_pool_id="0x8fa59a53f040d12d26f03bc9920373707c3c4004",
+            reference_asset="USD",
+            valuation_policy="STABLECOIN_ORACLE_VERIFIED",
+            price_usd=1.0,
+            observation={"answer": 100000000},
+            observation_timestamp="2026-11-13T12:00:00Z",
+            retrieval_timestamp_utc="2026-11-13T12:00:00Z",
+            http_status=200,
+            rpc_method="eth_call",
+            raw_payload="{}",
+            response_sha256="44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+            transport_type="MOCKED_TRANSPORT",
+            acquisition_method="CHAINLINK_RPC_LATEST_ROUND_DATA",
+            request_url="https://ethereum-rpc.publicnode.com",
+            feed_id="0x8fa59a53f040d12d26f03bc9920373707c3c4004",
+        )
+        base_token = _generate_provenance_token(base_canonical)
+
+        mutated_pid_canonical = _canonical_observation_payload(
+            provider="chainlink",
+            provider_identifier="0x0000000000000000000000000000000000000099",
+            chain="ethereum",
+            chain_id=1,
+            quote_asset="0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48",
+            feed_or_pool_id="0x8fa59a53f040d12d26f03bc9920373707c3c4004",
+            reference_asset="USD",
+            valuation_policy="STABLECOIN_ORACLE_VERIFIED",
+            price_usd=1.0,
+            observation={"answer": 100000000},
+            observation_timestamp="2026-11-13T12:00:00Z",
+            retrieval_timestamp_utc="2026-11-13T12:00:00Z",
+            http_status=200,
+            rpc_method="eth_call",
+            raw_payload="{}",
+            response_sha256="44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+            transport_type="MOCKED_TRANSPORT",
+            acquisition_method="CHAINLINK_RPC_LATEST_ROUND_DATA",
+            request_url="https://ethereum-rpc.publicnode.com",
+            feed_id="0x8fa59a53f040d12d26f03bc9920373707c3c4004",
+        )
+        self.assertNotEqual(base_canonical, mutated_pid_canonical)
+        self.assertNotEqual(base_token, _generate_provenance_token(mutated_pid_canonical))
+
+        mutated_fpid_canonical = _canonical_observation_payload(
+            provider="chainlink",
+            provider_identifier="0x8fa59a53f040d12d26f03bc9920373707c3c4004",
+            chain="ethereum",
+            chain_id=1,
+            quote_asset="0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48",
+            feed_or_pool_id="0x0000000000000000000000000000000000000099",
+            reference_asset="USD",
+            valuation_policy="STABLECOIN_ORACLE_VERIFIED",
+            price_usd=1.0,
+            observation={"answer": 100000000},
+            observation_timestamp="2026-11-13T12:00:00Z",
+            retrieval_timestamp_utc="2026-11-13T12:00:00Z",
+            http_status=200,
+            rpc_method="eth_call",
+            raw_payload="{}",
+            response_sha256="44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+            transport_type="MOCKED_TRANSPORT",
+            acquisition_method="CHAINLINK_RPC_LATEST_ROUND_DATA",
+            request_url="https://ethereum-rpc.publicnode.com",
+            feed_id="0x8fa59a53f040d12d26f03bc9920373707c3c4004",
+        )
+        self.assertNotEqual(base_canonical, mutated_fpid_canonical)
+        self.assertNotEqual(base_token, _generate_provenance_token(mutated_fpid_canonical))
+
+    # 18. All 23 canonical fields tested for None substitution
+    def test_18_all_23_fields_tested_for_none_substitution(self):
+        # 14 required fields reject None unconditionally
+        required_fields = [
+            "acquisition_method",
+            "chain",
+            "chain_id",
+            "http_status",
+            "observation_timestamp",
+            "price_usd",
+            "provider",
+            "quote_asset",
+            "reference_asset",
+            "retrieval_time_utc",
+            "transport_type",
+            "valuation_policy",
+        ]
+        for field_name in required_fields:
+            with self.subTest(required_field=field_name):
+                obs = ChainlinkRpcAdapter.fetch(
+                    VALID_QUOTE_ADDR,
+                    VALID_EVM_CHAIN,
+                    as_of_utc=self.as_of_utc,
+                    transport=self.mock_cl_transport,
+                )
+                self.assertTrue(_verify_provenance_token(obs))
+                setattr(obs, field_name, None)
+                self.assertFalse(_verify_provenance_token(obs), f"Setting required field '{field_name}' to None passed HMAC verification!")
+                ok, status, _, _ = validate_quote_usd_conversion(obs, as_of_utc=self.as_of_utc)
+                self.assertFalse(ok, f"Setting required field '{field_name}' to None passed validate_quote_usd_conversion!")
+
+        # Directly verify provider_identifier and feed_or_pool_id reject None in _canonical_observation_payload
+        with self.assertRaises(ValueError):
+            _canonical_observation_payload(
+                provider="chainlink",
+                provider_identifier=None,
+                chain="ethereum",
+                chain_id=1,
+                quote_asset="0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48",
+                feed_or_pool_id="0x8fa59a53f040d12d26f03bc9920373707c3c4004",
+                reference_asset="USD",
+                valuation_policy="STABLECOIN_ORACLE_VERIFIED",
+                price_usd=1.0,
+                observation={},
+                observation_timestamp="2026-11-13T12:00:00Z",
+                retrieval_timestamp_utc="2026-11-13T12:00:00Z",
+                http_status=200,
+                rpc_method="eth_call",
+                raw_payload="{}",
+                response_sha256="",
+                transport_type="MOCKED_TRANSPORT",
+                acquisition_method="CHAINLINK_RPC_LATEST_ROUND_DATA",
+            )
+        with self.assertRaises(ValueError):
+            _canonical_observation_payload(
+                provider="chainlink",
+                provider_identifier="0x8fa59a53f040d12d26f03bc9920373707c3c4004",
+                chain="ethereum",
+                chain_id=1,
+                quote_asset="0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48",
+                feed_or_pool_id=None,
+                reference_asset="USD",
+                valuation_policy="STABLECOIN_ORACLE_VERIFIED",
+                price_usd=1.0,
+                observation={},
+                observation_timestamp="2026-11-13T12:00:00Z",
+                retrieval_timestamp_utc="2026-11-13T12:00:00Z",
+                http_status=200,
+                rpc_method="eth_call",
+                raw_payload="{}",
+                response_sha256="",
+                transport_type="MOCKED_TRANSPORT",
+                acquisition_method="CHAINLINK_RPC_LATEST_ROUND_DATA",
+            )
+
+        # Optional fields that were present in the acquired observation invalidate HMAC when stripped to None
+        populated_optional_fields = [
+            "feed_id",
+            "request_url",
+            "rpc_method",
+            "raw_payload",
+            "response_sha256",
+            "observation",
+        ]
+        for field_name in populated_optional_fields:
+            with self.subTest(populated_optional=field_name):
+                obs = ChainlinkRpcAdapter.fetch(
+                    VALID_QUOTE_ADDR,
+                    VALID_EVM_CHAIN,
+                    as_of_utc=self.as_of_utc,
+                    transport=self.mock_cl_transport,
+                )
+                self.assertTrue(_verify_provenance_token(obs))
+                setattr(obs, field_name, None)
+                self.assertFalse(_verify_provenance_token(obs), f"Setting populated field '{field_name}' to None passed HMAC verification!")
+                ok, status, _, _ = validate_quote_usd_conversion(obs, as_of_utc=self.as_of_utc)
+                self.assertFalse(ok)
+
+    # 19. All required string fields reject empty or whitespace strings
+    def test_19_all_required_string_fields_reject_empty_or_whitespace(self):
+        required_string_fields = [
+            "acquisition_method",
+            "chain",
+            "chain_id",
+            "observation_timestamp",
+            "provider",
+            "quote_asset",
+            "reference_asset",
+            "retrieval_time_utc",
+            "transport_type",
+            "valuation_policy",
+        ]
+        for field_name in required_string_fields:
+            for empty_val in ("", "   ", "\t\n"):
+                with self.subTest(field=field_name, empty_val=repr(empty_val)):
+                    obs = ChainlinkRpcAdapter.fetch(
+                        VALID_QUOTE_ADDR,
+                        VALID_EVM_CHAIN,
+                        as_of_utc=self.as_of_utc,
+                        transport=self.mock_cl_transport,
+                    )
+                    self.assertTrue(_verify_provenance_token(obs))
+                    setattr(obs, field_name, empty_val)
+                    self.assertFalse(_verify_provenance_token(obs), f"Setting '{field_name}' to {empty_val!r} passed HMAC!")
+                    ok, status, _, _ = validate_quote_usd_conversion(obs, as_of_utc=self.as_of_utc)
+                    self.assertFalse(ok, f"Setting '{field_name}' to {empty_val!r} passed conversion validation!")
+
+    # 20. HTTP status and price type coercion and boundary rejection
+    def test_20_http_status_and_price_type_coercion_and_boundary_rejection(self):
+        # HTTP status boundary and type coercion tests
+        invalid_http_statuses = [0, None, True, False, 99, 600, -200, "200", 3.14]
+        for bad_status in invalid_http_statuses:
+            with self.subTest(http_status=bad_status):
+                obs = ChainlinkRpcAdapter.fetch(
+                    VALID_QUOTE_ADDR,
+                    VALID_EVM_CHAIN,
+                    as_of_utc=self.as_of_utc,
+                    transport=self.mock_cl_transport,
+                )
+                obs.http_status = bad_status
+                self.assertFalse(_verify_provenance_token(obs), f"HTTP status {bad_status!r} passed HMAC verification!")
+                ok, _, _, _ = validate_quote_usd_conversion(obs, as_of_utc=self.as_of_utc)
+                self.assertFalse(ok, f"HTTP status {bad_status!r} passed conversion validation!")
+
+        # Price USD boundary and type coercion tests
+        invalid_prices = [0.0, -1.0, None, True, False, float("nan"), float("inf"), float("-inf"), "1.0"]
+        for bad_price in invalid_prices:
+            with self.subTest(price_usd=bad_price):
+                obs = ChainlinkRpcAdapter.fetch(
+                    VALID_QUOTE_ADDR,
+                    VALID_EVM_CHAIN,
+                    as_of_utc=self.as_of_utc,
+                    transport=self.mock_cl_transport,
+                )
+                obs.price_usd = bad_price
+                self.assertFalse(_verify_provenance_token(obs), f"Price {bad_price!r} passed HMAC verification!")
+                ok, status, _, _ = validate_quote_usd_conversion(obs, as_of_utc=self.as_of_utc)
+                self.assertFalse(ok, f"Price {bad_price!r} passed conversion validation!")
+
+    # 21. Raw payload and SHA-256 mismatches detected
+    def test_21_raw_payload_and_sha256_mismatches_detected(self):
+        # 1. Mutate raw_payload only -> hash mismatch
+        obs1 = ChainlinkRpcAdapter.fetch(
+            VALID_QUOTE_ADDR,
+            VALID_EVM_CHAIN,
+            as_of_utc=self.as_of_utc,
+            transport=self.mock_cl_transport,
+        )
+        obs1.raw_payload = '{"altered": true}'
+        self.assertFalse(_verify_provenance_token(obs1))
+        ok1, st1, _, _ = validate_quote_usd_conversion(obs1, as_of_utc=self.as_of_utc)
+        self.assertFalse(ok1)
+        self.assertIn(st1, ("PAYLOAD_HASH_MISMATCH", "INVALID_PROVENANCE_SIGNATURE"))
+
+        # 2. Mutate response_sha256 only -> hash mismatch
+        obs2 = ChainlinkRpcAdapter.fetch(
+            VALID_QUOTE_ADDR,
+            VALID_EVM_CHAIN,
+            as_of_utc=self.as_of_utc,
+            transport=self.mock_cl_transport,
+        )
+        obs2.response_sha256 = "0000000000000000000000000000000000000000000000000000000000000000"
+        self.assertFalse(_verify_provenance_token(obs2))
+        ok2, st2, _, _ = validate_quote_usd_conversion(obs2, as_of_utc=self.as_of_utc)
+        self.assertFalse(ok2)
+        self.assertIn(st2, ("PAYLOAD_HASH_MISMATCH", "INVALID_PROVENANCE_SIGNATURE"))
+
+        # 3. Mutate raw_payload AND matching response_sha256 together -> HMAC signature mismatch
+        obs3 = ChainlinkRpcAdapter.fetch(
+            VALID_QUOTE_ADDR,
+            VALID_EVM_CHAIN,
+            as_of_utc=self.as_of_utc,
+            transport=self.mock_cl_transport,
+        )
+        new_payload = '{"forged": 123}'
+        obs3.raw_payload = new_payload
+        obs3.response_sha256 = hashlib.sha256(new_payload.encode("utf-8")).hexdigest()
+        self.assertFalse(_verify_provenance_token(obs3))
+        ok3, st3, _, _ = validate_quote_usd_conversion(obs3, as_of_utc=self.as_of_utc)
+        self.assertFalse(ok3)
+        self.assertEqual(st3, "INVALID_PROVENANCE_SIGNATURE")
+
+    # 22. Provider-specific required field omissions fail closed
+    def test_22_provider_specific_required_field_omissions(self):
+        # 1. Chainlink missing required observation fields
+        cl_obs = ChainlinkRpcAdapter.fetch(
+            VALID_QUOTE_ADDR,
+            VALID_EVM_CHAIN,
+            as_of_utc=self.as_of_utc,
+            transport=self.mock_cl_transport,
+        )
+        for missing_key in ("answer", "decimals", "round_id", "updated_at"):
+            with self.subTest(chainlink_missing=missing_key):
+                bad_cl = copy.deepcopy(cl_obs)
+                bad_cl.observation.pop(missing_key, None)
+                if missing_key == "round_id":
+                    bad_cl.observation.pop("answered_in_round", None)
+                bad_cl._auth_token = _generate_provenance_token(bad_cl.canonical_bytes())
+                ok, status, _, details = validate_quote_usd_conversion(bad_cl, as_of_utc=self.as_of_utc)
+                self.assertFalse(ok)
+                self.assertEqual(status, "MISSING_PROVIDER_OBSERVATION_FIELDS")
+
+        # Chainlink missing feed_address
+        bad_cl_feed = copy.deepcopy(cl_obs)
+        bad_cl_feed.feed_id = None
+        bad_cl_feed._auth_token = _generate_provenance_token(bad_cl_feed.canonical_bytes())
+        ok, status, _, details = validate_quote_usd_conversion(bad_cl_feed, as_of_utc=self.as_of_utc)
+        self.assertFalse(ok)
+        self.assertIn(status, ("MISSING_CONVERSION_PROVENANCE", "OBSERVATION_MUTATION_DETECTED"))
+
+        # 2. Pyth missing required observation fields
+        pyth_obs = AcquiredProviderObservation._create(
+            provider="pyth",
+            chain="ethereum",
+            chain_id="ethereum",
+            quote_asset=VALID_QUOTE_ADDR,
+            reference_asset="USD",
+            price_usd=1.0,
+            retrieval_time_utc=self.as_of_utc,
+            request_url="https://hermes.pyth.network/v2/updates/price/latest?ids[]=0xeaa020c61cc479712813461ce153894a96a6c00b21ed0cfc2798d1f9a9e9c94a",
+            http_status=200,
+            raw_payload='{"parsed":[{"price":{"price":"100000000","expo":-8,"publish_time":1794571200}}]}',
+            response_sha256=hashlib.sha256(b'{"parsed":[{"price":{"price":"100000000","expo":-8,"publish_time":1794571200}}]}').hexdigest(),
+            observation={"price": 100000000, "expo": -8, "publish_time": self.as_of_utc, "feed_id": "0xeaa020c61cc479712813461ce153894a96a6c00b21ed0cfc2798d1f9a9e9c94a"},
+            feed_id="0xeaa020c61cc479712813461ce153894a96a6c00b21ed0cfc2798d1f9a9e9c94a",
+            valuation_policy="STABLECOIN_ORACLE_VERIFIED",
+            transport_type="MOCKED_TRANSPORT",
+            acquisition_method="PYTH_HERMES_PRICE_SERVICE_HTTP",
+            observation_timestamp=self.as_of_utc,
+        )
+        for missing_key in ("price", "expo", "publish_time"):
+            with self.subTest(pyth_missing=missing_key):
+                bad_pyth = copy.deepcopy(pyth_obs)
+                bad_pyth.observation.pop(missing_key, None)
+                bad_pyth._auth_token = _generate_provenance_token(bad_pyth.canonical_bytes())
+                ok, status, _, _ = validate_quote_usd_conversion(bad_pyth, as_of_utc=self.as_of_utc)
+                self.assertFalse(ok)
+                self.assertEqual(status, "MISSING_PROVIDER_OBSERVATION_FIELDS")
+
+        # Pyth missing feed_id
+        bad_pyth_fid = copy.deepcopy(pyth_obs)
+        bad_pyth_fid.feed_id = None
+        bad_pyth_fid._auth_token = _generate_provenance_token(bad_pyth_fid.canonical_bytes())
+        ok, status, _, _ = validate_quote_usd_conversion(bad_pyth_fid, as_of_utc=self.as_of_utc)
+        self.assertFalse(ok)
+        self.assertIn(status, ("MISSING_CONVERSION_PROVENANCE", "OBSERVATION_MUTATION_DETECTED"))
+
+        # 3. Uniswap v3 missing required observation fields
+        uni_obs = AcquiredProviderObservation._create(
+            provider="uniswap_v3_twap",
+            chain="ethereum",
+            chain_id=1,
+            quote_asset=VALID_QUOTE_ADDR,
+            reference_asset="USD",
+            price_usd=1.0,
+            retrieval_time_utc=self.as_of_utc,
+            request_url="https://ethereum-rpc.publicnode.com",
+            rpc_method="eth_call:observe(uint32[])",
+            http_status=200,
+            raw_payload="0x",
+            response_sha256=hashlib.sha256(b"0x").hexdigest(),
+            observation={"twap_price": 1.0, "twap_window_seconds": 1800, "pool_address": "0x88e6a0c2ddd26feeb64f039a2c41296fcb3f5640"},
+            pool_address="0x88e6a0c2ddd26feeb64f039a2c41296fcb3f5640",
+            valuation_policy="ON_CHAIN_TWAP_VERIFIED",
+            transport_type="MOCKED_TRANSPORT",
+            acquisition_method="UNISWAP_V3_ON_CHAIN_OBSERVE_RPC",
+            observation_timestamp=self.as_of_utc,
+        )
+        for missing_key in ("twap_price", "twap_window_seconds"):
+            with self.subTest(uniswap_missing=missing_key):
+                bad_uni = copy.deepcopy(uni_obs)
+                bad_uni.observation.pop(missing_key, None)
+                bad_uni._auth_token = _generate_provenance_token(bad_uni.canonical_bytes())
+                ok, status, _, _ = validate_quote_usd_conversion(bad_uni, as_of_utc=self.as_of_utc)
+                self.assertFalse(ok)
+                self.assertEqual(status, "MISSING_PROVIDER_OBSERVATION_FIELDS")
+
+        bad_uni_pool = copy.deepcopy(uni_obs)
+        bad_uni_pool.pool_address = None
+        bad_uni_pool._auth_token = _generate_provenance_token(bad_uni_pool.canonical_bytes())
+        ok, status, _, _ = validate_quote_usd_conversion(bad_uni_pool, as_of_utc=self.as_of_utc)
+        self.assertFalse(ok)
+        self.assertIn(status, ("MISSING_CONVERSION_PROVENANCE", "OBSERVATION_MUTATION_DETECTED"))
+
+        # 4. CEX missing required observation fields
+        cex_obs = AcquiredProviderObservation._create(
+            provider="coinbase",
+            chain="ethereum",
+            chain_id="cex",
+            quote_asset=VALID_QUOTE_ADDR,
+            reference_asset="USD",
+            price_usd=1.0,
+            retrieval_time_utc=self.as_of_utc,
+            request_url="https://api.exchange.coinbase.com/products/USDC-USD/ticker",
+            http_status=200,
+            raw_payload='{"price":"1.0","bid":"0.9999","ask":"1.0001","volume":"1000000"}',
+            response_sha256=hashlib.sha256(b'{"price":"1.0","bid":"0.9999","ask":"1.0001","volume":"1000000"}').hexdigest(),
+            observation={"symbol": "USDC-USD", "last_price": 1.0, "bid_price": 0.9999, "ask_price": 1.0001, "volume_24h": 1000000.0, "timestamp": self.as_of_utc},
+            market_id="USDC-USD",
+            valuation_policy="CEX_MARKET_TICKER_VERIFIED",
+            transport_type="MOCKED_TRANSPORT",
+            acquisition_method="COINBASE_REST_TICKER_HTTP",
+            observation_timestamp=self.as_of_utc,
+        )
+        for missing_key in ("symbol", "last_price", "bid_price", "ask_price", "volume_24h"):
+            with self.subTest(cex_missing=missing_key):
+                bad_cex = copy.deepcopy(cex_obs)
+                bad_cex.observation.pop(missing_key, None)
+                bad_cex._auth_token = _generate_provenance_token(bad_cex.canonical_bytes())
+                ok, status, _, _ = validate_quote_usd_conversion(bad_cex, as_of_utc=self.as_of_utc)
+                self.assertFalse(ok)
+                self.assertEqual(status, "MISSING_PROVIDER_OBSERVATION_FIELDS")
+
+        bad_cex_mid = copy.deepcopy(cex_obs)
+        bad_cex_mid.market_id = None
+        bad_cex_mid._auth_token = _generate_provenance_token(bad_cex_mid.canonical_bytes())
+        ok, status, _, _ = validate_quote_usd_conversion(bad_cex_mid, as_of_utc=self.as_of_utc)
+        self.assertFalse(ok)
+        self.assertIn(status, ("MISSING_CONVERSION_PROVENANCE", "OBSERVATION_MUTATION_DETECTED"))
+
+        # 5. DefiLlama missing required observation fields
+        dl_obs = AcquiredProviderObservation._create(
+            provider="defillama",
+            chain="ethereum",
+            chain_id="ethereum",
+            quote_asset=VALID_QUOTE_ADDR,
+            reference_asset="USD",
+            price_usd=1.0,
+            retrieval_time_utc=self.as_of_utc,
+            request_url="https://coins.llama.fi/prices/current/ethereum:0x...",
+            http_status=200,
+            raw_payload='{"coins":{}}',
+            response_sha256=hashlib.sha256(b'{"coins":{}}').hexdigest(),
+            observation={"price": 1.0, "token": VALID_QUOTE_ADDR, "chain": "ethereum", "timestamp": self.as_of_utc},
+            feed_id=f"ethereum:{VALID_QUOTE_ADDR}",
+            valuation_policy="DEX_AGGREGATOR_VERIFIED",
+            transport_type="MOCKED_TRANSPORT",
+            acquisition_method="DEFILLAMA_PRICES_HTTP",
+            observation_timestamp=self.as_of_utc,
+        )
+        for missing_key in ("price", "token", "timestamp"):
+            with self.subTest(defillama_missing=missing_key):
+                bad_dl = copy.deepcopy(dl_obs)
+                bad_dl.observation.pop(missing_key, None)
+                bad_dl._auth_token = _generate_provenance_token(bad_dl.canonical_bytes())
+                ok, status, _, _ = validate_quote_usd_conversion(bad_dl, as_of_utc=self.as_of_utc)
+                self.assertFalse(ok)
+                self.assertEqual(status, "MISSING_PROVIDER_OBSERVATION_FIELDS")
+
+    # 23. Optional fields safe omission for each provider type
+    def test_23_optional_fields_safe_omission_for_each_provider_type(self):
+        # 1. Chainlink safely omits market_id and pool_address
+        cl_obs = ChainlinkRpcAdapter.fetch(
+            VALID_QUOTE_ADDR,
+            VALID_EVM_CHAIN,
+            as_of_utc=self.as_of_utc,
+            transport=self.mock_cl_transport,
+        )
+        self.assertIsNone(cl_obs.market_id)
+        self.assertIsNone(cl_obs.pool_address)
+        self.assertTrue(_verify_provenance_token(cl_obs))
+        canonical = json.loads(cl_obs.canonical_bytes().decode("utf-8"))
+        self.assertEqual(canonical["market_id"], "")
+        self.assertEqual(canonical["pool_address"], "")
+
+        # 2. DefiLlama safely omits rpc_method, market_id, and pool_address
+        dl_obs = AcquiredProviderObservation._create(
+            provider="defillama",
+            chain="ethereum",
+            chain_id="ethereum",
+            quote_asset=VALID_QUOTE_ADDR,
+            reference_asset="USD",
+            price_usd=1.0,
+            retrieval_time_utc=self.as_of_utc,
+            request_url="https://coins.llama.fi/prices/current/ethereum:0x...",
+            http_status=200,
+            raw_payload='{"coins":{}}',
+            response_sha256=hashlib.sha256(b'{"coins":{}}').hexdigest(),
+            observation={"price": 1.0, "token": VALID_QUOTE_ADDR, "chain": "ethereum", "timestamp": self.as_of_utc},
+            feed_id=f"ethereum:{VALID_QUOTE_ADDR}",
+            valuation_policy="DEX_AGGREGATOR_VERIFIED",
+            transport_type="MOCKED_TRANSPORT",
+            acquisition_method="DEFILLAMA_PRICES_HTTP",
+            observation_timestamp=self.as_of_utc,
+        )
+        self.assertIsNone(dl_obs.rpc_method)
+        self.assertIsNone(dl_obs.market_id)
+        self.assertIsNone(dl_obs.pool_address)
+        self.assertTrue(_verify_provenance_token(dl_obs))
+        dl_canon = json.loads(dl_obs.canonical_bytes().decode("utf-8"))
+        self.assertEqual(dl_canon["rpc_method"], "")
+        self.assertEqual(dl_canon["market_id"], "")
+        self.assertEqual(dl_canon["pool_address"], "")
 
 
 class TestLiveProviderIntegrations(unittest.TestCase):

@@ -1049,8 +1049,8 @@ def _canonical_observation_payload(
     pool_address: str | None = None,
 ) -> bytes:
     # 1. Exact finite numeric price representation without rounding
-    if price_usd is None or isinstance(price_usd, bool):
-        raise ValueError("price_usd must be a non-null numeric value")
+    if price_usd is None or isinstance(price_usd, bool) or not isinstance(price_usd, (int, float)):
+        raise ValueError(f"price_usd must be a non-null numeric float or int, got {price_usd!r}")
     val_price = float(price_usd)
     if not math.isfinite(val_price) or val_price <= 0.0:
         raise ValueError(f"price_usd must be positive and finite, got {price_usd!r}")
@@ -1062,31 +1062,31 @@ def _canonical_observation_payload(
         raise ValueError(f"http_status must be in the range [100, 599], got {http_status!r}")
     val_http_status = int(http_status)
 
-    # 3. Explicit None handling for required fields
-    if acquisition_method is None:
-        raise ValueError("acquisition_method must not be None")
-    if chain is None:
-        raise ValueError("chain must not be None")
-    if chain_id is None:
-        raise ValueError("chain_id must not be None")
-    if feed_or_pool_id is None:
-        raise ValueError("feed_or_pool_id must not be None")
-    if observation_timestamp is None:
-        raise ValueError("observation_timestamp must not be None")
-    if provider is None:
-        raise ValueError("provider must not be None")
-    if provider_identifier is None:
-        raise ValueError("provider_identifier must not be None")
-    if quote_asset is None:
-        raise ValueError("quote_asset must not be None")
-    if reference_asset is None:
-        raise ValueError("reference_asset must not be None")
-    if retrieval_timestamp_utc is None:
-        raise ValueError("retrieval_timestamp_utc must not be None")
-    if transport_type is None:
-        raise ValueError("transport_type must not be None")
-    if valuation_policy is None:
-        raise ValueError("valuation_policy must not be None")
+    # 3. Explicit None and empty handling for required fields
+    if acquisition_method is None or not str(acquisition_method).strip():
+        raise ValueError("acquisition_method must not be None or empty")
+    if chain is None or not str(chain).strip():
+        raise ValueError("chain must not be None or empty")
+    if chain_id is None or not str(chain_id).strip():
+        raise ValueError("chain_id must not be None or empty")
+    if feed_or_pool_id is None or not str(feed_or_pool_id).strip():
+        raise ValueError("feed_or_pool_id must not be None or empty")
+    if observation_timestamp is None or not str(observation_timestamp).strip():
+        raise ValueError("observation_timestamp must not be None or empty")
+    if provider is None or not str(provider).strip():
+        raise ValueError("provider must not be None or empty")
+    if provider_identifier is None or not str(provider_identifier).strip():
+        raise ValueError("provider_identifier must not be None or empty")
+    if quote_asset is None or not str(quote_asset).strip():
+        raise ValueError("quote_asset must not be None or empty")
+    if reference_asset is None or not str(reference_asset).strip():
+        raise ValueError("reference_asset must not be None or empty")
+    if retrieval_timestamp_utc is None or not str(retrieval_timestamp_utc).strip():
+        raise ValueError("retrieval_timestamp_utc must not be None or empty")
+    if transport_type is None or not str(transport_type).strip():
+        raise ValueError("transport_type must not be None or empty")
+    if valuation_policy is None or not str(valuation_policy).strip():
+        raise ValueError("valuation_policy must not be None or empty")
 
     # 4. Deterministic observation data handling
     if observation is None:
@@ -1170,7 +1170,7 @@ def _verify_provenance_token(obs: Any) -> bool:
         return False
     if obs.http_status < 100 or obs.http_status > 599:
         return False
-    if obs.price_usd is None or isinstance(obs.price_usd, bool):
+    if obs.price_usd is None or isinstance(obs.price_usd, bool) or not isinstance(obs.price_usd, (int, float)):
         return False
     try:
         val_price = float(obs.price_usd)
@@ -2152,7 +2152,7 @@ def validate_quote_usd_conversion(
             }
         if actual_obs.raw_payload:
             calc_sha = hashlib.sha256(actual_obs.raw_payload.encode("utf-8")).hexdigest()
-            if actual_obs.response_sha256.lower() != calc_sha.lower():
+            if str(actual_obs.response_sha256 or "").lower() != calc_sha.lower():
                 return False, "PAYLOAD_HASH_MISMATCH", None, {
                     "reason": f"observation raw_payload hash ({calc_sha}) does not match response_sha256 ({actual_obs.response_sha256})"
                 }
@@ -2186,7 +2186,7 @@ def validate_quote_usd_conversion(
             return False, "OBSERVATION_MUTATION_DETECTED", None, {
                 "reason": "conversion dict raw_payload does not match authenticated observation"
             }
-        if "response_sha256" in conversion and str(conversion["response_sha256"]).lower() != actual_obs.response_sha256.lower():
+        if "response_sha256" in conversion and str(conversion["response_sha256"]).lower() != str(actual_obs.response_sha256 or "").lower():
             return False, "OBSERVATION_MUTATION_DETECTED", None, {
                 "reason": "conversion dict response_sha256 does not match authenticated observation"
             }
@@ -3032,7 +3032,7 @@ def validate_quote_usd_conversion(
         # Check raw payload sha256
         if actual_obs.raw_payload:
             calc_sha = hashlib.sha256(actual_obs.raw_payload.encode("utf-8")).hexdigest()
-            if actual_obs.response_sha256.lower() != calc_sha.lower():
+            if str(actual_obs.response_sha256 or "").lower() != calc_sha.lower():
                 return False, "PAYLOAD_HASH_MISMATCH", None, {
                     "reason": f"observation raw_payload hash ({calc_sha}) does not match response_sha256 ({actual_obs.response_sha256})"
                 }
@@ -3065,7 +3065,7 @@ def validate_quote_usd_conversion(
                 return False, "OBSERVATION_MUTATION_DETECTED", None, {
                     "reason": "conversion dict observation payload does not match authenticated observation"
                 }
-        if isinstance(conversion, dict) and "response_sha256" in conversion and str(conversion["response_sha256"]).lower() != actual_obs.response_sha256.lower():
+        if isinstance(conversion, dict) and "response_sha256" in conversion and str(conversion["response_sha256"]).lower() != str(actual_obs.response_sha256 or "").lower():
             return False, "OBSERVATION_MUTATION_DETECTED", None, {
                 "reason": "conversion dict response_sha256 does not match authenticated observation"
             }
