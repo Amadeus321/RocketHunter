@@ -223,13 +223,15 @@ def parse_and_validate_url(url_val: Any) -> tuple[bool, str | None, str]:
     if parsed.username is not None or parsed.password is not None or "@" in (parsed.netloc or ""):
         return False, None, "CREDENTIALS_DISALLOWED"
 
-    # Check for invalid port
-    try:
-        port = parsed.port
-        if port is not None and not (1 <= port <= 65535):
+    # Check for invalid or empty port
+    netloc = parsed.netloc or ""
+    if ":" in netloc:
+        try:
+            port = parsed.port
+            if port is None or not (1 <= port <= 65535):
+                return False, None, "INVALID_PORT"
+        except ValueError:
             return False, None, "INVALID_PORT"
-    except ValueError:
-        return False, None, "INVALID_PORT"
 
     # Extract parsed.hostname (in lowercase)
     hostname = parsed.hostname

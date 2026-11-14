@@ -3306,3 +3306,68 @@ class TestChronologicalBacktest:
         res2 = evaluator._resolve_outcome(item2, lookup=None)
         assert res2["is_evaluated"] is False
         assert res2["outcome_classification"] == "UNAPPROVED_SOURCE_DOMAIN"
+
+    def test_empty_port_request_url_rejected_and_no_port_accepted(self):
+        """Regression 104: Explicitly supplied empty port (e.g. host:/path) is rejected as INVALID_RESPONSE_REQUEST_URL, while valid URL without explicit port remains accepted."""
+        evaluator = ChronologicalBacktestEvaluator([])
+        t = dt.datetime(2026, 11, 1, 12, 0, tzinfo=dt.timezone.utc)
+
+        # 1. Empty port URL must be rejected
+        trace_empty_port = make_valid_trace(
+            "dex:solana:TokenX:PoolA",
+            t,
+            duration_hours=24.0,
+            mfe_pct=45.0,
+            touch_hours=2.0,
+            response_request_url="https://api.geckoterminal.com:/api/v2/networks/solana/pools/PoolA/ohlcv/hour",
+        )
+        item_empty_port = {
+            "record_id": "rec_empty_port_rejected",
+            "market_key": "dex:solana:TokenX:PoolA",
+            "timestamp": t,
+            "timestamp_utc": "2026-11-01T12:00:00Z",
+            "detection_price": 1.0,
+            "raw_record": {
+                "chain": "solana",
+                "contract_address": "TokenX",
+                "pool_address": "PoolA",
+                "outcome_classification": "TARGET_REACHED",
+                "mfe_pct": 45.0,
+                "hours_to_target": 2.0,
+                "candle_trace": trace_empty_port,
+            },
+        }
+        res_empty = evaluator._resolve_outcome(item_empty_port, lookup=None)
+        assert res_empty["is_evaluated"] is False
+        assert res_empty["outcome_classification"] == "INVALID_RESPONSE_REQUEST_URL"
+        assert "INVALID_PORT" in res_empty["resolution_reason"]
+
+        # 2. Valid URL without explicit port remains accepted
+        trace_no_port = make_valid_trace(
+            "dex:solana:TokenX:PoolA",
+            t,
+            duration_hours=24.0,
+            mfe_pct=45.0,
+            touch_hours=2.0,
+            response_request_url="https://api.geckoterminal.com/api/v2/networks/solana/pools/PoolA/ohlcv/hour",
+        )
+        item_no_port = {
+            "record_id": "rec_no_port_accepted",
+            "market_key": "dex:solana:TokenX:PoolA",
+            "timestamp": t,
+            "timestamp_utc": "2026-11-01T12:00:00Z",
+            "detection_price": 1.0,
+            "raw_record": {
+                "chain": "solana",
+                "contract_address": "TokenX",
+                "pool_address": "PoolA",
+                "outcome_classification": "TARGET_REACHED",
+                "mfe_pct": 45.0,
+                "hours_to_target": 2.0,
+                "candle_trace": trace_no_port,
+            },
+        }
+        res_no_port = evaluator._resolve_outcome(item_no_port, lookup=None)
+        assert res_no_port["is_evaluated"] is True
+        assert res_no_port["target_reached"] is True
+        assert res_no_port["evidence_audit"]["request_url"] == "https://api.geckoterminal.com/api/v2/networks/solana/pools/PoolA/ohlcv/hour"
