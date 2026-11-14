@@ -5501,6 +5501,150 @@ class ProductionGateHardeningTests(ProvenanceIntegrityAdversarialTests):
         self.assertEqual(dl_canon["market_id"], "")
         self.assertEqual(dl_canon["pool_address"], "")
 
+    # 24. cryptographic_signature_verified strict boolean validation
+    def test_24_cryptographic_signature_verified_strict_bool_validation(self):
+        # 1. Valid True observation verifies correctly
+        cl_obs_true = ChainlinkRpcAdapter.fetch(
+            VALID_QUOTE_ADDR,
+            VALID_EVM_CHAIN,
+            as_of_utc=self.as_of_utc,
+            transport=self.mock_cl_transport,
+        )
+        cl_obs_true.cryptographic_signature_verified = True
+        cl_obs_true._auth_token = _generate_provenance_token(cl_obs_true.canonical_bytes())
+        self.assertTrue(_verify_provenance_token(cl_obs_true))
+        ok_t, _, _, _ = validate_quote_usd_conversion(cl_obs_true, as_of_utc=self.as_of_utc)
+        self.assertTrue(ok_t)
+
+        # 2. Valid False observation verifies correctly
+        cl_obs_false = ChainlinkRpcAdapter.fetch(
+            VALID_QUOTE_ADDR,
+            VALID_EVM_CHAIN,
+            as_of_utc=self.as_of_utc,
+            transport=self.mock_cl_transport,
+        )
+        self.assertFalse(cl_obs_false.cryptographic_signature_verified)
+        self.assertTrue(_verify_provenance_token(cl_obs_false))
+        ok_f, _, _, _ = validate_quote_usd_conversion(cl_obs_false, as_of_utc=self.as_of_utc)
+        self.assertTrue(ok_f)
+
+        # 3. True -> "false" cannot preserve the original HMAC
+        obs_swap = copy.deepcopy(cl_obs_true)
+        obs_swap.cryptographic_signature_verified = "false"
+        self.assertFalse(_verify_provenance_token(obs_swap))
+        ok_s, _, _, _ = validate_quote_usd_conversion(obs_swap, as_of_utc=self.as_of_utc)
+        self.assertFalse(ok_s)
+
+        # 4. True -> 1 is rejected
+        obs_one = copy.deepcopy(cl_obs_true)
+        obs_one.cryptographic_signature_verified = 1
+        self.assertFalse(_verify_provenance_token(obs_one))
+        ok_one, _, _, _ = validate_quote_usd_conversion(obs_one, as_of_utc=self.as_of_utc)
+        self.assertFalse(ok_one)
+
+        # 5. False -> None is rejected
+        obs_none = copy.deepcopy(cl_obs_false)
+        obs_none.cryptographic_signature_verified = None
+        self.assertFalse(_verify_provenance_token(obs_none))
+        ok_none, _, _, _ = validate_quote_usd_conversion(obs_none, as_of_utc=self.as_of_utc)
+        self.assertFalse(ok_none)
+
+        # 6. Reject invalid types in _canonical_observation_payload
+        for invalid_val in (None, 1, 0, "true", "false", 1.0, 0.0, [True], {"verified": True}):
+            with self.subTest(invalid_bool=invalid_val):
+                with self.assertRaises(ValueError):
+                    _canonical_observation_payload(
+                        provider="chainlink",
+                        provider_identifier="0x8fa59a53f040d12d26f03bc9920373707c3c4004",
+                        chain="ethereum",
+                        chain_id=1,
+                        quote_asset="0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48",
+                        feed_or_pool_id="0x8fa59a53f040d12d26f03bc9920373707c3c4004",
+                        reference_asset="USD",
+                        valuation_policy="STABLECOIN_ORACLE_VERIFIED",
+                        price_usd=1.0,
+                        observation={},
+                        observation_timestamp="2026-11-13T12:00:00Z",
+                        retrieval_timestamp_utc="2026-11-13T12:00:00Z",
+                        http_status=200,
+                        rpc_method="eth_call",
+                        raw_payload="{}",
+                        response_sha256="",
+                        transport_type="MOCKED_TRANSPORT",
+                        acquisition_method="CHAINLINK_RPC_LATEST_ROUND_DATA",
+                        cryptographic_signature_verified=invalid_val,
+                    )
+
+    # 25. Audit canonical equivalence and optional fields
+    def test_25_audit_canonical_equivalence_and_optional_fields(self):
+        # Base valid kwargs for _canonical_observation_payload
+        base_kwargs = {
+            "provider": "chainlink",
+            "provider_identifier": "0x8fa59a53f040d12d26f03bc9920373707c3c4004",
+            "chain": "ethereum",
+            "chain_id": 1,
+            "quote_asset": "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48",
+            "feed_or_pool_id": "0x8fa59a53f040d12d26f03bc9920373707c3c4004",
+            "reference_asset": "USD",
+            "valuation_policy": "STABLECOIN_ORACLE_VERIFIED",
+            "price_usd": 1.0,
+            "observation_timestamp": "2026-11-13T12:00:00Z",
+            "retrieval_timestamp_utc": "2026-11-13T12:00:00Z",
+            "http_status": 200,
+            "rpc_method": "eth_call",
+            "raw_payload": "{}",
+            "response_sha256": "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+            "transport_type": "MOCKED_TRANSPORT",
+            "acquisition_method": "CHAINLINK_RPC_LATEST_ROUND_DATA",
+            "request_url": "https://ethereum-rpc.publicnode.com",
+            "feed_id": "0x8fa59a53f040d12d26f03bc9920373707c3c4004",
+            "cryptographic_signature_verified": False,
+        }
+
+        # Case 1: observation=None versus {} (INTENTIONALLY EQUIVALENT)
+        b_none = _canonical_observation_payload(observation=None, **base_kwargs)
+        b_dict = _canonical_observation_payload(observation={}, **base_kwargs)
+        self.assertEqual(b_none, b_dict)
+        self.assertEqual(_generate_provenance_token(b_none), _generate_provenance_token(b_dict))
+
+        # Case 2: cryptographic_signature_verified=None versus False (REJECTED, NOT EQUIVALENT)
+        with self.assertRaises(ValueError):
+            _canonical_observation_payload(observation={}, **{**base_kwargs, "cryptographic_signature_verified": None})
+        b_false = _canonical_observation_payload(observation={}, **{**base_kwargs, "cryptographic_signature_verified": False})
+        self.assertIsInstance(b_false, bytes)
+
+        # Case 3: Optional string fields None versus "" (INTENTIONALLY EQUIVALENT)
+        for opt_str_field in ("feed_id", "market_id", "pool_address", "request_url", "rpc_method", "raw_payload", "response_sha256"):
+            with self.subTest(opt_field=opt_str_field):
+                b_opt_none = _canonical_observation_payload(observation={}, **{**base_kwargs, opt_str_field: None})
+                b_opt_empty = _canonical_observation_payload(observation={}, **{**base_kwargs, opt_str_field: ""})
+                self.assertEqual(b_opt_none, b_opt_empty)
+                self.assertEqual(_generate_provenance_token(b_opt_none), _generate_provenance_token(b_opt_empty))
+
+        # Case 4: Numeric values with equivalent IEEE-754 representations (INTENTIONALLY EQUIVALENT)
+        b_int_price = _canonical_observation_payload(observation={}, **{**base_kwargs, "price_usd": 1})
+        b_flt_price = _canonical_observation_payload(observation={}, **{**base_kwargs, "price_usd": 1.0})
+        self.assertEqual(b_int_price, b_flt_price)
+        b_sci = _canonical_observation_payload(observation={}, **{**base_kwargs, "price_usd": 1e-4})
+        b_dec = _canonical_observation_payload(observation={}, **{**base_kwargs, "price_usd": 0.0001})
+        self.assertEqual(b_sci, b_dec)
+
+        # Non-equivalent floats produce different canonical bytes (MUTATION DETECTED)
+        b_diff = _canonical_observation_payload(observation={}, **{**base_kwargs, "price_usd": 1.000000001})
+        self.assertNotEqual(b_flt_price, b_diff)
+        self.assertNotEqual(_generate_provenance_token(b_flt_price), _generate_provenance_token(b_diff))
+
+        # Case 5: chain_id integer versus equivalent string (INTENTIONALLY EQUIVALENT)
+        b_cid_int = _canonical_observation_payload(observation={}, **{**base_kwargs, "chain_id": 1})
+        b_cid_str = _canonical_observation_payload(observation={}, **{**base_kwargs, "chain_id": "1"})
+        self.assertEqual(b_cid_int, b_cid_str)
+        self.assertEqual(_generate_provenance_token(b_cid_int), _generate_provenance_token(b_cid_str))
+
+        # Non-equivalent chain IDs produce different canonical bytes (MUTATION DETECTED)
+        b_cid_diff = _canonical_observation_payload(observation={}, **{**base_kwargs, "chain_id": 42161})
+        self.assertNotEqual(b_cid_int, b_cid_diff)
+        self.assertNotEqual(_generate_provenance_token(b_cid_int), _generate_provenance_token(b_cid_diff))
+
 
 class TestLiveProviderIntegrations(unittest.TestCase):
     """Integration tests running against actual live public provider endpoints when internet is available."""

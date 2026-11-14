@@ -1062,6 +1062,12 @@ def _canonical_observation_payload(
         raise ValueError(f"http_status must be in the range [100, 599], got {http_status!r}")
     val_http_status = int(http_status)
 
+    # 3. Strict boolean validation for cryptographic_signature_verified (reject None, int, str, float)
+    if cryptographic_signature_verified is None or not isinstance(cryptographic_signature_verified, bool):
+        raise ValueError(
+            f"cryptographic_signature_verified must be a strict Python bool (True or False), got {cryptographic_signature_verified!r}"
+        )
+
     # 3. Explicit None and empty handling for required fields
     if acquisition_method is None or not str(acquisition_method).strip():
         raise ValueError("acquisition_method must not be None or empty")
@@ -1100,7 +1106,7 @@ def _canonical_observation_payload(
         "acquisition_method": str(acquisition_method).strip(),
         "chain": str(chain).strip().lower(),
         "chain_id": str(chain_id).strip(),
-        "cryptographic_signature_verified": bool(cryptographic_signature_verified) if cryptographic_signature_verified is not None else False,
+        "cryptographic_signature_verified": cryptographic_signature_verified,
         "feed_id": str(feed_id).strip().lower() if feed_id is not None else "",
         "feed_or_pool_id": str(feed_or_pool_id).strip().lower(),
         "http_status": val_http_status,
@@ -1169,6 +1175,8 @@ def _verify_provenance_token(obs: Any) -> bool:
     if obs.http_status is None or isinstance(obs.http_status, bool) or not isinstance(obs.http_status, int):
         return False
     if obs.http_status < 100 or obs.http_status > 599:
+        return False
+    if not isinstance(getattr(obs, "cryptographic_signature_verified", None), bool):
         return False
     if obs.price_usd is None or isinstance(obs.price_usd, bool) or not isinstance(obs.price_usd, (int, float)):
         return False
@@ -1250,7 +1258,7 @@ class AcquiredProviderObservation:
         self.transport_type = str(transport_type).strip() if transport_type is not None else None
         self.acquisition_method = str(acquisition_method).strip() if acquisition_method is not None else None
         self.observation_timestamp = str(observation_timestamp or retrieval_time_utc).strip() if (observation_timestamp or retrieval_time_utc) is not None else None
-        self.cryptographic_signature_verified = bool(cryptographic_signature_verified) if cryptographic_signature_verified is not None else False
+        self.cryptographic_signature_verified = cryptographic_signature_verified
 
         # Reject caller-created observation objects that bypass genuine adapter factory
         if _internal_seal is not _ADAPTER_FACTORY_SECRET:
