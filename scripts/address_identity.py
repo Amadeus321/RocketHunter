@@ -75,9 +75,15 @@ def build_canonical_cex_identity(exchange_or_venue: Any, market_type: Any, tradi
 def validate_and_build_identity(record: dict[str, Any]) -> dict[str, Any]:
     """Validate market identity completeness and return canonical identity or rejection diagnostic.
 
-    Enforces mandatory pool address for all DEX observations, distinguishes CEX from DEX
-    using structural and explicit discriminators, and flags ambiguous or conflicting representations.
-    A DEX record missing a pool address is never converted into a CEX market.
+    Enforces:
+    - Independent parsing and validation of every supplied identity representation
+      ('identity', 'market_key', 'exact_identity').
+    - Strict rejection of legacy pipe-separated identity strings (LEGACY_IDENTITY_FORMAT).
+    - Detection of conflicts between multiple supplied canonical strings (CONFLICTING_CANONICAL_STRINGS).
+    - Cross-validation between top-level fields, normalized_record fields, and supplied canonical strings
+      (CONFLICTING_CHAIN_IDENTITY, CONFLICTING_TOKEN_IDENTITY, CONFLICTING_POOL_IDENTITY).
+    - Mandatory pool address for all DEX observations; a missing pool is never converted to CEX.
+    - Full EVM hex case-normalization (0xabc) and case-preservation for non-EVM chains (Solana mints/pools).
     """
     if not isinstance(record, dict):
         return {
@@ -87,48 +93,167 @@ def validate_and_build_identity(record: dict[str, Any]) -> dict[str, Any]:
             "rejection_reason": "NOT_A_DICTIONARY",
         }
 
+    # 1. Collect all supplied identity strings
+    supplied_raw: dict[str, str] = {}
+    for key in ("identity", "market_key", "exact_identity"):
+        val = record.get(key)
+        if val is not None and str(val).strip():
+            supplied_raw[key] = str(val).strip()
+
+    # 2. Reject legacy pipe-separated identities immediately
+    for key, raw_str in supplied_raw.items():
+        if "|" in raw_str or raw_str.lower().startswith("dex|") or raw_str.lower().startswith("cex|"):
+            return {
+                "is_valid": False,
+                "market_type": "legacy",
+                "canonical_identity": None,
+                "rejection_reason": "LEGACY_IDENTITY_FORMAT",
+                "field": key,
+                "value": raw_str,
+            }
+
+    # 3. Independently parse and normalize each supplied canonical identity string
+    parsed_supplied: dict[str, dict[str, Any]] = {}
+    for key, raw_str in supplied_raw.items():
+        if raw_str.lower().startswith("dex:"):
+            parts = raw_str.split(":")
+            if len(parts) not in (3, 4):
+                return {
+                    "is_valid": False,
+                    "market_type": "dex",
+                    "canonical_identity": None,
+                    "rejection_reason": "INVALID_CANONICAL_IDENTITY_FORMAT",
+                    "field": key,
+                }
+            norm_ch = normalize_chain(parts[1])
+            if len(parts) == 4:
+                norm_tok = address_key(norm_ch, parts[2])
+                norm_pl = address_key(norm_ch, parts[3])
+                canon_str = f"dex:{norm_ch}:{norm_tok}:{norm_pl}"
+                parsed_supplied[key] = {
+                    "market_type": "dex",
+                    "canonical_identity": canon_str,
+                    "chain": norm_ch,
+                    "token": norm_tok,
+                    "pool": norm_pl,
+                    "is_full": True,
+                }
+            else:
+                parsed_supplied[key] = {
+                    "market_type": "dex",
+                    "canonical_identity": None,
+                    "chain": norm_ch,
+                    "token": None,
+                    "pool": None,
+                    "is_full": False,
+                }
+        elif raw_str.lower().startswith("cex:"):
+            parts = raw_str.split(":")
+            if len(parts) != 4:
+                return {
+                    "is_valid": False,
+                    "market_type": "cex",
+                    "canonical_identity": None,
+                    "rejection_reason": "INVALID_CANONICAL_IDENTITY_FORMAT",
+                    "field": key,
+                }
+            ex_key = parts[1].strip().lower()
+            mtype_key = parts[2].strip().lower()
+            pair_key = parts[3].strip().upper().replace("/", "-")
+            canon_str = f"cex:{ex_key}:{mtype_key}:{pair_key}"
+            parsed_supplied[key] = {
+                "market_type": "cex",
+                "canonical_identity": canon_str,
+                "exchange": ex_key,
+                "market_sub_type": mtype_key,
+                "pair": pair_key,
+                "is_full": True,
+            }
+        else:
+            return {
+                "is_valid": False,
+                "market_type": "unknown",
+                "canonical_identity": None,
+                "rejection_reason": "INVALID_CANONICAL_IDENTITY_FORMAT",
+                "field": key,
+            }
+
+    # 4. Check for conflicts between multiple supplied canonical strings
+    if len(parsed_supplied) > 1:
+        chains = {info["chain"] for info in parsed_supplied.values() if info.get("chain")}
+        if len(chains) > 1:
+            return {
+                "is_valid": False,
+                "market_type": "ambiguous",
+                "canonical_identity": None,
+                "rejection_reason": "CONFLICTING_CANONICAL_STRINGS",
+                "supplied": {k: v.get("canonical_identity") or v.get("chain") for k, v in parsed_supplied.items()},
+            }
+        tokens = {info["token"] for info in parsed_supplied.values() if info.get("token")}
+        if len(tokens) > 1:
+            return {
+                "is_valid": False,
+                "market_type": "ambiguous",
+                "canonical_identity": None,
+                "rejection_reason": "CONFLICTING_CANONICAL_STRINGS",
+                "supplied": {k: v.get("canonical_identity") or v.get("token") for k, v in parsed_supplied.items()},
+            }
+        pools = {info["pool"] for info in parsed_supplied.values() if info.get("pool")}
+        if len(pools) > 1:
+            return {
+                "is_valid": False,
+                "market_type": "ambiguous",
+                "canonical_identity": None,
+                "rejection_reason": "CONFLICTING_CANONICAL_STRINGS",
+                "supplied": {k: v.get("canonical_identity") or v.get("pool") for k, v in parsed_supplied.items()},
+            }
+        full_canons = {info["canonical_identity"] for info in parsed_supplied.values() if info.get("canonical_identity")}
+        if len(full_canons) > 1:
+            return {
+                "is_valid": False,
+                "market_type": "ambiguous",
+                "canonical_identity": None,
+                "rejection_reason": "CONFLICTING_CANONICAL_STRINGS",
+                "supplied": {k: v["canonical_identity"] for k, v in parsed_supplied.items()},
+            }
+
+    # 5. Extract structural fields from top-level and normalized_record
     market_type = str(record.get("market_type") or record.get("type") or "").strip().lower()
-    identity_str = str(record.get("identity") or record.get("market_key") or record.get("exact_identity") or "").strip()
     norm_rec = record.get("normalized_record") if isinstance(record.get("normalized_record"), dict) else {}
 
-    # Decompose canonical string if present
-    dex_parts = identity_str.split(":") if identity_str.lower().startswith("dex:") else []
-    cex_parts = identity_str.split(":") if identity_str.lower().startswith("cex:") else []
+    top_chain = record.get("chain")
+    norm_chain = norm_rec.get("chain")
+    top_token = record.get("contract_address") or record.get("token_mint") or record.get("address")
+    norm_token = norm_rec.get("token_contract")
+    top_pool = record.get("pool_address") or record.get("pair_address") or record.get("gecko_pool_id")
+    norm_pool = norm_rec.get("pool_address")
 
-    # Check structural DEX indicators
-    chain_val = record.get("chain") or norm_rec.get("chain") or (dex_parts[1].strip() if len(dex_parts) >= 2 else None)
-    token_val = (
-        record.get("contract_address") or record.get("token_mint") or record.get("address")
-        or norm_rec.get("token_contract") or (dex_parts[2].strip() if len(dex_parts) >= 3 else None)
-    )
-    pool_val = (
-        record.get("pool_address") or record.get("pair_address") or record.get("gecko_pool_id")
-        or norm_rec.get("pool_address") or (dex_parts[3].strip() if len(dex_parts) >= 4 else None)
-    )
+    venue_val = record.get("venue") or record.get("exchange")
+    venue_str = str(venue_val or "").strip().lower()
+    pair_val = record.get("venue_pair") or record.get("pair") or record.get("trading_pair")
+
+    supplied_is_dex = any(info["market_type"] == "dex" for info in parsed_supplied.values())
+    supplied_is_cex = any(info["market_type"] == "cex" for info in parsed_supplied.values())
 
     is_explicit_dex = (
         market_type in DEX_MARKET_TYPES
-        or bool(dex_parts)
-        or bool(chain_val)
-        or bool(token_val)
-        or bool(pool_val)
+        or supplied_is_dex
+        or bool(top_chain)
+        or bool(top_token)
+        or bool(top_pool)
+        or bool(norm_chain)
+        or bool(norm_token)
+        or bool(norm_pool)
     )
-
-    # Check structural CEX indicators
-    venue_val = record.get("venue") or record.get("exchange") or (cex_parts[1].strip() if len(cex_parts) >= 2 else None)
-    venue_str = str(venue_val or "").strip().lower()
-    pair_val = record.get("venue_pair") or record.get("pair") or record.get("trading_pair") or (cex_parts[3].strip() if len(cex_parts) >= 4 else None)
-    if not market_type and len(cex_parts) >= 3:
-        market_type = cex_parts[2].strip().lower()
 
     is_explicit_cex = (
         market_type in CEX_MARKET_TYPES
-        or bool(cex_parts)
+        or supplied_is_cex
         or (venue_str in KNOWN_CEX_VENUES and not is_explicit_dex)
     )
 
-    # Reject contradictory market type indicators
-    if is_explicit_dex and market_type in CEX_MARKET_TYPES:
+    # Contradictory market type indicators
+    if is_explicit_dex and (market_type in CEX_MARKET_TYPES or supplied_is_cex):
         return {
             "is_valid": False,
             "market_type": "ambiguous",
@@ -136,35 +261,90 @@ def validate_and_build_identity(record: dict[str, Any]) -> dict[str, Any]:
             "rejection_reason": "AMBIGUOUS_MARKET_TYPE",
         }
 
-    # 1. DEX Market Evaluation
+    # 6. DEX Evaluation with thorough cross-validation
     if is_explicit_dex:
-        if not chain_val or not str(chain_val).strip():
-            if identity_str.lower().startswith("dex:"):
-                parts = identity_str.split(":")
-                if len(parts) >= 2 and parts[1].strip():
-                    chain_val = parts[1].strip()
-            if not chain_val or not str(chain_val).strip():
-                return {
-                    "is_valid": False,
-                    "market_type": "dex",
-                    "canonical_identity": None,
-                    "rejection_reason": "MISSING_CHAIN",
-                }
-        norm_chain = normalize_chain(chain_val)
+        # Cross-validate chain
+        active_chain = top_chain or norm_chain
+        if top_chain and norm_chain and normalize_chain(top_chain) != normalize_chain(norm_chain):
+            return {
+                "is_valid": False,
+                "market_type": "dex",
+                "canonical_identity": None,
+                "rejection_reason": "CONFLICTING_CHAIN_IDENTITY",
+                "top_chain": str(top_chain),
+                "norm_chain": str(norm_chain),
+            }
 
-        token_top = record.get("contract_address") or record.get("token_mint") or record.get("address")
-        token_norm = norm_rec.get("token_contract")
-        if token_top and token_norm and not same_address(norm_chain, token_top, token_norm):
+        # Check against supplied canonical strings chain
+        if parsed_supplied:
+            for info in parsed_supplied.values():
+                supplied_chain = info.get("chain")
+                if supplied_chain:
+                    if top_chain and normalize_chain(top_chain) != supplied_chain:
+                        return {
+                            "is_valid": False,
+                            "market_type": "dex",
+                            "canonical_identity": None,
+                            "rejection_reason": "CONFLICTING_CHAIN_IDENTITY",
+                            "top_chain": str(top_chain),
+                            "supplied_chain": str(supplied_chain),
+                        }
+                    if norm_chain and normalize_chain(norm_chain) != supplied_chain:
+                        return {
+                            "is_valid": False,
+                            "market_type": "dex",
+                            "canonical_identity": None,
+                            "rejection_reason": "CONFLICTING_CHAIN_IDENTITY",
+                            "norm_chain": str(norm_chain),
+                            "supplied_chain": str(supplied_chain),
+                        }
+                    active_chain = active_chain or supplied_chain
+
+        if not active_chain or not str(active_chain).strip():
+            return {
+                "is_valid": False,
+                "market_type": "dex",
+                "canonical_identity": None,
+                "rejection_reason": "MISSING_CHAIN",
+            }
+        chain_norm = normalize_chain(active_chain)
+
+        # Cross-validate token
+        if top_token and norm_token and not same_address(chain_norm, top_token, norm_token):
             return {
                 "is_valid": False,
                 "market_type": "dex",
                 "canonical_identity": None,
                 "rejection_reason": "CONFLICTING_TOKEN_IDENTITY",
-                "token_top": str(token_top),
-                "token_norm": str(token_norm),
+                "top_token": str(top_token),
+                "norm_token": str(norm_token),
             }
-        token = token_top or token_norm or token_val
-        if not token or not str(token).strip():
+        active_token = top_token or norm_token
+        if parsed_supplied:
+            for info in parsed_supplied.values():
+                supplied_token = info.get("token")
+                if supplied_token:
+                    if top_token and not same_address(chain_norm, top_token, supplied_token):
+                        return {
+                            "is_valid": False,
+                            "market_type": "dex",
+                            "canonical_identity": None,
+                            "rejection_reason": "CONFLICTING_TOKEN_IDENTITY",
+                            "top_token": str(top_token),
+                            "supplied_token": str(supplied_token),
+                        }
+                    if norm_token and not same_address(chain_norm, norm_token, supplied_token):
+                        return {
+                            "is_valid": False,
+                            "market_type": "dex",
+                            "canonical_identity": None,
+                            "rejection_reason": "CONFLICTING_TOKEN_IDENTITY",
+                            "norm_token": str(norm_token),
+                            "supplied_token": str(supplied_token),
+                        }
+                    active_token = active_token or supplied_token
+
+        if not active_token or not str(active_token).strip():
             return {
                 "is_valid": False,
                 "market_type": "dex",
@@ -172,20 +352,43 @@ def validate_and_build_identity(record: dict[str, Any]) -> dict[str, Any]:
                 "rejection_reason": "MISSING_TOKEN",
             }
 
-        pool_top = record.get("pool_address") or record.get("pair_address") or record.get("gecko_pool_id")
-        pool_norm = norm_rec.get("pool_address")
-        if pool_top and pool_norm and not same_address(norm_chain, pool_top, pool_norm):
+        # Cross-validate pool
+        if top_pool and norm_pool and not same_address(chain_norm, top_pool, norm_pool):
             return {
                 "is_valid": False,
                 "market_type": "dex",
                 "canonical_identity": None,
                 "rejection_reason": "CONFLICTING_POOL_IDENTITY",
-                "pool_top": str(pool_top),
-                "pool_norm": str(pool_norm),
+                "top_pool": str(top_pool),
+                "norm_pool": str(norm_pool),
             }
-        pool = pool_top or pool_norm or pool_val
-        if not pool or not str(pool).strip():
-            # A missing DEX pool address MUST be rejected as MISSING_POOL (never CEX)
+        active_pool = top_pool or norm_pool
+        if parsed_supplied:
+            for info in parsed_supplied.values():
+                supplied_pool = info.get("pool")
+                if supplied_pool:
+                    if top_pool and not same_address(chain_norm, top_pool, supplied_pool):
+                        return {
+                            "is_valid": False,
+                            "market_type": "dex",
+                            "canonical_identity": None,
+                            "rejection_reason": "CONFLICTING_POOL_IDENTITY",
+                            "top_pool": str(top_pool),
+                            "supplied_pool": str(supplied_pool),
+                        }
+                    if norm_pool and not same_address(chain_norm, norm_pool, supplied_pool):
+                        return {
+                            "is_valid": False,
+                            "market_type": "dex",
+                            "canonical_identity": None,
+                            "rejection_reason": "CONFLICTING_POOL_IDENTITY",
+                            "norm_pool": str(norm_pool),
+                            "supplied_pool": str(supplied_pool),
+                        }
+                    active_pool = active_pool or supplied_pool
+
+        if not active_pool or not str(active_pool).strip():
+            # A missing pool address must NEVER be silently converted to CEX
             return {
                 "is_valid": False,
                 "market_type": "dex",
@@ -193,7 +396,7 @@ def validate_and_build_identity(record: dict[str, Any]) -> dict[str, Any]:
                 "rejection_reason": "MISSING_POOL",
             }
 
-        dex_id = build_canonical_dex_identity(norm_chain, token, pool)
+        dex_id = build_canonical_dex_identity(chain_norm, active_token, active_pool)
         if not dex_id:
             return {
                 "is_valid": False,
@@ -206,31 +409,55 @@ def validate_and_build_identity(record: dict[str, Any]) -> dict[str, Any]:
             "is_valid": True,
             "market_type": "dex",
             "canonical_identity": dex_id,
-            "chain": norm_chain,
-            "token": address_key(norm_chain, token),
-            "pool": address_key(norm_chain, pool),
+            "chain": chain_norm,
+            "token": address_key(chain_norm, active_token),
+            "pool": address_key(chain_norm, active_pool),
         }
 
-    # 2. CEX Market Evaluation
+    # 7. CEX Evaluation
     if is_explicit_cex:
-        if not venue_val or not str(venue_val).strip() or not pair_val or not str(pair_val).strip():
+        active_venue = venue_val
+        active_pair = pair_val
+        if parsed_supplied:
+            first_parsed = next(iter(parsed_supplied.values()))
+            if venue_val and str(venue_val).strip().lower() != first_parsed.get("exchange"):
+                return {
+                    "is_valid": False,
+                    "market_type": "cex",
+                    "canonical_identity": None,
+                    "rejection_reason": "CONFLICTING_CEX_FIELDS",
+                }
+            if pair_val and str(pair_val).strip().upper().replace("/", "-") != first_parsed.get("pair"):
+                return {
+                    "is_valid": False,
+                    "market_type": "cex",
+                    "canonical_identity": None,
+                    "rejection_reason": "CONFLICTING_CEX_FIELDS",
+                }
+            active_venue = active_venue or first_parsed.get("exchange")
+            active_pair = active_pair or first_parsed.get("pair")
+            if not market_type:
+                market_type = first_parsed.get("market_sub_type", "cex_spot")
+
+        if not active_venue or not str(active_venue).strip() or not active_pair or not str(active_pair).strip():
             return {
                 "is_valid": False,
                 "market_type": "cex",
                 "canonical_identity": None,
                 "rejection_reason": "MISSING_CEX_FIELDS",
             }
-        cex_id = build_canonical_cex_identity(venue_val, market_type or "cex_spot", pair_val)
+
+        cex_id = build_canonical_cex_identity(active_venue, market_type or "cex_spot", active_pair)
         return {
             "is_valid": True,
             "market_type": "cex",
             "canonical_identity": cex_id,
-            "exchange": str(venue_val).strip().lower(),
-            "pair": str(pair_val).strip().upper().replace("/", "-"),
+            "exchange": str(active_venue).strip().lower(),
+            "pair": str(active_pair).strip().upper().replace("/", "-"),
             "market_sub_type": market_type or "cex_spot",
         }
 
-    # 3. Ambiguous Market Type
+    # 8. Ambiguous Market Type
     return {
         "is_valid": False,
         "market_type": "ambiguous",
