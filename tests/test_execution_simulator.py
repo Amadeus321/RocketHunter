@@ -356,6 +356,14 @@ class AdversarialPhase2ExecutionTests(unittest.TestCase):
     def setUp(self):
         self.as_of_utc = "2026-11-13T12:00:00Z"
         self.now_dt = datetime(2026, 11, 13, 12, 0, 0, tzinfo=timezone.utc)
+        self.valid_quote_conversion = {
+            "price_usd": 1.0,
+            "chain": VALID_EVM_CHAIN,
+            "quote_asset": VALID_QUOTE_ADDR,
+            "timestamp_utc": "2026-11-13T12:00:00Z",
+            "source": "chainlink_oracle_usd",
+            "valuation_policy": "STABLECOIN_ORACLE_VERIFIED",
+        }
         self.valid_quote_source = {
             "chain": VALID_EVM_CHAIN,
             "pool_address": VALID_POOL_ADDR,
@@ -363,6 +371,7 @@ class AdversarialPhase2ExecutionTests(unittest.TestCase):
             "intended_trade_size_usd": 100.0,
             "quote_token_address": VALID_QUOTE_ADDR,
             "expected_quote_asset": VALID_QUOTE_ADDR,
+            "quote_usd_conversion": self.valid_quote_conversion,
             "liquidity_usd": 100_000.0,
             "final_price_timestamp_utc": "2026-11-13T12:00:00Z",
             "dex_execution_quotes": {
@@ -512,6 +521,7 @@ class AdversarialPhase2ExecutionTests(unittest.TestCase):
 
         # Case B: expected_quote_asset mismatch
         src_exp = copy.deepcopy(self.valid_quote_source)
+        src_exp["quote_usd_conversion"]["quote_asset"] = VALID_ALT_QUOTE
         res_exp = simulate_multi_size(
             src_exp, sizes_usd=[100.0], as_of_utc=self.as_of_utc,
             expected_token_address=VALID_TOKEN_ADDR,
@@ -886,6 +896,7 @@ class AdversarialPhase2ExecutionTests(unittest.TestCase):
             "intended_trade_size_usd": 100.0,
             "quote_token_address": VALID_QUOTE_ADDR,
             "expected_quote_asset": VALID_QUOTE_ADDR,
+            "quote_usd_conversion": self.valid_quote_conversion,
             "liquidity_usd": 100_000.0,
             "fee_bps": 30.0,
             "technical_tp_validation": {
@@ -978,6 +989,7 @@ class AdversarialPhase2ExecutionTests(unittest.TestCase):
             "intended_trade_size_usd": 100.0,
             "quote_token_address": VALID_QUOTE_ADDR,
             "expected_quote_asset": VALID_QUOTE_ADDR,
+            "quote_usd_conversion": self.valid_quote_conversion,
             "liquidity_usd": 100_000.0,
             "fee_bps": 30.0,
             "technical_tp_validation": {
@@ -1246,6 +1258,7 @@ class AdversarialPhase2ExecutionTests(unittest.TestCase):
             "market_type": "dex_pool",
             "expected_quote_asset": VALID_QUOTE_ADDR,
             "quote_token_address": VALID_QUOTE_ADDR,
+            "quote_usd_conversion": self.valid_quote_conversion,
             "final_price_usd": 5.0,
             "target_price": 7.0,  # +40.0% upside
             "target_price_source": "7D_SWING_RESISTANCE",
@@ -1473,6 +1486,7 @@ class AdversarialPhase2ExecutionTests(unittest.TestCase):
             "market_type": "dex_pool",
             "expected_quote_asset": VALID_QUOTE_ADDR,
             "quote_token_address": VALID_QUOTE_ADDR,
+            "quote_usd_conversion": self.valid_quote_conversion,
             "final_price_usd": 100.0,
             "target_price": 140.0,  # +40.0% upside
             "target_price_source": "7D_SWING_RESISTANCE",
@@ -1528,6 +1542,437 @@ class AdversarialPhase2ExecutionTests(unittest.TestCase):
             f"Expected quote asset failure in blockers: {cand_book_missing_quote['qualification_blockers']}"
         )
         self.assertEqual(cand_book_missing_quote["execution_simulation"]["status"], "MISSING_QUOTE_ASSET_EVIDENCE")
+
+    # 35. USD quote asset with verified conversion
+    def test_35_usd_quote_asset_with_verified_conversion(self):
+        conv = {
+            "price_usd": 1.0,
+            "chain": VALID_EVM_CHAIN,
+            "quote_asset": VALID_QUOTE_ADDR,
+            "timestamp_utc": self.as_of_utc,
+            "source": "chainlink_oracle_usd",
+            "valuation_policy": "STABLECOIN_ORACLE_VERIFIED",
+        }
+        # Test AMM with verified USD quote asset
+        amm_res = simulate_constant_product_amm(
+            reserve0=10_000.0,
+            reserve1=50_000.0,
+            buy_notional_usd=100.0,
+            fee_bps=30.0,
+            chain=VALID_EVM_CHAIN,
+            pool_address=VALID_POOL_ADDR,
+            token0=VALID_TOKEN_ADDR,
+            token1=VALID_QUOTE_ADDR,
+            timestamp_utc=self.as_of_utc,
+            expected_chain=VALID_EVM_CHAIN,
+            expected_pool=VALID_POOL_ADDR,
+            expected_token_address=VALID_TOKEN_ADDR,
+            expected_quote_asset=VALID_QUOTE_ADDR,
+            quote_usd_conversion=conv,
+            require_quote_conversion=True,
+        )
+        self.assertEqual(amm_res["status"], "FULL_ROUND_TRIP_AMM_LIQUIDITY_AVAILABLE")
+        self.assertEqual(amm_res["quote_usd_price"], 1.0)
+        self.assertEqual(amm_res["buy"]["filled_quote_usd"], 100.0)
+        self.assertEqual(amm_res["buy"]["filled_quote_tokens"], 100.0)
+
+    # 36. Non-USD quote asset (e.g. WETH @ $3000) with verified conversion
+    def test_36_non_usd_quote_asset_with_verified_conversion(self):
+        weth_conv = {
+            "price_usd": 3000.0,
+            "chain": VALID_EVM_CHAIN,
+            "quote_asset": VALID_ALT_QUOTE,
+            "timestamp_utc": self.as_of_utc,
+            "source": "chainlink_oracle_eth_usd",
+            "valuation_policy": "CRYPTO_ORACLE_VERIFIED",
+        }
+        # In this pool, quote reserve is 16.666667 WETH ($50k USD equiv)
+        weth_reserve = 50_000.0 / 3000.0
+        amm_res = simulate_constant_product_amm(
+            reserve0=10_000.0,
+            reserve1=weth_reserve,
+            buy_notional_usd=100.0,
+            fee_bps=30.0,
+            chain=VALID_EVM_CHAIN,
+            pool_address=VALID_POOL_ADDR,
+            token0=VALID_TOKEN_ADDR,
+            token1=VALID_ALT_QUOTE,
+            timestamp_utc=self.as_of_utc,
+            expected_chain=VALID_EVM_CHAIN,
+            expected_pool=VALID_POOL_ADDR,
+            expected_token_address=VALID_TOKEN_ADDR,
+            expected_quote_asset=VALID_ALT_QUOTE,
+            quote_usd_conversion=weth_conv,
+            require_quote_conversion=True,
+        )
+        self.assertEqual(amm_res["status"], "FULL_ROUND_TRIP_AMM_LIQUIDITY_AVAILABLE")
+        self.assertEqual(amm_res["quote_usd_price"], 3000.0)
+        self.assertEqual(amm_res["buy"]["filled_quote_usd"], 100.0)
+        self.assertAlmostEqual(amm_res["buy"]["filled_quote_tokens"], 100.0 / 3000.0, places=9)
+
+        # Also test order-book simulation with non-USD quote currency (WETH)
+        book = {
+            "chain": VALID_EVM_CHAIN,
+            "pool_address": VALID_POOL_ADDR,
+            "token_address": VALID_TOKEN_ADDR,
+            "quote_asset": VALID_ALT_QUOTE,
+            "denomination": "WETH",
+            "timestamp_utc": self.as_of_utc,
+            "bids": [[0.0016, 100.0]],   # bid in WETH per token (~$4.80)
+            "asks": [[0.0017, 100.0]],   # ask in WETH per token (~$5.10)
+        }
+        book_sim = simulate(
+            book,
+            buy_notional_usd=100.0,
+            fee_bps=30.0,
+            quote_usd_conversion=weth_conv,
+            require_quote_conversion=True,
+            require_quote_denomination=True,
+            expected_chain=VALID_EVM_CHAIN,
+            expected_quote_asset=VALID_ALT_QUOTE,
+            as_of_utc=self.as_of_utc,
+        )
+        self.assertEqual(book_sim["status"], "FULL_ROUND_TRIP_DEPTH_AVAILABLE")
+        self.assertEqual(book_sim["quote_usd_price"], 3000.0)
+        self.assertAlmostEqual(book_sim["buy"]["filled_quote_tokens"], 100.0 / 3000.0, places=9)
+        self.assertAlmostEqual(book_sim["buy"]["filled_quote_usd"], 100.0, places=9)
+
+    # 37. Missing conversion evidence fails closed
+    def test_37_missing_conversion_evidence_fails_closed(self):
+        # AMM without conversion when required
+        with self.assertRaisesRegex(ValueError, "MISSING_QUOTE_CONVERSION_EVIDENCE"):
+            simulate_constant_product_amm(
+                reserve0=10_000.0,
+                reserve1=50_000.0,
+                buy_notional_usd=100.0,
+                chain=VALID_EVM_CHAIN,
+                pool_address=VALID_POOL_ADDR,
+                token0=VALID_TOKEN_ADDR,
+                token1=VALID_QUOTE_ADDR,
+                timestamp_utc=self.as_of_utc,
+                expected_token_address=VALID_TOKEN_ADDR,
+                require_quote_conversion=True,
+            )
+
+        # Multi-size without conversion when required
+        src_no_conv = {
+            "chain": VALID_EVM_CHAIN,
+            "pool_address": VALID_POOL_ADDR,
+            "contract_address": VALID_TOKEN_ADDR,
+            "amm_reserves": {
+                "chain": VALID_EVM_CHAIN,
+                "pool_address": VALID_POOL_ADDR,
+                "token0": VALID_TOKEN_ADDR,
+                "token1": VALID_QUOTE_ADDR,
+                "reserve0": 10_000.0,
+                "reserve1": 50_000.0,
+                "timestamp_utc": self.as_of_utc,
+            },
+        }
+        res = simulate_multi_size(
+            src_no_conv,
+            sizes_usd=[100.0],
+            as_of_utc=self.as_of_utc,
+            expected_token_address=VALID_TOKEN_ADDR,
+            expected_quote_asset=VALID_QUOTE_ADDR,
+            require_quote_conversion=True,
+        )
+        self.assertEqual(res["status"], "MISSING_QUOTE_CONVERSION_EVIDENCE")
+        self.assertFalse(res["size_evaluations"]["$100"]["route_available"])
+
+    # 38. Stale conversion evidence fails closed
+    def test_38_stale_and_future_dated_conversion_evidence_fails_closed(self):
+        stale_conv = {
+            "price_usd": 1.0,
+            "chain": VALID_EVM_CHAIN,
+            "quote_asset": VALID_QUOTE_ADDR,
+            "timestamp_utc": "2026-11-13T11:50:00Z",  # 10 minutes old (> 300s)
+            "source": "chainlink_oracle_usd",
+        }
+        with self.assertRaisesRegex(ValueError, "STALE_QUOTE_CONVERSION"):
+            simulate_constant_product_amm(
+                reserve0=10_000.0,
+                reserve1=50_000.0,
+                buy_notional_usd=100.0,
+                chain=VALID_EVM_CHAIN,
+                pool_address=VALID_POOL_ADDR,
+                token0=VALID_TOKEN_ADDR,
+                token1=VALID_QUOTE_ADDR,
+                timestamp_utc=self.as_of_utc,
+                expected_token_address=VALID_TOKEN_ADDR,
+                quote_usd_conversion=stale_conv,
+                as_of_utc=self.as_of_utc,
+            )
+
+        future_conv = {
+            "price_usd": 1.0,
+            "chain": VALID_EVM_CHAIN,
+            "quote_asset": VALID_QUOTE_ADDR,
+            "timestamp_utc": "2026-11-13T12:05:00Z",  # Future-dated
+            "source": "chainlink_oracle_usd",
+        }
+        with self.assertRaisesRegex(ValueError, "FUTURE_DATED_QUOTE_CONVERSION"):
+            simulate_constant_product_amm(
+                reserve0=10_000.0,
+                reserve1=50_000.0,
+                buy_notional_usd=100.0,
+                chain=VALID_EVM_CHAIN,
+                pool_address=VALID_POOL_ADDR,
+                token0=VALID_TOKEN_ADDR,
+                token1=VALID_QUOTE_ADDR,
+                timestamp_utc=self.as_of_utc,
+                expected_token_address=VALID_TOKEN_ADDR,
+                quote_usd_conversion=future_conv,
+                as_of_utc=self.as_of_utc,
+            )
+
+    # 39. Wrong asset or chain conversion fails closed
+    def test_39_wrong_asset_or_chain_conversion_fails_closed(self):
+        # Mismatched chain
+        wrong_chain_conv = {
+            "price_usd": 1.0,
+            "chain": "solana",  # Expected ethereum
+            "quote_asset": VALID_QUOTE_ADDR,
+            "timestamp_utc": self.as_of_utc,
+            "source": "pyth_oracle",
+        }
+        with self.assertRaisesRegex(ValueError, "QUOTE_CONVERSION_CHAIN_MISMATCH"):
+            simulate_constant_product_amm(
+                reserve0=10_000.0,
+                reserve1=50_000.0,
+                buy_notional_usd=100.0,
+                chain=VALID_EVM_CHAIN,
+                pool_address=VALID_POOL_ADDR,
+                token0=VALID_TOKEN_ADDR,
+                token1=VALID_QUOTE_ADDR,
+                timestamp_utc=self.as_of_utc,
+                expected_chain=VALID_EVM_CHAIN,
+                expected_token_address=VALID_TOKEN_ADDR,
+                expected_quote_asset=VALID_QUOTE_ADDR,
+                quote_usd_conversion=wrong_chain_conv,
+            )
+
+        # Mismatched quote asset
+        wrong_asset_conv = {
+            "price_usd": 3000.0,
+            "chain": VALID_EVM_CHAIN,
+            "quote_asset": VALID_ALT_QUOTE,  # Pool uses VALID_QUOTE_ADDR (USDC), but conversion is for WETH
+            "timestamp_utc": self.as_of_utc,
+            "source": "chainlink_oracle",
+        }
+        with self.assertRaisesRegex(ValueError, "QUOTE_CONVERSION_ASSET_MISMATCH"):
+            simulate_constant_product_amm(
+                reserve0=10_000.0,
+                reserve1=50_000.0,
+                buy_notional_usd=100.0,
+                chain=VALID_EVM_CHAIN,
+                pool_address=VALID_POOL_ADDR,
+                token0=VALID_TOKEN_ADDR,
+                token1=VALID_QUOTE_ADDR,
+                timestamp_utc=self.as_of_utc,
+                expected_chain=VALID_EVM_CHAIN,
+                expected_token_address=VALID_TOKEN_ADDR,
+                expected_quote_asset=VALID_QUOTE_ADDR,
+                quote_usd_conversion=wrong_asset_conv,
+            )
+
+        # Unverified valuation source
+        no_source_conv = {
+            "price_usd": 1.0,
+            "chain": VALID_EVM_CHAIN,
+            "quote_asset": VALID_QUOTE_ADDR,
+            "timestamp_utc": self.as_of_utc,
+            # No "source" or "valuation_policy"
+        }
+        with self.assertRaisesRegex(ValueError, "UNVERIFIED_VALUATION_SOURCE"):
+            simulate_constant_product_amm(
+                reserve0=10_000.0,
+                reserve1=50_000.0,
+                buy_notional_usd=100.0,
+                chain=VALID_EVM_CHAIN,
+                pool_address=VALID_POOL_ADDR,
+                token0=VALID_TOKEN_ADDR,
+                token1=VALID_QUOTE_ADDR,
+                timestamp_utc=self.as_of_utc,
+                expected_chain=VALID_EVM_CHAIN,
+                expected_token_address=VALID_TOKEN_ADDR,
+                expected_quote_asset=VALID_QUOTE_ADDR,
+                quote_usd_conversion=no_source_conv,
+            )
+
+    # 40. Order book missing or incorrect denomination fails
+    def test_40_order_book_missing_or_incorrect_denomination_fails(self):
+        book_missing_denom = {
+            "chain": VALID_EVM_CHAIN,
+            "pool_address": VALID_POOL_ADDR,
+            "token_address": VALID_TOKEN_ADDR,
+            # No quote_currency, denomination, quote_asset, or quote_token
+            "timestamp_utc": self.as_of_utc,
+            "bids": [[99.0, 10.0]],
+            "asks": [[101.0, 10.0]],
+        }
+        with self.assertRaisesRegex(ValueError, "MISSING_QUOTE_DENOMINATION"):
+            simulate(
+                book_missing_denom,
+                buy_notional_usd=100.0,
+                require_quote_denomination=True,
+            )
+
+        res = simulate_multi_size(
+            book_missing_denom,
+            sizes_usd=[100.0],
+            as_of_utc=self.as_of_utc,
+            expected_token_address=VALID_TOKEN_ADDR,
+            require_quote_denomination=True,
+        )
+        self.assertEqual(res["size_evaluations"]["$100"]["status"], "MISSING_QUOTE_DENOMINATION")
+        self.assertFalse(res["size_evaluations"]["$100"]["route_available"])
+
+    # 41. Equivalent economic results across USD and non-USD quote-token representations
+    def test_41_equivalent_economic_results_usd_vs_quote_token_units(self):
+        # Pool A: 10,000 candidate tokens, 50,000 USDC @ $1.00 USD
+        conv_usdc = {
+            "price_usd": 1.0,
+            "chain": VALID_EVM_CHAIN,
+            "quote_asset": VALID_QUOTE_ADDR,
+            "timestamp_utc": self.as_of_utc,
+            "source": "chainlink_oracle_usd",
+            "valuation_policy": "STABLECOIN_ORACLE_VERIFIED",
+        }
+        sim_usdc = simulate_constant_product_amm(
+            reserve0=10_000.0,
+            reserve1=50_000.0,
+            buy_notional_usd=100.0,
+            fee_bps=30.0,
+            chain=VALID_EVM_CHAIN,
+            pool_address=VALID_POOL_ADDR,
+            token0=VALID_TOKEN_ADDR,
+            token1=VALID_QUOTE_ADDR,
+            timestamp_utc=self.as_of_utc,
+            expected_token_address=VALID_TOKEN_ADDR,
+            expected_quote_asset=VALID_QUOTE_ADDR,
+            quote_usd_conversion=conv_usdc,
+            require_quote_conversion=True,
+        )
+
+        # Pool B: 10,000 candidate tokens, 16.666666666666668 WETH @ $3000.00 USD (exact economic equivalence: $50,000 USD)
+        conv_weth = {
+            "price_usd": 3000.0,
+            "chain": VALID_EVM_CHAIN,
+            "quote_asset": VALID_ALT_QUOTE,
+            "timestamp_utc": self.as_of_utc,
+            "source": "chainlink_oracle_eth_usd",
+            "valuation_policy": "CRYPTO_ORACLE_VERIFIED",
+        }
+        weth_reserve = 50_000.0 / 3000.0
+        sim_weth = simulate_constant_product_amm(
+            reserve0=10_000.0,
+            reserve1=weth_reserve,
+            buy_notional_usd=100.0,
+            fee_bps=30.0,
+            chain=VALID_EVM_CHAIN,
+            pool_address=VALID_POOL_ADDR,
+            token0=VALID_TOKEN_ADDR,
+            token1=VALID_ALT_QUOTE,
+            timestamp_utc=self.as_of_utc,
+            expected_token_address=VALID_TOKEN_ADDR,
+            expected_quote_asset=VALID_ALT_QUOTE,
+            quote_usd_conversion=conv_weth,
+            require_quote_conversion=True,
+        )
+
+        # Verifications of invariance:
+        # 1. Output token quantity must be identical
+        self.assertAlmostEqual(sim_usdc["buy"]["filled_quantity"], sim_weth["buy"]["filled_quantity"], places=9)
+        # 2. USD mid prices must match ($5.00/token)
+        self.assertAlmostEqual(sim_usdc["mid_price"], sim_weth["mid_price"], places=9)
+        self.assertAlmostEqual(sim_usdc["mid_price"], 5.0, places=9)
+        # 3. Buy VWAP in USD must match
+        self.assertAlmostEqual(sim_usdc["buy"]["vwap"], sim_weth["buy"]["vwap"], places=9)
+        # 4. Price impact in bps must match
+        self.assertAlmostEqual(sim_usdc["buy"]["price_impact_bps"], sim_weth["buy"]["price_impact_bps"], places=6)
+        self.assertAlmostEqual(sim_usdc["immediate_exit"]["price_impact_bps"], sim_weth["immediate_exit"]["price_impact_bps"], places=6)
+        # 5. Sell USD proceeds must match
+        self.assertAlmostEqual(sim_usdc["immediate_exit"]["filled_quote_usd"], sim_weth["immediate_exit"]["filled_quote_usd"], places=6)
+        # 6. Net PnL USD and return percentage must match
+        self.assertAlmostEqual(sim_usdc["round_trip_estimate"]["net_pnl_usd"], sim_weth["round_trip_estimate"]["net_pnl_usd"], places=6)
+        self.assertAlmostEqual(sim_usdc["round_trip_estimate"]["net_return_pct"], sim_weth["round_trip_estimate"]["net_return_pct"], places=6)
+
+    # 42. Production qualification gate rejects missing or invalid conversion
+    def test_42_production_gate_rejects_missing_or_invalid_conversion(self):
+        # Case A: Missing conversion
+        cand_no_conv = copy.deepcopy(self.valid_quote_source)
+        del cand_no_conv["quote_usd_conversion"]
+        cand_no_conv.update({
+            "market_type": "dex_pool",
+            "final_pool_address": VALID_POOL_ADDR,
+            "final_token_contract": VALID_TOKEN_ADDR,
+            "final_quote_chain": VALID_EVM_CHAIN,
+            "final_quote_token_orientation_verified": True,
+            "final_price_verified": True,
+            "final_price_usd": 100.0,
+            "target_price": 140.0,
+            "target_price_source": "7D_SWING_RESISTANCE",
+            "fee_bps": 30.0,
+            "technical_tp_validation": {
+                "status": "PASS",
+                "chain": VALID_EVM_CHAIN,
+                "pool_address": VALID_POOL_ADDR,
+                "token_address": VALID_TOKEN_ADDR,
+                "token_orientation_verified": True,
+                "target_price": 140.0,
+                "target_price_source": "7D_SWING_RESISTANCE",
+                "current_price": 100.0,
+                "atr_1h_pct": 10.0,
+                "maximum_tp_distance_pct": 40.0,
+                "candle_retrieved_utc": self.as_of_utc,
+            },
+            "trade_plan": {"single_take_profit": 140.0, "intended_trade_size_usd": 100.0, "quote_token_address": VALID_QUOTE_ADDR},
+            "dex_loss_guard_status": "PASS",
+            "dex_loss_guard_evidence": {
+                "status": "PASS",
+                "checks": {
+                    "exact_token_and_pool_identity": True,
+                    "launch_wallet_analysis": True,
+                    "lp_position_audit": True,
+                    "token_security_audit": True,
+                    "two_way_route_quotes": True,
+                },
+            },
+            "safety_verified": True,
+            "executable_route_verified": True,
+        })
+        qualified_no_conv = v425.qualify_final_actionable_candidates([cand_no_conv], self.now_dt)
+        self.assertEqual(len(qualified_no_conv), 0)
+        self.assertTrue(any("quote-asset USD conversion" in b for b in cand_no_conv["qualification_blockers"]))
+
+        # Case B: Stale conversion
+        cand_stale_conv = copy.deepcopy(cand_no_conv)
+        cand_stale_conv["quote_usd_conversion"] = {
+            "price_usd": 1.0,
+            "chain": VALID_EVM_CHAIN,
+            "quote_asset": VALID_QUOTE_ADDR,
+            "timestamp_utc": "2026-11-13T11:45:00Z",  # 15 minutes old
+            "source": "chainlink_oracle_usd",
+            "valuation_policy": "STABLECOIN_ORACLE_VERIFIED",
+        }
+        qualified_stale = v425.qualify_final_actionable_candidates([cand_stale_conv], self.now_dt)
+        self.assertEqual(len(qualified_stale), 0)
+        self.assertTrue(any("STALE_QUOTE_CONVERSION" in b for b in cand_stale_conv["qualification_blockers"]))
+
+        # Case C: Asset mismatch conversion
+        cand_mismatch_conv = copy.deepcopy(cand_no_conv)
+        cand_mismatch_conv["quote_usd_conversion"] = {
+            "price_usd": 3000.0,
+            "chain": VALID_EVM_CHAIN,
+            "quote_asset": VALID_ALT_QUOTE,  # Mismatched to VALID_QUOTE_ADDR
+            "timestamp_utc": self.as_of_utc,
+            "source": "chainlink_oracle_eth_usd",
+            "valuation_policy": "CRYPTO_ORACLE_VERIFIED",
+        }
+        qualified_mismatch = v425.qualify_final_actionable_candidates([cand_mismatch_conv], self.now_dt)
+        self.assertEqual(len(qualified_mismatch), 0)
+        self.assertTrue(any("QUOTE_CONVERSION_ASSET_MISMATCH" in b for b in cand_mismatch_conv["qualification_blockers"]))
 
 
 if __name__ == "__main__":

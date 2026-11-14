@@ -1896,6 +1896,18 @@ def qualify_final_actionable_candidates(candidates: list[dict[str, Any]], now: d
         else:
             expected_quote = raw_quote_asset
 
+        raw_quote_conversion = (
+            candidate.get("quote_usd_conversion") or
+            candidate.get("quote_conversion") or
+            plan.get("quote_usd_conversion") or
+            plan.get("quote_conversion") or
+            (candidate.get("order_book", {}).get("quote_usd_conversion") if isinstance(candidate.get("order_book"), dict) else None) or
+            (candidate.get("amm_reserves", {}).get("quote_usd_conversion") if isinstance(candidate.get("amm_reserves"), dict) else None) or
+            (candidate.get("dex_execution_quotes", {}).get("quote_usd_conversion") if isinstance(candidate.get("dex_execution_quotes"), dict) else None)
+        )
+        if not raw_quote_conversion:
+            sim_blockers.append("quote-asset USD conversion evidence is missing or unverified")
+
         if intended_size is not None and expected_quote is not None:
             sim_now_iso = (
                 now.isoformat().replace("+00:00", "Z")
@@ -1918,6 +1930,9 @@ def qualify_final_actionable_candidates(candidates: list[dict[str, Any]], now: d
                 require_pool_identity=True,
                 require_reserve_identity=True,
                 require_quote_asset=True,
+                require_quote_conversion=True,
+                require_quote_denomination=True,
+                quote_usd_conversion=raw_quote_conversion,
             )
             size_key = f"${int(intended_size) if intended_size.is_integer() else intended_size}"
             sim_eval = sim_res.get("size_evaluations", {}).get(size_key) or {}
@@ -1946,6 +1961,40 @@ def qualify_final_actionable_candidates(candidates: list[dict[str, Any]], now: d
 
             if sim_status == "QUANTITY_MISMATCH":
                 sim_blockers.append("execution simulation round-trip token quantity mismatch")
+
+            if sim_status in {
+                "MISSING_QUOTE_CONVERSION_EVIDENCE",
+                "INVALID_QUOTE_CONVERSION_PRICE",
+                "STALE_QUOTE_CONVERSION",
+                "FUTURE_DATED_QUOTE_CONVERSION",
+                "INVALID_QUOTE_CONVERSION_TIMESTAMP",
+                "QUOTE_CONVERSION_CHAIN_MISMATCH",
+                "QUOTE_CONVERSION_ASSET_MISMATCH",
+                "UNVERIFIED_VALUATION_SOURCE",
+                "MISSING_QUOTE_DENOMINATION",
+            } or sim_res.get("status") in {
+                "MISSING_QUOTE_CONVERSION_EVIDENCE",
+                "INVALID_QUOTE_CONVERSION_PRICE",
+                "STALE_QUOTE_CONVERSION",
+                "FUTURE_DATED_QUOTE_CONVERSION",
+                "INVALID_QUOTE_CONVERSION_TIMESTAMP",
+                "QUOTE_CONVERSION_CHAIN_MISMATCH",
+                "QUOTE_CONVERSION_ASSET_MISMATCH",
+                "UNVERIFIED_VALUATION_SOURCE",
+                "MISSING_QUOTE_DENOMINATION",
+            }:
+                err_code = sim_status if sim_status in {
+                    "MISSING_QUOTE_CONVERSION_EVIDENCE",
+                    "INVALID_QUOTE_CONVERSION_PRICE",
+                    "STALE_QUOTE_CONVERSION",
+                    "FUTURE_DATED_QUOTE_CONVERSION",
+                    "INVALID_QUOTE_CONVERSION_TIMESTAMP",
+                    "QUOTE_CONVERSION_CHAIN_MISMATCH",
+                    "QUOTE_CONVERSION_ASSET_MISMATCH",
+                    "UNVERIFIED_VALUATION_SOURCE",
+                    "MISSING_QUOTE_DENOMINATION",
+                } else sim_res.get("status")
+                sim_blockers.append(f"quote-asset USD conversion verification failed: {err_code}")
 
             if sim_status in {"MISSING_QUOTE_ASSET_EVIDENCE", "QUOTE_ASSET_MISMATCH"}:
                 sim_blockers.append(f"quote asset verification failed: {sim_status}")

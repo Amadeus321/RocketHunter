@@ -151,6 +151,14 @@ class TestEngineDiagnostics:
                     "notional_size_usd": 100.0,
                 },
             },
+            "quote_usd_conversion": {
+                "price_usd": 1.0,
+                "chain": "ethereum",
+                "quote_asset": "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48",
+                "timestamp_utc": now.isoformat(),
+                "source": "chainlink_oracle_usd",
+                "valuation_policy": "STABLECOIN_ORACLE_VERIFIED",
+            },
         }
 
         # 1. Verify candidate passes when software execution succeeds

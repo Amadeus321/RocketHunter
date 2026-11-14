@@ -143,8 +143,21 @@ def _consume(levels, quantity):
             "vwap": quote / filled_qty if filled_qty else None, "fills": fills}
 
 
-def simulate(book, buy_notional_usd, fee_bps=0.0):
-    """Simulate order book walk for buy and immediate sell."""
+def simulate(
+    book: dict[str, Any],
+    buy_notional_usd: float,
+    fee_bps: float = 0.0,
+    *,
+    quote_usd_conversion: dict[str, Any] | None = None,
+    quote_usd_price: float | None = None,
+    expected_chain: str | None = None,
+    expected_quote_asset: str | None = None,
+    as_of_utc: str | None = None,
+    max_conversion_age_seconds: float = 300.0,
+    require_quote_conversion: bool = False,
+    require_quote_denomination: bool = False,
+) -> dict[str, Any]:
+    """Simulate order book walk for buy and immediate sell with quote-currency USD normalization."""
     try:
         buy_notional_usd = float(buy_notional_usd)
     except (TypeError, ValueError):
@@ -153,6 +166,41 @@ def simulate(book, buy_notional_usd, fee_bps=0.0):
         raise ValueError("buy_notional_usd must be positive and finite")
 
     fee_bps = validate_fee_bps(fee_bps)
+
+    # Establish quote-currency denomination
+    denom = (
+        book.get("quote_currency") or
+        book.get("denomination") or
+        book.get("quote_asset") or
+        book.get("quote_token") or
+        book.get("quote_symbol")
+    )
+    if require_quote_denomination or require_quote_conversion or quote_usd_conversion is not None:
+        if not denom:
+            raise ValueError("MISSING_QUOTE_DENOMINATION: order-book snapshot missing quote-currency denomination")
+
+    # Resolve conversion rate
+    conv = quote_usd_conversion or book.get("quote_usd_conversion")
+    if conv:
+        ok, status, rate, details = validate_quote_usd_conversion(
+            conv,
+            expected_chain=expected_chain or book.get("chain"),
+            expected_quote_asset=expected_quote_asset or book.get("quote_asset") or book.get("quote_token"),
+            as_of_utc=as_of_utc,
+            max_conversion_age_seconds=max_conversion_age_seconds,
+        )
+        if not ok:
+            raise ValueError(f"{status}: {details.get('reason')}")
+        eff_quote_price = rate
+    elif quote_usd_price is not None:
+        p = _clean_strictly_positive(quote_usd_price)
+        if p is None:
+            raise ValueError("INVALID_QUOTE_CONVERSION_PRICE: quote_usd_price must be positive and finite")
+        eff_quote_price = p
+    elif require_quote_conversion:
+        raise ValueError("MISSING_QUOTE_CONVERSION_EVIDENCE: quote-asset USD conversion evidence is required")
+    else:
+        eff_quote_price = 1.0
 
     bids = _levels(book.get("bids"), reverse=True)
     asks = _levels(book.get("asks"), reverse=False)
@@ -163,13 +211,18 @@ def simulate(book, buy_notional_usd, fee_bps=0.0):
         raise ValueError("crossed or locked book; inspect snapshot before simulation")
     mid = (best_bid + best_ask) / 2.0
 
-    # Measure quote depth within +/-2% of mid; depth is displayed, cancellable size.
-    bid_depth_2pct = sum(p * q for p, q in bids if p >= mid * 0.98)
-    ask_depth_2pct = sum(p * q for p, q in asks if p <= mid * 1.02)
+    # Measure quote depth within +/-2% of mid in quote tokens and USD
+    bid_depth_2pct_tokens = sum(p * q for p, q in bids if p >= mid * 0.98)
+    ask_depth_2pct_tokens = sum(p * q for p, q in asks if p <= mid * 1.02)
+    bid_depth_2pct = bid_depth_2pct_tokens * eff_quote_price
+    ask_depth_2pct = ask_depth_2pct_tokens * eff_quote_price
 
-    # Walk asks until the requested quote spend is reached.
-    remaining_quote = buy_notional_usd
-    buy_qty = buy_quote = 0.0
+    # Convert USD trade notional into quote-token units
+    buy_notional_quote_tokens = buy_notional_usd / eff_quote_price
+
+    # Walk asks until requested quote spend is reached
+    remaining_quote = buy_notional_quote_tokens
+    buy_qty = buy_quote_tokens = 0.0
     buy_fills = []
     for price, available_qty in asks:
         if remaining_quote <= 1e-10:
@@ -177,19 +230,35 @@ def simulate(book, buy_notional_usd, fee_bps=0.0):
         take_qty = min(available_qty, remaining_quote / price)
         if take_qty > 0:
             spent = take_qty * price
-            buy_fills.append({"price": price, "quantity": take_qty, "quote": spent})
+            buy_fills.append({
+                "price": price * eff_quote_price,
+                "price_quote": price,
+                "quantity": take_qty,
+                "quote": spent * eff_quote_price,
+                "quote_tokens": spent,
+            })
             buy_qty += take_qty
-            buy_quote += spent
+            buy_quote_tokens += spent
             remaining_quote -= spent
-    buy_complete = remaining_quote <= max(1e-8, buy_notional_usd * 1e-9)
+    buy_complete = remaining_quote <= max(1e-8, buy_notional_quote_tokens * 1e-9)
 
-    # Simulate an immediate sale of the quantity purchased against the bid side.
+    # Immediate sale of quantity purchased against bid side
     sell = _consume(bids, buy_qty)
     sell_complete = sell["remaining_quantity"] <= max(1e-12, buy_qty * 1e-9)
-    buy_vwap = buy_quote / buy_qty if buy_qty else None
-    gross_pnl = (sell["quote_notional"] - buy_quote) if sell["vwap"] is not None else None
-    fee_cost = (buy_quote + sell["quote_notional"]) * fee_bps / 10000.0 if gross_pnl is not None else None
-    net_pnl = gross_pnl - fee_cost if gross_pnl is not None else None
+    sell_quote_tokens = sell["quote_notional"]
+
+    # Convert back to USD
+    buy_quote_usd = buy_quote_tokens * eff_quote_price
+    sell_quote_usd = sell_quote_tokens * eff_quote_price
+    buy_vwap_quote = buy_quote_tokens / buy_qty if buy_qty else None
+    buy_vwap_usd = buy_vwap_quote * eff_quote_price if buy_vwap_quote else None
+    sell_vwap_quote = sell["vwap"]
+    sell_vwap_usd = sell_vwap_quote * eff_quote_price if sell_vwap_quote else None
+    mid_usd = mid * eff_quote_price
+
+    gross_pnl_usd = (sell_quote_usd - buy_quote_usd) if sell_vwap_quote is not None else None
+    fee_cost_usd = (buy_quote_usd + sell_quote_usd) * fee_bps / 10000.0 if gross_pnl_usd is not None else None
+    net_pnl_usd = gross_pnl_usd - fee_cost_usd if gross_pnl_usd is not None else None
 
     return {
         "schema": "crypto-prebreakout.execution-simulation.v1",
@@ -197,32 +266,58 @@ def simulate(book, buy_notional_usd, fee_bps=0.0):
         "status": "FULL_ROUND_TRIP_DEPTH_AVAILABLE" if buy_complete and sell_complete else "INSUFFICIENT_DISPLAYED_DEPTH",
         "execution_enabled": False,
         "snapshot": book.get("timestamp_utc") or book.get("timestamp") or "NOT PROVIDED",
-        "mid_price": mid,
-        "best_bid": best_bid,
-        "best_ask": best_ask,
+        "quote_denomination": denom,
+        "quote_usd_price": eff_quote_price,
+        "mid_price": mid_usd,
+        "mid_price_quote": mid,
+        "best_bid": best_bid * eff_quote_price,
+        "best_bid_quote": best_bid,
+        "best_ask": best_ask * eff_quote_price,
+        "best_ask_quote": best_ask,
         "spread_bps": (best_ask - best_bid) / mid * 10000.0,
         "requested_buy_notional_usd": buy_notional_usd,
-        "buy": {"filled_quote_usd": buy_quote, "filled_quantity": buy_qty, "vwap": buy_vwap,
-                "remaining_quote_usd": max(0.0, remaining_quote), "complete": buy_complete,
-                "impact_vs_best_ask_bps": ((buy_vwap / best_ask) - 1.0) * 10000.0 if buy_vwap else None,
-                "slippage_vs_mid_bps": ((buy_vwap / mid) - 1.0) * 10000.0 if buy_vwap else None,
-                "fills": buy_fills},
-        "immediate_exit": {"filled_quote_usd": sell["quote_notional"], "filled_quantity": sell["filled_quantity"],
-                           "vwap": sell["vwap"], "remaining_quantity": sell["remaining_quantity"],
-                           "complete": sell_complete,
-                           "impact_vs_best_bid_bps": ((best_bid / sell["vwap"]) - 1.0) * 10000.0 if sell["vwap"] else None,
-                           "slippage_vs_mid_bps": ((mid / sell["vwap"]) - 1.0) * 10000.0 if sell["vwap"] else None,
-                           "fills": sell["fills"]},
-        "depth_within_2pct_usd": {"bids": bid_depth_2pct, "asks": ask_depth_2pct,
-                                  "limiting_side": min(bid_depth_2pct, ask_depth_2pct)},
-        "round_trip_estimate": {"fee_bps_each_side": fee_bps,
-                                "gross_pnl_usd": gross_pnl, "estimated_fee_usd": fee_cost,
-                                "net_pnl_usd": net_pnl,
-                                "net_return_pct": (net_pnl / buy_quote * 100.0) if net_pnl is not None and buy_quote else None},
-        "limitations": ["single order-book snapshot; displayed orders may cancel or move",
-                        "immediate round-trip simulation is not a future exit-price forecast",
-                        "does not model hidden liquidity, queue priority, latency, adverse selection or dynamic impact",
-                        "fees are user-supplied and may differ by tier, venue, token or order type"],
+        "buy": {
+            "filled_quote_usd": buy_quote_usd,
+            "filled_quote_tokens": buy_quote_tokens,
+            "filled_quantity": buy_qty,
+            "vwap": buy_vwap_usd,
+            "vwap_quote": buy_vwap_quote,
+            "remaining_quote_usd": max(0.0, remaining_quote * eff_quote_price),
+            "complete": buy_complete,
+            "impact_vs_best_ask_bps": ((buy_vwap_quote / best_ask) - 1.0) * 10000.0 if buy_vwap_quote else None,
+            "slippage_vs_mid_bps": ((buy_vwap_quote / mid) - 1.0) * 10000.0 if buy_vwap_quote else None,
+            "fills": buy_fills,
+        },
+        "immediate_exit": {
+            "filled_quote_usd": sell_quote_usd,
+            "filled_quote_tokens": sell_quote_tokens,
+            "filled_quantity": sell["filled_quantity"],
+            "vwap": sell_vwap_usd,
+            "vwap_quote": sell_vwap_quote,
+            "remaining_quantity": sell["remaining_quantity"],
+            "complete": sell_complete,
+            "impact_vs_best_bid_bps": ((best_bid / sell_vwap_quote) - 1.0) * 10000.0 if sell_vwap_quote else None,
+            "slippage_vs_mid_bps": ((mid / sell_vwap_quote) - 1.0) * 10000.0 if sell_vwap_quote else None,
+            "fills": sell["fills"],
+        },
+        "depth_within_2pct_usd": {
+            "bids": bid_depth_2pct,
+            "asks": ask_depth_2pct,
+            "limiting_side": min(bid_depth_2pct, ask_depth_2pct),
+        },
+        "round_trip_estimate": {
+            "fee_bps_each_side": fee_bps,
+            "gross_pnl_usd": gross_pnl_usd,
+            "estimated_fee_usd": fee_cost_usd,
+            "net_pnl_usd": net_pnl_usd,
+            "net_return_pct": (net_pnl_usd / buy_quote_usd * 100.0) if net_pnl_usd is not None and buy_quote_usd else None,
+        },
+        "limitations": [
+            "single order-book snapshot; displayed orders may cancel or move",
+            "immediate round-trip simulation is not a future exit-price forecast",
+            "does not model hidden liquidity, queue priority, latency, adverse selection or dynamic impact",
+            "fees are user-supplied and may differ by tier, venue, token or order type",
+        ],
     }
 
 
@@ -310,6 +405,125 @@ def validate_timestamp_freshness(
     return True, "FRESH", age_seconds
 
 
+def validate_quote_usd_conversion(
+    conversion: Any,
+    *,
+    expected_chain: str | None = None,
+    expected_quote_asset: str | None = None,
+    as_of_utc: str | None = None,
+    max_conversion_age_seconds: float = 300.0,
+) -> tuple[bool, str, float | None, dict[str, Any]]:
+    """Validate quote-asset/USD conversion evidence.
+
+    Requires:
+    - conversion evidence dictionary with explicit price_usd, timestamp_utc, chain, and quote_asset.
+    - price_usd must be positive and finite.
+    - chain must match expected_chain.
+    - quote_asset must match expected_quote_asset.
+    - timestamp_utc must be timezone-aware UTC, not future-dated, and fresh relative to as_of_utc.
+    - explicit source or valuation_policy.
+
+    Returns:
+    (is_valid, status, price_usd, details)
+    """
+    if not isinstance(conversion, dict) or not conversion:
+        return False, "MISSING_QUOTE_CONVERSION_EVIDENCE", None, {
+            "reason": "quote-asset USD conversion evidence is missing"
+        }
+
+    # 1. Price validation
+    raw_price = conversion.get("price_usd")
+    if raw_price is None and "rate" in conversion:
+        raw_price = conversion["rate"]
+    if raw_price is None and "quote_price_usd" in conversion:
+        raw_price = conversion["quote_price_usd"]
+
+    clean_price = _clean_strictly_positive(raw_price)
+    if clean_price is None:
+        return False, "INVALID_QUOTE_CONVERSION_PRICE", None, {
+            "reason": f"quote-asset USD conversion price must be positive and finite, got {raw_price!r}"
+        }
+
+    # 2. Timestamp freshness validation
+    stamp = conversion.get("timestamp_utc") or conversion.get("timestamp") or conversion.get("as_of_utc")
+    fresh, fresh_status, age = validate_timestamp_freshness(stamp, as_of_utc, max_conversion_age_seconds)
+    if not fresh:
+        if fresh_status in ("FUTURE_DATED_QUOTE", "FUTURE_DATED"):
+            status_code = "FUTURE_DATED_QUOTE_CONVERSION"
+        elif fresh_status in ("STALE_QUOTE", "STALE"):
+            status_code = "STALE_QUOTE_CONVERSION"
+        else:
+            status_code = "INVALID_QUOTE_CONVERSION_TIMESTAMP"
+        return False, status_code, None, {
+            "reason": f"quote-asset USD conversion timestamp verification failed: {fresh_status}",
+            "age_seconds": age,
+        }
+
+    # 3. Chain validation
+    conv_chain = conversion.get("chain")
+    if expected_chain:
+        if not conv_chain:
+            return False, "MISSING_CONVERSION_CHAIN_IDENTITY", None, {
+                "reason": "quote-asset USD conversion evidence missing chain identity"
+            }
+        if str(conv_chain).strip().lower() != str(expected_chain).strip().lower():
+            return False, "QUOTE_CONVERSION_CHAIN_MISMATCH", None, {
+                "reason": f"conversion chain ({conv_chain}) does not match expected ({expected_chain})",
+                "actual": conv_chain,
+                "expected": expected_chain,
+            }
+
+    # 4. Quote asset address validation
+    conv_asset = (
+        conversion.get("quote_asset") or
+        conversion.get("quote_token") or
+        conversion.get("token_address") or
+        conversion.get("address")
+    )
+    effective_chain = expected_chain or conv_chain or "evm"
+    if expected_quote_asset:
+        if not conv_asset:
+            return False, "MISSING_CONVERSION_ASSET_IDENTITY", None, {
+                "reason": "quote-asset USD conversion evidence missing quote asset address"
+            }
+        if not is_valid_address(effective_chain, conv_asset):
+            return False, "INVALID_TOKEN_ADDRESS", None, {
+                "reason": f"conversion quote asset address format invalid: {conv_asset}"
+            }
+        if not same_address(effective_chain, conv_asset, expected_quote_asset):
+            return False, "QUOTE_CONVERSION_ASSET_MISMATCH", None, {
+                "reason": f"conversion quote asset ({conv_asset}) does not match expected ({expected_quote_asset})",
+                "actual": conv_asset,
+                "expected": expected_quote_asset,
+            }
+    elif conv_asset:
+        if not is_valid_address(effective_chain, conv_asset):
+            return False, "INVALID_TOKEN_ADDRESS", None, {
+                "reason": f"conversion quote asset address format invalid: {conv_asset}"
+            }
+
+    # 5. Valuation source / policy validation
+    source = (
+        conversion.get("source") or
+        conversion.get("provider") or
+        conversion.get("valuation_policy") or
+        conversion.get("oracle")
+    )
+    if not source:
+        return False, "UNVERIFIED_VALUATION_SOURCE", None, {
+            "reason": "quote-asset USD conversion lacks explicit, verified valuation source or policy"
+        }
+
+    return True, "CONVERSION_VERIFIED", clean_price, {
+        "price_usd": clean_price,
+        "chain": conv_chain,
+        "quote_asset": conv_asset,
+        "source": source,
+        "valuation_policy": conversion.get("valuation_policy") or source,
+        "age_seconds": round(age, 1) if age is not None else None,
+    }
+
+
 def validate_two_way_quotes(
     buy_q: Any,
     sell_q: Any,
@@ -320,6 +534,7 @@ def validate_two_way_quotes(
     expected_quote_asset: str | None = None,
     require_pool_identity: bool = False,
     require_quote_asset: bool = False,
+    quote_usd_price: float | None = None,
     target_size_usd: float | None = None,
     size_tolerance_pct: float = 1.0,
     quantity_tolerance_pct: float = 0.1,
@@ -508,8 +723,19 @@ def validate_two_way_quotes(
         }
 
     # 8. Quoted notional size verification on BOTH legs
-    buy_size = _clean_strictly_positive(buy_q.get("notional_size_usd") or buy_q.get("in_amount"))
-    sell_size = _clean_strictly_positive(sell_q.get("notional_size_usd") or sell_q.get("out_amount") or sell_q.get("output_amount"))
+    if buy_q.get("notional_size_usd") is not None:
+        buy_size = _clean_strictly_positive(buy_q.get("notional_size_usd"))
+    elif quote_usd_price is not None and buy_in is not None:
+        buy_size = buy_in * quote_usd_price
+    else:
+        buy_size = _clean_strictly_positive(buy_q.get("in_amount"))
+
+    if sell_q.get("notional_size_usd") is not None:
+        sell_size = _clean_strictly_positive(sell_q.get("notional_size_usd"))
+    elif quote_usd_price is not None and sell_out is not None:
+        sell_size = sell_out * quote_usd_price
+    else:
+        sell_size = _clean_strictly_positive(sell_q.get("out_amount") or sell_q.get("output_amount"))
 
     if target_size_usd is not None:
         if buy_size is None or sell_size is None:
@@ -577,13 +803,19 @@ def simulate_constant_product_amm(
     expected_token_address: str | None = None,
     expected_quote_asset: str | None = None,
     require_reserve_identity: bool = True,
+    require_quote_conversion: bool = False,
+    quote_usd_conversion: dict[str, Any] | None = None,
+    quote_usd_price: float | None = None,
+    as_of_utc: str | None = None,
+    max_conversion_age_seconds: float = 300.0,
 ) -> dict[str, Any]:
     """Exact constant-product AMM (x * y = k) simulation with reserve tracking, fees, and identity verification.
 
     Associates reserve0 exclusively with token0 and reserve1 exclusively with token1.
     Determines whether candidate token is token0 or token1 to select the correct base and quote reserves.
+    Normalizes USD trade sizes into quote-token quantities using verified quote-asset USD conversion.
     Rejects missing, zero, negative, non-finite, or inconsistent reserve data.
-    Fails closed on any incomplete identity or orientation ambiguity.
+    Fails closed on any incomplete identity, orientation ambiguity, or unverified conversion.
     """
     fee = validate_fee_bps(fee_bps)
 
@@ -659,6 +891,7 @@ def simulate_constant_product_amm(
             if not match0 and not match1:
                 raise ValueError("AMM_TOKEN_MISMATCH: neither reserve token matches expected candidate token")
             token0_is_candidate = match0
+        pool_quote_token = (token1 if token0_is_candidate else token0) if token0_is_candidate is not None else expected_quote_asset
 
     # Step 2: Validate and associate reserves
     has_r0_r1 = (reserve0 is not None or reserve1 is not None)
@@ -713,13 +946,40 @@ def simulate_constant_product_amm(
     if effective_base_reserve is None or effective_quote_reserve is None:
         raise ValueError("INVALID_AMM_RESERVES: could not determine effective base and quote reserves")
 
+    # Step 3: Resolve quote-asset USD conversion rate
+    conv = quote_usd_conversion
+    if conv:
+        ok, status, rate, details = validate_quote_usd_conversion(
+            conv,
+            expected_chain=expected_chain or chain,
+            expected_quote_asset=pool_quote_token or expected_quote_asset,
+            as_of_utc=as_of_utc or timestamp_utc,
+            max_conversion_age_seconds=max_conversion_age_seconds,
+        )
+        if not ok:
+            raise ValueError(f"{status}: {details.get('reason')}")
+        eff_quote_price = rate
+    elif quote_usd_price is not None:
+        p = _clean_strictly_positive(quote_usd_price)
+        if p is None:
+            raise ValueError("INVALID_QUOTE_CONVERSION_PRICE: quote_usd_price must be positive and finite")
+        eff_quote_price = p
+    elif require_quote_conversion:
+        raise ValueError("MISSING_QUOTE_CONVERSION_EVIDENCE: quote-asset USD conversion evidence is required")
+    else:
+        eff_quote_price = 1.0
+
     rb = effective_base_reserve
     rq = effective_quote_reserve
-    mid_price = rq / rb
+    mid_price_quote = rq / rb
+    mid_price_usd = mid_price_quote * eff_quote_price
     fee_factor = 1.0 - (fee / 10000.0)
 
-    # Buy swap: spend buy_usd quote tokens to get base tokens
-    delta_in_eff = buy_usd * fee_factor
+    # Convert USD trade size into quote-token units
+    buy_quote_tokens = buy_usd / eff_quote_price
+
+    # Buy swap: spend buy_quote_tokens quote tokens to get base tokens
+    delta_in_eff = buy_quote_tokens * fee_factor
     delta_base_out = (rb * delta_in_eff) / (rq + delta_in_eff)
 
     if delta_base_out <= 0 or delta_base_out >= rb:
@@ -734,25 +994,30 @@ def simulate_constant_product_amm(
             "token0": token0,
             "token1": token1,
             "token0_is_candidate": token0_is_candidate,
-            "mid_price": mid_price,
-            "buy": {"complete": False, "filled_quote_usd": 0.0, "filled_quantity": 0.0, "vwap": None},
-            "immediate_exit": {"complete": False, "filled_quote_usd": 0.0, "filled_quantity": 0.0, "vwap": None},
+            "quote_usd_price": eff_quote_price,
+            "mid_price": mid_price_usd,
+            "mid_price_quote": mid_price_quote,
+            "buy": {"complete": False, "filled_quote_usd": 0.0, "filled_quote_tokens": 0.0, "filled_quantity": 0.0, "vwap": None},
+            "immediate_exit": {"complete": False, "filled_quote_usd": 0.0, "filled_quote_tokens": 0.0, "filled_quantity": 0.0, "vwap": None},
             "round_trip_estimate": {"fee_bps_each_side": fee, "net_pnl_usd": None, "net_return_pct": None},
         }
 
     rb_post = rb - delta_base_out
-    rq_post = rq + buy_usd
-    buy_vwap = buy_usd / delta_base_out
-    buy_impact_bps = ((buy_vwap / mid_price) - 1.0) * 10000.0
+    rq_post = rq + buy_quote_tokens
+    buy_vwap_quote = buy_quote_tokens / delta_base_out
+    buy_vwap_usd = buy_vwap_quote * eff_quote_price
+    buy_impact_bps = ((buy_vwap_quote / mid_price_quote) - 1.0) * 10000.0
 
     # Sell swap: sell delta_base_out back into the pool to get quote tokens
     delta_base_in_eff = delta_base_out * fee_factor
-    delta_quote_out = (rq_post * delta_base_in_eff) / (rb_post + delta_base_in_eff)
-    sell_vwap = delta_quote_out / delta_base_out
-    sell_impact_bps = ((mid_price / sell_vwap) - 1.0) * 10000.0
+    delta_quote_out_tokens = (rq_post * delta_base_in_eff) / (rb_post + delta_base_in_eff)
+    sell_quote_usd = delta_quote_out_tokens * eff_quote_price
+    sell_vwap_quote = delta_quote_out_tokens / delta_base_out
+    sell_vwap_usd = sell_vwap_quote * eff_quote_price
+    sell_impact_bps = ((mid_price_quote / sell_vwap_quote) - 1.0) * 10000.0
 
-    gross_pnl = delta_quote_out - buy_usd
-    net_return_pct = (gross_pnl / buy_usd) * 100.0
+    gross_pnl_usd = sell_quote_usd - buy_usd
+    net_return_pct = (gross_pnl_usd / buy_usd) * 100.0
 
     return {
         "status": "FULL_ROUND_TRIP_AMM_LIQUIDITY_AVAILABLE",
@@ -765,24 +1030,30 @@ def simulate_constant_product_amm(
         "token0": token0,
         "token1": token1,
         "token0_is_candidate": token0_is_candidate,
-        "mid_price": mid_price,
+        "quote_usd_price": eff_quote_price,
+        "mid_price": mid_price_usd,
+        "mid_price_quote": mid_price_quote,
         "buy": {
             "complete": True,
             "filled_quote_usd": buy_usd,
+            "filled_quote_tokens": buy_quote_tokens,
             "filled_quantity": delta_base_out,
-            "vwap": buy_vwap,
+            "vwap": buy_vwap_usd,
+            "vwap_quote": buy_vwap_quote,
             "price_impact_bps": buy_impact_bps,
         },
         "immediate_exit": {
             "complete": True,
-            "filled_quote_usd": delta_quote_out,
+            "filled_quote_usd": sell_quote_usd,
+            "filled_quote_tokens": delta_quote_out_tokens,
             "filled_quantity": delta_base_out,
-            "vwap": sell_vwap,
+            "vwap": sell_vwap_usd,
+            "vwap_quote": sell_vwap_quote,
             "price_impact_bps": sell_impact_bps,
         },
         "round_trip_estimate": {
             "fee_bps_each_side": fee,
-            "net_pnl_usd": gross_pnl,
+            "net_pnl_usd": gross_pnl_usd,
             "net_return_pct": net_return_pct,
         },
     }
@@ -804,6 +1075,10 @@ def simulate_multi_size(
     require_pool_identity: bool = False,
     require_reserve_identity: bool = True,
     require_quote_asset: bool = False,
+    require_quote_conversion: bool = False,
+    require_quote_denomination: bool = False,
+    quote_usd_conversion: dict[str, Any] | None = None,
+    max_conversion_age_seconds: float = 300.0,
     size_tolerance_pct: float = 1.0,
     quantity_tolerance_pct: float = 0.1,
 ) -> dict[str, Any]:
@@ -878,6 +1153,110 @@ def simulate_multi_size(
     amm_reserves = source.get("amm_reserves") if isinstance(source.get("amm_reserves"), dict) else (
         source.get("reserves") if isinstance(source.get("reserves"), dict) else None
     )
+
+    conv_data = quote_usd_conversion
+    if not conv_data and isinstance(source, dict):
+        conv_data = (
+            source.get("quote_usd_conversion") or
+            (book.get("quote_usd_conversion") if isinstance(book, dict) else None) or
+            (amm_reserves.get("quote_usd_conversion") if isinstance(amm_reserves, dict) else None) or
+            (quotes.get("quote_usd_conversion") if isinstance(quotes, dict) else None)
+        )
+
+    target_chain = (
+        expected_chain or
+        (book.get("chain") if isinstance(book, dict) else None) or
+        (amm_reserves.get("chain") if isinstance(amm_reserves, dict) else None) or
+        (quotes.get("chain") if isinstance(quotes, dict) else None)
+    )
+
+    pool_quote_asset = None
+    if amm_reserves and expected_token_address and target_chain:
+        r_t0 = amm_reserves.get("token0")
+        r_t1 = amm_reserves.get("token1")
+        if r_t0 and same_address(target_chain, r_t0, expected_token_address):
+            pool_quote_asset = r_t1
+        elif r_t1 and same_address(target_chain, r_t1, expected_token_address):
+            pool_quote_asset = r_t0
+
+    target_quote_asset = (
+        expected_quote_asset or
+        (book.get("quote_asset") or book.get("quote_token") if isinstance(book, dict) else None) or
+        pool_quote_asset or
+        (quotes.get("quote_asset") if isinstance(quotes, dict) else None)
+    )
+
+    if require_quote_conversion and not conv_data:
+        size_evaluations = {}
+        for s in clean_sizes:
+            size_key = f"${int(s) if s.is_integer() else s}"
+            size_evaluations[size_key] = {
+                "size_usd": s,
+                "status": "MISSING_QUOTE_CONVERSION_EVIDENCE",
+                "simulation_method": "QUOTE_CONVERSION_REJECTED",
+                "route_available": False,
+                "quote_verified_for_size": False,
+                "size_verification_status": "ORDER_SIZE_UNVERIFIED_ESTIMATE",
+                "quote_freshness": "UNVERIFIED",
+                "reason": "quote-asset USD conversion evidence is required",
+                "buy": {"status": "UNAVAILABLE", "reason": "Missing quote-asset USD conversion evidence"},
+                "sell": {"status": "UNAVAILABLE", "reason": "Missing quote-asset USD conversion evidence"},
+                "estimated_round_trip_cost_pct": None,
+                "execution_adjusted_return_pct": None,
+            }
+        return {
+            "schema": "crypto-prebreakout.multi-size-execution-simulation.v1",
+            "simulator_version": BACKTEST_VERSION if "BACKTEST_VERSION" in globals() else "4.30.0",
+            "execution_enabled": False,
+            "status": "MISSING_QUOTE_CONVERSION_EVIDENCE",
+            "available_liquidity_usd": liquidity_usd,
+            "fee_bps": validated_fee_bps,
+            "gas_usd": gas_usd,
+            "target_upside_pct": target_upside_pct,
+            "size_evaluations": size_evaluations,
+            "research_disclaimer": "Read-only simulation. Evaluates hypothetical size-dependent price impact and execution drag.",
+        }
+
+    effective_quote_usd_price = 1.0
+    if conv_data:
+        ok_conv, conv_status, conv_price, conv_details = validate_quote_usd_conversion(
+            conv_data,
+            expected_chain=target_chain,
+            expected_quote_asset=target_quote_asset,
+            as_of_utc=as_of_utc,
+            max_conversion_age_seconds=max_conversion_age_seconds,
+        )
+        if not ok_conv:
+            size_evaluations = {}
+            for s in clean_sizes:
+                size_key = f"${int(s) if s.is_integer() else s}"
+                size_evaluations[size_key] = {
+                    "size_usd": s,
+                    "status": conv_status,
+                    "simulation_method": "QUOTE_CONVERSION_REJECTED",
+                    "route_available": False,
+                    "quote_verified_for_size": False,
+                    "size_verification_status": "ORDER_SIZE_UNVERIFIED_ESTIMATE",
+                    "quote_freshness": "UNVERIFIED",
+                    "reason": conv_details.get("reason"),
+                    "buy": {"status": "UNAVAILABLE", "reason": conv_details.get("reason")},
+                    "sell": {"status": "UNAVAILABLE", "reason": conv_details.get("reason")},
+                    "estimated_round_trip_cost_pct": None,
+                    "execution_adjusted_return_pct": None,
+                }
+            return {
+                "schema": "crypto-prebreakout.multi-size-execution-simulation.v1",
+                "simulator_version": BACKTEST_VERSION if "BACKTEST_VERSION" in globals() else "4.30.0",
+                "execution_enabled": False,
+                "status": conv_status,
+                "available_liquidity_usd": liquidity_usd,
+                "fee_bps": validated_fee_bps,
+                "gas_usd": gas_usd,
+                "target_upside_pct": target_upside_pct,
+                "size_evaluations": size_evaluations,
+                "research_disclaimer": "Read-only simulation. Evaluates hypothetical size-dependent price impact and execution drag.",
+            }
+        effective_quote_usd_price = conv_price
 
     size_evaluations: dict[str, Any] = {}
 
@@ -971,7 +1350,19 @@ def simulate_multi_size(
                 continue
 
             try:
-                sim = simulate(book, buy_notional_usd=size, fee_bps=validated_fee_bps)
+                sim = simulate(
+                    book,
+                    buy_notional_usd=size,
+                    fee_bps=validated_fee_bps,
+                    quote_usd_conversion=conv_data,
+                    quote_usd_price=effective_quote_usd_price,
+                    expected_chain=expected_chain,
+                    expected_quote_asset=expected_quote_asset,
+                    as_of_utc=as_of_utc,
+                    max_conversion_age_seconds=max_conversion_age_seconds,
+                    require_quote_conversion=require_quote_conversion,
+                    require_quote_denomination=require_quote_denomination,
+                )
                 buy_complete = sim["buy"]["complete"]
                 sell_complete = sim["immediate_exit"]["complete"]
                 buy_impact_bps = sim["buy"]["impact_vs_best_ask_bps"]
@@ -1000,10 +1391,13 @@ def simulate_multi_size(
                     "quote_freshness": "FRESH",
                     "quote_age_seconds": round(book_age, 1) if book_age is not None else None,
                     "available_liquidity_usd": liquidity_usd,
+                    "quote_usd_price": sim.get("quote_usd_price"),
                     "buy": {
                         "status": "AVAILABLE" if buy_complete else "PARTIAL_DEPTH_ONLY",
                         "filled_quote_usd": sim["buy"]["filled_quote_usd"],
+                        "filled_quote_tokens": sim["buy"].get("filled_quote_tokens"),
                         "vwap": sim["buy"]["vwap"],
+                        "vwap_quote": sim["buy"].get("vwap_quote"),
                         "price_impact_bps": buy_impact_bps,
                         "slippage_bps": buy_slip_bps,
                         "complete": buy_complete,
@@ -1011,7 +1405,9 @@ def simulate_multi_size(
                     "sell": {
                         "status": "AVAILABLE" if sell_complete else "PARTIAL_DEPTH_ONLY",
                         "filled_quote_usd": sim["immediate_exit"]["filled_quote_usd"],
+                        "filled_quote_tokens": sim["immediate_exit"].get("filled_quote_tokens"),
                         "vwap": sim["immediate_exit"]["vwap"],
+                        "vwap_quote": sim["immediate_exit"].get("vwap_quote"),
                         "price_impact_bps": sell_impact_bps,
                         "slippage_bps": sell_slip_bps,
                         "complete": sell_complete,
@@ -1023,17 +1419,35 @@ def simulate_multi_size(
                     "execution_adjusted_return_pct": round(adj_return, 2) if adj_return is not None else None,
                 }
             except ValueError as e:
+                err_msg = str(e)
+                status_code = "UNAVAILABLE"
+                for code in (
+                    "MISSING_QUOTE_DENOMINATION",
+                    "MISSING_QUOTE_CONVERSION_EVIDENCE",
+                    "INVALID_QUOTE_CONVERSION_PRICE",
+                    "STALE_QUOTE_CONVERSION",
+                    "FUTURE_DATED_QUOTE_CONVERSION",
+                    "INVALID_QUOTE_CONVERSION_TIMESTAMP",
+                    "QUOTE_CONVERSION_CHAIN_MISMATCH",
+                    "QUOTE_CONVERSION_ASSET_MISMATCH",
+                    "UNVERIFIED_VALUATION_SOURCE",
+                ):
+                    if code in err_msg:
+                        status_code = code
+                        break
                 size_evaluations[size_key] = {
                     "size_usd": size,
-                    "status": "UNAVAILABLE",
+                    "status": status_code,
                     "simulation_method": "ORDER_BOOK_DEPTH_WALK",
                     "is_depth_walk": True,
                     "quote_verified_for_size": False,
                     "size_verification_status": "ORDER_SIZE_UNVERIFIED_ESTIMATE",
                     "route_available": False,
-                    "reason": str(e),
-                    "buy": {"status": "UNAVAILABLE"},
-                    "sell": {"status": "UNAVAILABLE"},
+                    "reason": err_msg,
+                    "buy": {"status": "UNAVAILABLE", "reason": err_msg},
+                    "sell": {"status": "UNAVAILABLE", "reason": err_msg},
+                    "estimated_round_trip_cost_pct": None,
+                    "execution_adjusted_return_pct": None,
                 }
 
         # Case B: Constant-product AMM simulation
@@ -1142,6 +1556,11 @@ def simulate_multi_size(
                     expected_token_address=expected_token_address,
                     expected_quote_asset=expected_quote_asset,
                     require_reserve_identity=require_reserve_identity,
+                    require_quote_conversion=require_quote_conversion,
+                    quote_usd_conversion=conv_data,
+                    quote_usd_price=effective_quote_usd_price,
+                    as_of_utc=as_of_utc,
+                    max_conversion_age_seconds=max_conversion_age_seconds,
                 )
 
                 buy_ok = amm_sim["buy"]["complete"]
@@ -1170,19 +1589,24 @@ def simulate_multi_size(
                     "reserve0": amm_sim.get("reserve0"),
                     "reserve1": amm_sim.get("reserve1"),
                     "token0_is_candidate": amm_sim.get("token0_is_candidate"),
+                    "quote_usd_price": amm_sim.get("quote_usd_price"),
                     "buy": {
                         "status": "AVAILABLE" if buy_ok else "UNAVAILABLE",
                         "filled_quote_usd": amm_sim["buy"]["filled_quote_usd"],
+                        "filled_quote_tokens": amm_sim["buy"].get("filled_quote_tokens"),
                         "filled_quantity": amm_sim["buy"]["filled_quantity"],
                         "vwap": amm_sim["buy"]["vwap"],
+                        "vwap_quote": amm_sim["buy"].get("vwap_quote"),
                         "price_impact_bps": amm_sim["buy"].get("price_impact_bps"),
                         "complete": buy_ok,
                     },
                     "sell": {
                         "status": "AVAILABLE" if sell_ok else "UNAVAILABLE",
                         "filled_quote_usd": amm_sim["immediate_exit"]["filled_quote_usd"],
+                        "filled_quote_tokens": amm_sim["immediate_exit"].get("filled_quote_tokens"),
                         "filled_quantity": amm_sim["immediate_exit"]["filled_quantity"],
                         "vwap": amm_sim["immediate_exit"]["vwap"],
+                        "vwap_quote": amm_sim["immediate_exit"].get("vwap_quote"),
                         "price_impact_bps": amm_sim["immediate_exit"].get("price_impact_bps"),
                         "complete": sell_ok,
                     },
@@ -1193,11 +1617,21 @@ def simulate_multi_size(
             except ValueError as e:
                 err_msg = str(e)
                 status_code = "INVALID_AMM_RESERVES"
-                for code in ("MISSING_AMM_POOL_IDENTITY", "AMM_POOL_MISMATCH",
-                             "MISSING_AMM_CHAIN_IDENTITY", "AMM_CHAIN_MISMATCH",
-                             "MISSING_AMM_TOKEN_IDENTITY", "AMM_TOKEN_MISMATCH",
-                             "QUOTE_ASSET_MISMATCH", "INVALID_TOKEN_ADDRESS",
-                             "INCONSISTENT_AMM_RESERVES", "MISSING_AMM_RESERVES", "INVALID_AMM_RESERVES"):
+                for code in (
+                    "MISSING_QUOTE_CONVERSION_EVIDENCE",
+                    "INVALID_QUOTE_CONVERSION_PRICE",
+                    "STALE_QUOTE_CONVERSION",
+                    "FUTURE_DATED_QUOTE_CONVERSION",
+                    "INVALID_QUOTE_CONVERSION_TIMESTAMP",
+                    "QUOTE_CONVERSION_CHAIN_MISMATCH",
+                    "QUOTE_CONVERSION_ASSET_MISMATCH",
+                    "UNVERIFIED_VALUATION_SOURCE",
+                    "MISSING_AMM_POOL_IDENTITY", "AMM_POOL_MISMATCH",
+                    "MISSING_AMM_CHAIN_IDENTITY", "AMM_CHAIN_MISMATCH",
+                    "MISSING_AMM_TOKEN_IDENTITY", "AMM_TOKEN_MISMATCH",
+                    "QUOTE_ASSET_MISMATCH", "INVALID_TOKEN_ADDRESS",
+                    "INCONSISTENT_AMM_RESERVES", "MISSING_AMM_RESERVES", "INVALID_AMM_RESERVES",
+                ):
                     if code in err_msg:
                         status_code = code
                         break
@@ -1312,6 +1746,7 @@ def simulate_multi_size(
                 size_tolerance_pct=size_tolerance_pct,
                 quantity_tolerance_pct=quantity_tolerance_pct,
                 quote_meta=quotes,
+                quote_usd_price=effective_quote_usd_price,
             )
 
             # Check if liquidity supports this size
