@@ -10,6 +10,7 @@ from scripts.execution_simulator import (
     validate_fee_bps,
     validate_two_way_quotes,
     validate_timestamp_freshness,
+    validate_quote_usd_conversion,
     is_valid_address,
 )
 from scripts import v425_early_breakout as v425
@@ -362,6 +363,8 @@ class AdversarialPhase2ExecutionTests(unittest.TestCase):
             "quote_asset": VALID_QUOTE_ADDR,
             "timestamp_utc": "2026-11-13T12:00:00Z",
             "source": "chainlink_oracle_usd",
+            "provider": "chainlink",
+            "feed_address": "0x8fa59a53f040d12d26f03bc9920373707c3c4004",
             "valuation_policy": "STABLECOIN_ORACLE_VERIFIED",
         }
         self.valid_quote_source = {
@@ -1551,6 +1554,8 @@ class AdversarialPhase2ExecutionTests(unittest.TestCase):
             "quote_asset": VALID_QUOTE_ADDR,
             "timestamp_utc": self.as_of_utc,
             "source": "chainlink_oracle_usd",
+            "provider": "chainlink",
+            "feed_address": "0x8fa59a53f040d12d26f03bc9920373707c3c4004",
             "valuation_policy": "STABLECOIN_ORACLE_VERIFIED",
         }
         # Test AMM with verified USD quote asset
@@ -1584,6 +1589,8 @@ class AdversarialPhase2ExecutionTests(unittest.TestCase):
             "quote_asset": VALID_ALT_QUOTE,
             "timestamp_utc": self.as_of_utc,
             "source": "chainlink_oracle_eth_usd",
+            "provider": "chainlink",
+            "feed_address": "0x5f4ec3df9cbd43714fe2740f5e3616155c5b8419",
             "valuation_policy": "CRYPTO_ORACLE_VERIFIED",
         }
         # In this pool, quote reserve is 16.666667 WETH ($50k USD equiv)
@@ -1688,6 +1695,9 @@ class AdversarialPhase2ExecutionTests(unittest.TestCase):
             "quote_asset": VALID_QUOTE_ADDR,
             "timestamp_utc": "2026-11-13T11:50:00Z",  # 10 minutes old (> 300s)
             "source": "chainlink_oracle_usd",
+            "provider": "chainlink",
+            "feed_address": "0x8fa59a53f040d12d26f03bc9920373707c3c4004",
+            "valuation_policy": "STABLECOIN_ORACLE_VERIFIED",
         }
         with self.assertRaisesRegex(ValueError, "STALE_QUOTE_CONVERSION"):
             simulate_constant_product_amm(
@@ -1710,6 +1720,9 @@ class AdversarialPhase2ExecutionTests(unittest.TestCase):
             "quote_asset": VALID_QUOTE_ADDR,
             "timestamp_utc": "2026-11-13T12:05:00Z",  # Future-dated
             "source": "chainlink_oracle_usd",
+            "provider": "chainlink",
+            "feed_address": "0x8fa59a53f040d12d26f03bc9920373707c3c4004",
+            "valuation_policy": "STABLECOIN_ORACLE_VERIFIED",
         }
         with self.assertRaisesRegex(ValueError, "FUTURE_DATED_QUOTE_CONVERSION"):
             simulate_constant_product_amm(
@@ -1735,6 +1748,9 @@ class AdversarialPhase2ExecutionTests(unittest.TestCase):
             "quote_asset": VALID_QUOTE_ADDR,
             "timestamp_utc": self.as_of_utc,
             "source": "pyth_oracle",
+            "provider": "pyth",
+            "feed_id": "solana_feed_123",
+            "valuation_policy": "CRYPTO_ORACLE_VERIFIED",
         }
         with self.assertRaisesRegex(ValueError, "QUOTE_CONVERSION_CHAIN_MISMATCH"):
             simulate_constant_product_amm(
@@ -1758,7 +1774,10 @@ class AdversarialPhase2ExecutionTests(unittest.TestCase):
             "chain": VALID_EVM_CHAIN,
             "quote_asset": VALID_ALT_QUOTE,  # Pool uses VALID_QUOTE_ADDR (USDC), but conversion is for WETH
             "timestamp_utc": self.as_of_utc,
-            "source": "chainlink_oracle",
+            "source": "chainlink_oracle_eth_usd",
+            "provider": "chainlink",
+            "feed_address": "0x5f4ec3df9cbd43714fe2740f5e3616155c5b8419",
+            "valuation_policy": "CRYPTO_ORACLE_VERIFIED",
         }
         with self.assertRaisesRegex(ValueError, "QUOTE_CONVERSION_ASSET_MISMATCH"):
             simulate_constant_product_amm(
@@ -1782,7 +1801,7 @@ class AdversarialPhase2ExecutionTests(unittest.TestCase):
             "chain": VALID_EVM_CHAIN,
             "quote_asset": VALID_QUOTE_ADDR,
             "timestamp_utc": self.as_of_utc,
-            # No "source" or "valuation_policy"
+            # No "source", "provider", or "valuation_policy"
         }
         with self.assertRaisesRegex(ValueError, "UNVERIFIED_VALUATION_SOURCE"):
             simulate_constant_product_amm(
@@ -1837,6 +1856,8 @@ class AdversarialPhase2ExecutionTests(unittest.TestCase):
             "quote_asset": VALID_QUOTE_ADDR,
             "timestamp_utc": self.as_of_utc,
             "source": "chainlink_oracle_usd",
+            "provider": "chainlink",
+            "feed_address": "0x8fa59a53f040d12d26f03bc9920373707c3c4004",
             "valuation_policy": "STABLECOIN_ORACLE_VERIFIED",
         }
         sim_usdc = simulate_constant_product_amm(
@@ -1862,6 +1883,8 @@ class AdversarialPhase2ExecutionTests(unittest.TestCase):
             "quote_asset": VALID_ALT_QUOTE,
             "timestamp_utc": self.as_of_utc,
             "source": "chainlink_oracle_eth_usd",
+            "provider": "chainlink",
+            "feed_address": "0x5f4ec3df9cbd43714fe2740f5e3616155c5b8419",
             "valuation_policy": "CRYPTO_ORACLE_VERIFIED",
         }
         weth_reserve = 50_000.0 / 3000.0
@@ -1954,6 +1977,8 @@ class AdversarialPhase2ExecutionTests(unittest.TestCase):
             "quote_asset": VALID_QUOTE_ADDR,
             "timestamp_utc": "2026-11-13T11:45:00Z",  # 15 minutes old
             "source": "chainlink_oracle_usd",
+            "provider": "chainlink",
+            "feed_address": "0x8fa59a53f040d12d26f03bc9920373707c3c4004",
             "valuation_policy": "STABLECOIN_ORACLE_VERIFIED",
         }
         qualified_stale = v425.qualify_final_actionable_candidates([cand_stale_conv], self.now_dt)
@@ -1968,11 +1993,250 @@ class AdversarialPhase2ExecutionTests(unittest.TestCase):
             "quote_asset": VALID_ALT_QUOTE,  # Mismatched to VALID_QUOTE_ADDR
             "timestamp_utc": self.as_of_utc,
             "source": "chainlink_oracle_eth_usd",
+            "provider": "chainlink",
+            "feed_address": "0x5f4ec3df9cbd43714fe2740f5e3616155c5b8419",
             "valuation_policy": "CRYPTO_ORACLE_VERIFIED",
         }
         qualified_mismatch = v425.qualify_final_actionable_candidates([cand_mismatch_conv], self.now_dt)
         self.assertEqual(len(qualified_mismatch), 0)
         self.assertTrue(any("QUOTE_CONVERSION_ASSET_MISMATCH" in b for b in cand_mismatch_conv["qualification_blockers"]))
+
+    # 43. Valid trusted-provider conversion with full provenance passes
+    def test_43_valid_trusted_provider_conversion_passes(self):
+        valid_conv = {
+            "price_usd": 1.0,
+            "chain": VALID_EVM_CHAIN,
+            "quote_asset": VALID_QUOTE_ADDR,
+            "timestamp_utc": self.as_of_utc,
+            "source": "chainlink_oracle_usd",
+            "provider": "chainlink",
+            "feed_address": "0x8fa59a53f040d12d26f03bc9920373707c3c4004",
+            "valuation_policy": "STABLECOIN_ORACLE_VERIFIED",
+        }
+        ok, status, price, details = validate_quote_usd_conversion(
+            valid_conv,
+            expected_chain=VALID_EVM_CHAIN,
+            expected_quote_asset=VALID_QUOTE_ADDR,
+            as_of_utc=self.as_of_utc,
+        )
+        self.assertTrue(ok)
+        self.assertEqual(status, "CONVERSION_VERIFIED")
+        self.assertEqual(price, 1.0)
+        self.assertEqual(details["provider"], "chainlink")
+        self.assertEqual(details["provenance_id"], "0x8fa59a53f040d12d26f03bc9920373707c3c4004")
+        self.assertFalse(details["cryptographic_authenticity_verified"])
+
+    # 44. Arbitrary source string is rejected
+    def test_44_arbitrary_source_string_rejected(self):
+        conv_arbitrary_source = {
+            "price_usd": 1.0,
+            "chain": VALID_EVM_CHAIN,
+            "quote_asset": VALID_QUOTE_ADDR,
+            "timestamp_utc": self.as_of_utc,
+            "source": "untrusted_arbitrary_oracle_network",
+            "valuation_policy": "STABLECOIN_ORACLE_VERIFIED",
+            "feed_address": "0x8fa59a53f040d12d26f03bc9920373707c3c4004",
+        }
+        ok, status, price, details = validate_quote_usd_conversion(
+            conv_arbitrary_source,
+            expected_chain=VALID_EVM_CHAIN,
+            expected_quote_asset=VALID_QUOTE_ADDR,
+            as_of_utc=self.as_of_utc,
+        )
+        self.assertFalse(ok)
+        self.assertEqual(status, "UNVERIFIED_VALUATION_SOURCE")
+        self.assertIn("arbitrary or unrecognized valuation source", details["reason"])
+
+    # 45. Arbitrary provider name is rejected
+    def test_45_arbitrary_provider_name_rejected(self):
+        conv_arbitrary_provider = {
+            "price_usd": 1.0,
+            "chain": VALID_EVM_CHAIN,
+            "quote_asset": VALID_QUOTE_ADDR,
+            "timestamp_utc": self.as_of_utc,
+            "provider": "untrusted_pricing_corp",
+            "valuation_policy": "STABLECOIN_ORACLE_VERIFIED",
+            "feed_address": "0x8fa59a53f040d12d26f03bc9920373707c3c4004",
+        }
+        ok, status, price, details = validate_quote_usd_conversion(
+            conv_arbitrary_provider,
+            expected_chain=VALID_EVM_CHAIN,
+            expected_quote_asset=VALID_QUOTE_ADDR,
+            as_of_utc=self.as_of_utc,
+        )
+        self.assertFalse(ok)
+        self.assertEqual(status, "UNVERIFIED_VALUATION_SOURCE")
+        self.assertIn("arbitrary or unrecognized valuation provider", details["reason"])
+
+    # 46. Unrecognized valuation policy is rejected
+    def test_46_unrecognized_valuation_policy_rejected(self):
+        conv_unrecognized_policy = {
+            "price_usd": 1.0,
+            "chain": VALID_EVM_CHAIN,
+            "quote_asset": VALID_QUOTE_ADDR,
+            "timestamp_utc": self.as_of_utc,
+            "source": "chainlink",
+            "feed_address": "0x8fa59a53f040d12d26f03bc9920373707c3c4004",
+            "valuation_policy": "TRUST_ME_BRO_POLICY",
+        }
+        ok, status, price, details = validate_quote_usd_conversion(
+            conv_unrecognized_policy,
+            expected_chain=VALID_EVM_CHAIN,
+            expected_quote_asset=VALID_QUOTE_ADDR,
+            as_of_utc=self.as_of_utc,
+        )
+        self.assertFalse(ok)
+        self.assertEqual(status, "UNRECOGNIZED_VALUATION_POLICY")
+        self.assertIn("unrecognized valuation policy", details["reason"])
+
+    # 47. Missing provider/feed provenance fails closed
+    def test_47_missing_provider_feed_provenance_fails_closed(self):
+        conv_no_provenance = {
+            "price_usd": 1.0,
+            "chain": VALID_EVM_CHAIN,
+            "quote_asset": VALID_QUOTE_ADDR,
+            "timestamp_utc": self.as_of_utc,
+            "source": "chainlink",
+            "valuation_policy": "STABLECOIN_ORACLE_VERIFIED",
+            # No feed_address, feed_id, pair_id, etc.
+        }
+        ok, status, price, details = validate_quote_usd_conversion(
+            conv_no_provenance,
+            expected_chain=VALID_EVM_CHAIN,
+            expected_quote_asset=VALID_QUOTE_ADDR,
+            as_of_utc=self.as_of_utc,
+        )
+        self.assertFalse(ok)
+        self.assertEqual(status, "MISSING_CONVERSION_PROVENANCE")
+        self.assertIn("missing valuation provenance", details["reason"])
+
+    # 48. simulate() rejects bare quote_usd_price when conversion is required
+    def test_48_simulate_rejects_bare_quote_usd_price_when_conversion_required(self):
+        book = {
+            "chain": VALID_EVM_CHAIN,
+            "pool_address": VALID_POOL_ADDR,
+            "token_address": VALID_TOKEN_ADDR,
+            "quote_asset": VALID_QUOTE_ADDR,
+            "denomination": "USDC",
+            "timestamp_utc": self.as_of_utc,
+            "bids": [[99.0, 10.0]],
+            "asks": [[101.0, 10.0]],
+        }
+        with self.assertRaisesRegex(ValueError, "MISSING_QUOTE_CONVERSION_EVIDENCE"):
+            simulate(
+                book,
+                buy_notional_usd=100.0,
+                quote_usd_price=1.0,
+                require_quote_conversion=True,
+            )
+
+    # 49. simulate_constant_product_amm() rejects bare quote_usd_price when conversion is required
+    def test_49_amm_rejects_bare_quote_usd_price_when_conversion_required(self):
+        with self.assertRaisesRegex(ValueError, "MISSING_QUOTE_CONVERSION_EVIDENCE"):
+            simulate_constant_product_amm(
+                reserve0=10_000.0,
+                reserve1=50_000.0,
+                buy_notional_usd=100.0,
+                chain=VALID_EVM_CHAIN,
+                pool_address=VALID_POOL_ADDR,
+                token0=VALID_TOKEN_ADDR,
+                token1=VALID_QUOTE_ADDR,
+                timestamp_utc=self.as_of_utc,
+                expected_token_address=VALID_TOKEN_ADDR,
+                expected_quote_asset=VALID_QUOTE_ADDR,
+                quote_usd_price=1.0,
+                require_quote_conversion=True,
+            )
+
+    # 50. simulate_multi_size() rejects missing or invalid conversion evidence
+    def test_50_simulate_multi_size_rejects_missing_or_invalid_conversion_evidence(self):
+        # Case A: Missing conversion evidence when required
+        res_missing = simulate_multi_size(
+            {"liquidity_usd": 50_000},
+            sizes_usd=[100.0],
+            require_quote_conversion=True,
+        )
+        self.assertEqual(res_missing["status"], "MISSING_QUOTE_CONVERSION_EVIDENCE")
+        self.assertFalse(res_missing["size_evaluations"]["$100"]["route_available"])
+
+        # Case B: Arbitrary source in conversion evidence
+        res_arbitrary = simulate_multi_size(
+            {
+                "liquidity_usd": 50_000,
+                "quote_usd_conversion": {
+                    "price_usd": 1.0,
+                    "chain": VALID_EVM_CHAIN,
+                    "quote_asset": VALID_QUOTE_ADDR,
+                    "timestamp_utc": self.as_of_utc,
+                    "source": "fake_source",
+                    "valuation_policy": "STABLECOIN_ORACLE_VERIFIED",
+                    "feed_address": "0x8fa59a53f040d12d26f03bc9920373707c3c4004",
+                },
+            },
+            sizes_usd=[100.0],
+            as_of_utc=self.as_of_utc,
+            expected_token_address=VALID_TOKEN_ADDR,
+            expected_quote_asset=VALID_QUOTE_ADDR,
+            require_quote_conversion=True,
+        )
+        self.assertEqual(res_arbitrary["status"], "UNVERIFIED_VALUATION_SOURCE")
+        self.assertFalse(res_arbitrary["size_evaluations"]["$100"]["route_available"])
+
+    # 51. Production qualification gate cannot qualify a candidate using fabricated conversion provenance
+    def test_51_production_gate_rejects_fabricated_conversion_provenance(self):
+        cand_fake = copy.deepcopy(self.valid_quote_source)
+        cand_fake.update({
+            "market_type": "dex_pool",
+            "final_pool_address": VALID_POOL_ADDR,
+            "final_token_contract": VALID_TOKEN_ADDR,
+            "final_quote_chain": VALID_EVM_CHAIN,
+            "final_quote_token_orientation_verified": True,
+            "final_price_verified": True,
+            "final_price_usd": 100.0,
+            "target_price": 140.0,
+            "target_price_source": "7D_SWING_RESISTANCE",
+            "fee_bps": 30.0,
+            "technical_tp_validation": {
+                "status": "PASS",
+                "chain": VALID_EVM_CHAIN,
+                "pool_address": VALID_POOL_ADDR,
+                "token_address": VALID_TOKEN_ADDR,
+                "token_orientation_verified": True,
+                "target_price": 140.0,
+                "target_price_source": "7D_SWING_RESISTANCE",
+                "current_price": 100.0,
+                "atr_1h_pct": 10.0,
+                "maximum_tp_distance_pct": 40.0,
+                "candle_retrieved_utc": self.as_of_utc,
+            },
+            "trade_plan": {"single_take_profit": 140.0, "intended_trade_size_usd": 100.0, "quote_token_address": VALID_QUOTE_ADDR},
+            "dex_loss_guard_status": "PASS",
+            "dex_loss_guard_evidence": {
+                "status": "PASS",
+                "checks": {
+                    "exact_token_and_pool_identity": True,
+                    "launch_wallet_analysis": True,
+                    "lp_position_audit": True,
+                    "token_security_audit": True,
+                    "two_way_route_quotes": True,
+                },
+            },
+            "safety_verified": True,
+            "executable_route_verified": True,
+            "quote_usd_conversion": {
+                "price_usd": 1.0,
+                "chain": VALID_EVM_CHAIN,
+                "quote_asset": VALID_QUOTE_ADDR,
+                "timestamp_utc": self.as_of_utc,
+                "source": "fabricated_oracle_network",
+                "provider": "fabricated_provider",
+                "valuation_policy": "FABRICATED_PEG_POLICY",
+                "feed_address": "0x8fa59a53f040d12d26f03bc9920373707c3c4004",
+            },
+        })
+        qualified = v425.qualify_final_actionable_candidates([cand_fake], self.now_dt)
+        self.assertEqual(len(qualified), 0)
+        self.assertTrue(any("quote-asset USD conversion verification failed" in b for b in cand_fake["qualification_blockers"]))
 
 
 if __name__ == "__main__":

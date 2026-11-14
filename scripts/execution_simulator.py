@@ -180,7 +180,10 @@ def simulate(
             raise ValueError("MISSING_QUOTE_DENOMINATION: order-book snapshot missing quote-currency denomination")
 
     # Resolve conversion rate
-    conv = quote_usd_conversion or book.get("quote_usd_conversion")
+    conv = quote_usd_conversion or (book.get("quote_usd_conversion") if isinstance(book, dict) else None)
+    if require_quote_conversion and not conv:
+        raise ValueError("MISSING_QUOTE_CONVERSION_EVIDENCE: quote-asset USD conversion evidence is required; bare numeric quote_usd_price cannot satisfy this requirement")
+
     if conv:
         ok, status, rate, details = validate_quote_usd_conversion(
             conv,
@@ -405,6 +408,70 @@ def validate_timestamp_freshness(
     return True, "FRESH", age_seconds
 
 
+# Trusted Provider and Valuation Policy Registries
+RECOGNIZED_VALUATION_PROVIDERS: dict[str, dict[str, Any]] = {
+    "chainlink": {
+        "name": "Chainlink Decentralized Oracle Network",
+        "aliases": {"chainlink", "chainlink_oracle", "chainlink_feed", "chainlink_oracle_usd", "chainlink_oracle_eth_usd"},
+        "requires_feed_provenance": True,
+    },
+    "pyth": {
+        "name": "Pyth Network High-Fidelity On-Demand Oracle",
+        "aliases": {"pyth", "pyth_network", "pyth_oracle"},
+        "requires_feed_provenance": True,
+    },
+    "uniswap_v3_twap": {
+        "name": "Uniswap v3 On-Chain TWAP Oracle",
+        "aliases": {"uniswap_v3_twap", "uniswap_twap", "uni_v3_twap"},
+        "requires_feed_provenance": True,
+    },
+    "defillama": {
+        "name": "DefiLlama Multi-Chain Price API",
+        "aliases": {"defillama", "defillama_prices", "defillama_api"},
+        "requires_feed_provenance": True,
+    },
+    "geckoterminal": {
+        "name": "GeckoTerminal Validated Token Price API",
+        "aliases": {"geckoterminal", "geckoterminal_api", "geckoterminal_price"},
+        "requires_feed_provenance": True,
+    },
+    "dexscreener": {
+        "name": "DexScreener Multi-Chain Pair API",
+        "aliases": {"dexscreener", "dexscreener_api", "dexscreener_price"},
+        "requires_feed_provenance": True,
+    },
+    "coinbase": {
+        "name": "Coinbase Institutional Public Market Reference",
+        "aliases": {"coinbase", "coinbase_oracle", "coinbase_pro"},
+        "requires_feed_provenance": True,
+    },
+    "binance": {
+        "name": "Binance Public Market Reference Ticker",
+        "aliases": {"binance", "binance_ticker", "binance_market"},
+        "requires_feed_provenance": True,
+    },
+    "kraken": {
+        "name": "Kraken Public Market Reference Ticker",
+        "aliases": {"kraken", "kraken_ticker"},
+        "requires_feed_provenance": True,
+    },
+}
+
+ALL_RECOGNIZED_PROVIDER_ALIASES: set[str] = set()
+for prov_key, prov_data in RECOGNIZED_VALUATION_PROVIDERS.items():
+    ALL_RECOGNIZED_PROVIDER_ALIASES.add(prov_key)
+    ALL_RECOGNIZED_PROVIDER_ALIASES.update(prov_data.get("aliases", set()))
+
+RECOGNIZED_VALUATION_POLICIES: dict[str, str] = {
+    "STABLECOIN_ORACLE_VERIFIED": "Empirical price reported by trusted oracle for a fiat-backed or multi-collateral stablecoin; never assumes hardcoded $1.00.",
+    "CRYPTO_ORACLE_VERIFIED": "Empirical price reported by trusted oracle for a native/crypto quote asset (e.g. WETH, SOL).",
+    "ON_CHAIN_TWAP_VERIFIED": "Time-weighted average price verified directly from on-chain liquidity pool reserves.",
+    "DEX_AGGREGATOR_VERIFIED": "Multi-venue volume-weighted market reference from trusted indexer/aggregator.",
+    "CEX_MARKET_TICKER_VERIFIED": "Consolidated public market reference from tier-1 centralized exchange ticker.",
+    "STABLECOIN_DEVIATION_BAND_POLICY": "Empirical stablecoin valuation verified to reside within acceptable depeg tolerance bands without assuming constant $1.00.",
+}
+
+
 def validate_quote_usd_conversion(
     conversion: Any,
     *,
@@ -413,15 +480,18 @@ def validate_quote_usd_conversion(
     as_of_utc: str | None = None,
     max_conversion_age_seconds: float = 300.0,
 ) -> tuple[bool, str, float | None, dict[str, Any]]:
-    """Validate quote-asset/USD conversion evidence.
+    """Validate quote-asset/USD conversion evidence and provenance.
 
     Requires:
     - conversion evidence dictionary with explicit price_usd, timestamp_utc, chain, and quote_asset.
     - price_usd must be positive and finite.
     - chain must match expected_chain.
-    - quote_asset must match expected_quote_asset.
+    - quote_asset must match expected_quote_asset and have syntactically valid address format.
     - timestamp_utc must be timezone-aware UTC, not future-dated, and fresh relative to as_of_utc.
-    - explicit source or valuation_policy.
+    - source/provider must identify a recognized trusted valuation provider; arbitrary strings rejected (UNVERIFIED_VALUATION_SOURCE).
+    - valuation_policy must match an approved policy; arbitrary or self-declared pegs rejected (UNRECOGNIZED_VALUATION_POLICY / UNVERIFIED_VALUATION_SOURCE).
+    - feed/provenance metadata must bind the price to the exact quote-token address and chain (MISSING_CONVERSION_PROVENANCE).
+    - does not claim cryptographic authenticity unless verified.
 
     Returns:
     (is_valid, status, price_usd, details)
@@ -502,25 +572,92 @@ def validate_quote_usd_conversion(
                 "reason": f"conversion quote asset address format invalid: {conv_asset}"
             }
 
-    # 5. Valuation source / policy validation
-    source = (
-        conversion.get("source") or
-        conversion.get("provider") or
-        conversion.get("valuation_policy") or
-        conversion.get("oracle")
-    )
-    if not source:
+    # 5. Valuation source / provider validation
+    raw_source = conversion.get("source")
+    raw_provider = conversion.get("provider")
+    raw_oracle = conversion.get("oracle")
+
+    if not raw_source and not raw_provider and not raw_oracle:
         return False, "UNVERIFIED_VALUATION_SOURCE", None, {
-            "reason": "quote-asset USD conversion lacks explicit, verified valuation source or policy"
+            "reason": "quote-asset USD conversion lacks explicit valuation source or provider"
         }
+
+    if raw_source:
+        norm_source = str(raw_source).strip().lower()
+        if norm_source not in ALL_RECOGNIZED_PROVIDER_ALIASES:
+            return False, "UNVERIFIED_VALUATION_SOURCE", None, {
+                "reason": f"arbitrary or unrecognized valuation source: {raw_source!r}"
+            }
+
+    if raw_provider:
+        norm_provider = str(raw_provider).strip().lower()
+        if norm_provider not in ALL_RECOGNIZED_PROVIDER_ALIASES:
+            return False, "UNVERIFIED_VALUATION_SOURCE", None, {
+                "reason": f"arbitrary or unrecognized valuation provider: {raw_provider!r}"
+            }
+
+    if raw_oracle:
+        norm_oracle = str(raw_oracle).strip().lower()
+        if norm_oracle not in ALL_RECOGNIZED_PROVIDER_ALIASES:
+            return False, "UNVERIFIED_VALUATION_SOURCE", None, {
+                "reason": f"arbitrary or unrecognized valuation oracle: {raw_oracle!r}"
+            }
+
+    # 6. Valuation policy validation
+    raw_policy = conversion.get("valuation_policy") or conversion.get("policy")
+    if not raw_policy:
+        return False, "UNRECOGNIZED_VALUATION_POLICY", None, {
+            "reason": "quote-asset USD conversion lacks explicit valuation policy"
+        }
+    norm_policy = str(raw_policy).strip().upper()
+    if norm_policy not in RECOGNIZED_VALUATION_POLICIES:
+        return False, "UNRECOGNIZED_VALUATION_POLICY", None, {
+            "reason": f"unrecognized valuation policy: {raw_policy!r}"
+        }
+
+    # Reject self-declared peg or assumed constant valuations
+    if conversion.get("self_declared_peg") is True or conversion.get("assumed_peg") is True or norm_policy == "SELF_DECLARED_PEG":
+        return False, "UNVERIFIED_VALUATION_SOURCE", None, {
+            "reason": "self-declared stablecoin peg rejected; empirical oracle valuation required"
+        }
+
+    # 7. Feed / Provenance metadata binding
+    provenance_id = (
+        conversion.get("feed_address") or
+        conversion.get("feed_id") or
+        conversion.get("aggregator_address") or
+        conversion.get("oracle_address") or
+        conversion.get("pool_id") or
+        conversion.get("pair_id") or
+        conversion.get("pair_address") or
+        conversion.get("market_id") or
+        conversion.get("source_url") or
+        conversion.get("query_id")
+    )
+    if not provenance_id or not str(provenance_id).strip():
+        return False, "MISSING_CONVERSION_PROVENANCE", None, {
+            "reason": "missing valuation provenance: feed_address, feed_id, pair_id, pool_id, or source_url required to bind USD price to asset"
+        }
+    prov_str = str(provenance_id).strip()
+
+    if "feed_address" in conversion or "aggregator_address" in conversion or "oracle_address" in conversion:
+        addr_val = str(conversion.get("feed_address") or conversion.get("aggregator_address") or conversion.get("oracle_address")).strip()
+        if not is_valid_address(effective_chain, addr_val):
+            return False, "INVALID_TOKEN_ADDRESS", None, {
+                "reason": f"invalid oracle feed address format for chain {effective_chain}: {addr_val}"
+            }
 
     return True, "CONVERSION_VERIFIED", clean_price, {
         "price_usd": clean_price,
         "chain": conv_chain,
         "quote_asset": conv_asset,
-        "source": source,
-        "valuation_policy": conversion.get("valuation_policy") or source,
+        "source": str(raw_source or raw_provider or raw_oracle).strip(),
+        "provider": str(raw_provider or raw_source or raw_oracle).strip(),
+        "valuation_policy": norm_policy,
+        "provenance_id": prov_str,
         "age_seconds": round(age, 1) if age is not None else None,
+        "verification_method": "TRUSTED_PROVIDER_FEED_METADATA_AND_FRESHNESS_VERIFIED",
+        "cryptographic_authenticity_verified": False,
     }
 
 
@@ -948,6 +1085,9 @@ def simulate_constant_product_amm(
 
     # Step 3: Resolve quote-asset USD conversion rate
     conv = quote_usd_conversion
+    if require_quote_conversion and not conv:
+        raise ValueError("MISSING_QUOTE_CONVERSION_EVIDENCE: quote-asset USD conversion evidence is required; bare numeric quote_usd_price cannot satisfy this requirement")
+
     if conv:
         ok, status, rate, details = validate_quote_usd_conversion(
             conv,
@@ -1431,6 +1571,8 @@ def simulate_multi_size(
                     "QUOTE_CONVERSION_CHAIN_MISMATCH",
                     "QUOTE_CONVERSION_ASSET_MISMATCH",
                     "UNVERIFIED_VALUATION_SOURCE",
+                    "UNRECOGNIZED_VALUATION_POLICY",
+                    "MISSING_CONVERSION_PROVENANCE",
                 ):
                     if code in err_msg:
                         status_code = code
@@ -1626,6 +1768,8 @@ def simulate_multi_size(
                     "QUOTE_CONVERSION_CHAIN_MISMATCH",
                     "QUOTE_CONVERSION_ASSET_MISMATCH",
                     "UNVERIFIED_VALUATION_SOURCE",
+                    "UNRECOGNIZED_VALUATION_POLICY",
+                    "MISSING_CONVERSION_PROVENANCE",
                     "MISSING_AMM_POOL_IDENTITY", "AMM_POOL_MISMATCH",
                     "MISSING_AMM_CHAIN_IDENTITY", "AMM_CHAIN_MISMATCH",
                     "MISSING_AMM_TOKEN_IDENTITY", "AMM_TOKEN_MISMATCH",

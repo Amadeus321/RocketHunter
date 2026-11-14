@@ -777,6 +777,8 @@ class FinalActionableGateTests(unittest.TestCase):
                 "quote_asset": self.quote_address,
                 "timestamp_utc": now_iso,
                 "source": "chainlink_oracle_usd",
+                "provider": "chainlink",
+                "feed_address": "0x8fa59a53f040d12d26f03bc9920373707c3c4004",
                 "valuation_policy": "STABLECOIN_ORACLE_VERIFIED",
             },
             "liquidity_usd": 150000,

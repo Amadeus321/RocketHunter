@@ -157,6 +157,8 @@ class TestEngineDiagnostics:
                 "quote_asset": "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48",
                 "timestamp_utc": now.isoformat(),
                 "source": "chainlink_oracle_usd",
+                "provider": "chainlink",
+                "feed_address": "0x8fa59a53f040d12d26f03bc9920373707c3c4004",
                 "valuation_policy": "STABLECOIN_ORACLE_VERIFIED",
             },
         }

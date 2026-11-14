@@ -1971,6 +1971,8 @@ def qualify_final_actionable_candidates(candidates: list[dict[str, Any]], now: d
                 "QUOTE_CONVERSION_CHAIN_MISMATCH",
                 "QUOTE_CONVERSION_ASSET_MISMATCH",
                 "UNVERIFIED_VALUATION_SOURCE",
+                "UNRECOGNIZED_VALUATION_POLICY",
+                "MISSING_CONVERSION_PROVENANCE",
                 "MISSING_QUOTE_DENOMINATION",
             } or sim_res.get("status") in {
                 "MISSING_QUOTE_CONVERSION_EVIDENCE",
@@ -1981,6 +1983,8 @@ def qualify_final_actionable_candidates(candidates: list[dict[str, Any]], now: d
                 "QUOTE_CONVERSION_CHAIN_MISMATCH",
                 "QUOTE_CONVERSION_ASSET_MISMATCH",
                 "UNVERIFIED_VALUATION_SOURCE",
+                "UNRECOGNIZED_VALUATION_POLICY",
+                "MISSING_CONVERSION_PROVENANCE",
                 "MISSING_QUOTE_DENOMINATION",
             }:
                 err_code = sim_status if sim_status in {
@@ -1992,6 +1996,8 @@ def qualify_final_actionable_candidates(candidates: list[dict[str, Any]], now: d
                     "QUOTE_CONVERSION_CHAIN_MISMATCH",
                     "QUOTE_CONVERSION_ASSET_MISMATCH",
                     "UNVERIFIED_VALUATION_SOURCE",
+                    "UNRECOGNIZED_VALUATION_POLICY",
+                    "MISSING_CONVERSION_PROVENANCE",
                     "MISSING_QUOTE_DENOMINATION",
                 } else sim_res.get("status")
                 sim_blockers.append(f"quote-asset USD conversion verification failed: {err_code}")
