@@ -20,6 +20,8 @@ from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Any, Iterable
 
+from scripts.address_identity import validate_and_build_identity
+
 PIPELINE_VERSION = "4.18.1"
 CORE_RUNTIME_VERSION = "4.15.3"
 EARLY_BREAKOUT_SIGNAL_VERSION = "v4.25-early-breakout.v1"
@@ -119,8 +121,12 @@ def _canonical_address(chain: str, address: Any) -> str:
     return value
 
 
-def market_key(row: dict[str, Any]) -> str | None:
-    """Version-2 stable DEX identity: chain + token/mint + pool/pair."""
+def legacy_pipe_market_key(row: dict[str, Any]) -> str | None:
+    """Explicitly labelled legacy v4.18 pipe-separated market key.
+
+    Preserved only for backward-compatibility with historical pre-v4.30 memory partitions.
+    Never compare silently with canonical colon-separated identities.
+    """
     market_type = str(row.get("market_type") or row.get("type") or "unknown").strip().lower()
     is_dex = is_dex_pool(row) or market_type in {"dex_token", "dex_pool"}
     if is_dex:
@@ -137,23 +143,19 @@ def market_key(row: dict[str, Any]) -> str | None:
         if not chain or not contract or not pool:
             return None
         return f"dex|{chain}|token:{contract}|pool:{pool}"
+    return None
 
-    # Preserve the prior CEX/catalogue behavior.
-    identity = str(row.get("identity") or "").strip().lower()
-    provider_or_venue = str(row.get("venue") or (
-        row.get("source") if market_type in {"cex_spot", "cex_perp", "spot", "perpetual"} else ""
-    ) or "").strip().lower()
-    quote = str(row.get("quote_symbol") or "").strip().lower()
-    if identity and (row.get("contract_address") or row.get("address") or provider_or_venue):
-        return "|".join((identity, "", provider_or_venue, quote))
-    chain = str(row.get("chain") or "").strip().lower()
-    contract = str(row.get("contract_address") or row.get("address") or "").strip().lower()
-    if chain and contract:
-        return "|".join((chain, contract, "", provider_or_venue, quote, market_type))
-    catalogue_id = str(row.get("id") or "").strip().lower()
-    source = str(row.get("source") or "").strip().lower()
-    if catalogue_id and source:
-        return f"catalogue|{source}|{catalogue_id}"
+
+def market_key(row: dict[str, Any]) -> str | None:
+    """Canonical market identity builder delegating to shared address_identity module.
+
+    Emits single canonical format across RocketHunter:
+    - DEX: dex:<chain>:<token>:<pool>
+    - CEX: cex:<exchange>:<market_type>:<trading_pair>
+    """
+    res = validate_and_build_identity(row)
+    if res.get("is_valid"):
+        return res.get("canonical_identity")
     return None
 
 def add_flag(row: dict[str, Any], flag: str) -> None:

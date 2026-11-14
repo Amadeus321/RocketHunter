@@ -7,7 +7,7 @@ from pathlib import Path
 
 from scripts.v418_pipeline import (
     age_classify, asset_age_hours, collect_rows, fingerprint_clusters, grade_outcomes,
-    make_forecast_record, market_key, process_snapshot, read_jsonl_gz,
+    make_forecast_record, market_key, legacy_pipe_market_key, process_snapshot, read_jsonl_gz,
 )
 from scripts import v425_early_breakout
 
@@ -182,8 +182,10 @@ class V418QualityTests(unittest.TestCase):
         self.assertIsNone(market_key({"symbol": "ABC", "asset": "ABC"}))
 
     def test_market_key_supports_chain_contract_without_prebuilt_identity(self):
-        key = market_key({"chain": "base", "contract_address": "0xabc", "pool_address": "0xpool", "market_type": "dex_pool", "source": "gecko"})
-        self.assertEqual(key, "dex|base|token:0xabc|pool:0xpool")
+        row = {"chain": "base", "contract_address": "0xabc", "pool_address": "0xpool", "market_type": "dex_pool", "source": "gecko"}
+        key = market_key(row)
+        self.assertEqual(key, "dex:base:0xabc:0xpool")
+        self.assertEqual(legacy_pipe_market_key(row), "dex|base|token:0xabc|pool:0xpool")
 
     def test_dex_market_key_requires_chain_token_and_exact_pool(self):
         self.assertIsNone(market_key({

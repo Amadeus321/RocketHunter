@@ -75,6 +75,7 @@ class TestChronologicalBacktest:
                 "age_hours": 12.0,
                 "mfe_pct": 45.0 if hit_tp else 15.0,
                 "mae_pct": -8.0,
+                "hours_to_target": 3.5 if hit_tp else None,
                 "outcome_classification": "TARGET_REACHED" if hit_tp else "TARGET_NOT_REACHED",
             })
 
@@ -174,6 +175,7 @@ class TestChronologicalBacktest:
             "record_id": "rec_pool_a",
             "market_key": "dex:solana:TokenX:PoolA",
             "exact_identity": "dex:solana:TokenX:PoolA",
+            "timestamp": dt.datetime(2026, 11, 1, 12, 0, tzinfo=dt.timezone.utc),
             "timestamp_utc": "2026-11-01T12:00:00Z",
             "detection_price": 1.0,
             "raw_record": {},
@@ -182,6 +184,7 @@ class TestChronologicalBacktest:
             "record_id": "rec_pool_b",
             "market_key": "dex:solana:TokenX:PoolB",
             "exact_identity": "dex:solana:TokenX:PoolB",
+            "timestamp": dt.datetime(2026, 11, 1, 12, 0, tzinfo=dt.timezone.utc),
             "timestamp_utc": "2026-11-01T12:00:00Z",
             "detection_price": 0.8,
             "raw_record": {},
@@ -194,6 +197,7 @@ class TestChronologicalBacktest:
                 "outcome_classification": "TARGET_REACHED",
                 "target_reached": True,
                 "mfe_pct": 55.0,
+                "hours_to_target": 2.0,
             },
             # If an attempt is made to join Pool B with Pool A's outcome, it must be rejected!
             "rec_pool_b": {
@@ -201,6 +205,7 @@ class TestChronologicalBacktest:
                 "outcome_classification": "TARGET_REACHED",
                 "target_reached": True,
                 "mfe_pct": 55.0,
+                "hours_to_target": 2.0,
             },
         }
 
@@ -272,12 +277,17 @@ class TestChronologicalBacktest:
         item = {
             "record_id": "rec_future_test",
             "market_key": "dex:solana:MintFrozen:PoolFrozen",
+            "timestamp": dt.datetime(2026, 11, 1, 12, 0, tzinfo=dt.timezone.utc),
             "timestamp_utc": "2026-11-01T12:00:00Z",
             "detection_price": 1.0,
             "score": 88.0,
             "raw_record": {
+                "chain": "solana",
+                "contract_address": "MintFrozen",
+                "pool_address": "PoolFrozen",
                 "outcome_classification": "TARGET_REACHED",
                 "mfe_pct": 65.0,
+                "hours_to_target": 3.0,
                 "price_usd_at_outcome": 2.5,  # Future price!
             },
         }
@@ -296,9 +306,13 @@ class TestChronologicalBacktest:
         item = {
             "record_id": "rec_incomplete",
             "market_key": "dex:solana:MintInc:PoolInc",
+            "timestamp": dt.datetime(2026, 11, 1, 12, 0, tzinfo=dt.timezone.utc),
             "timestamp_utc": "2026-11-01T12:00:00Z",
             "detection_price": 1.0,
             "raw_record": {
+                "chain": "solana",
+                "contract_address": "MintInc",
+                "pool_address": "PoolInc",
                 "outcome_classification": "UNKNOWN_DUE_TO_GAP",
                 "mfe_pct": 50.0,  # Even if an unverified MFE is claimed during a gap, must remain incomplete!
             },
@@ -423,10 +437,14 @@ class TestChronologicalBacktest:
         item = {
             "record_id": "rec_contradictory_1",
             "market_key": "dex:solana:TokenX:PoolA",
+            "timestamp": dt.datetime(2026, 11, 1, 12, 0, tzinfo=dt.timezone.utc),
             "timestamp_utc": "2026-11-01T12:00:00Z",
             "detection_price": 1.0,
             "technical_tp_pct": 40.0,
             "raw_record": {
+                "chain": "solana",
+                "contract_address": "TokenX",
+                "pool_address": "PoolA",
                 "outcome_classification": "TARGET_NOT_REACHED",
                 "mfe_pct": 52.0,  # Contradicts TARGET_NOT_REACHED!
                 "mae_pct": -5.0,
@@ -445,13 +463,18 @@ class TestChronologicalBacktest:
         item = {
             "record_id": "rec_contradictory_2",
             "market_key": "dex:solana:TokenX:PoolA",
+            "timestamp": dt.datetime(2026, 11, 1, 12, 0, tzinfo=dt.timezone.utc),
             "timestamp_utc": "2026-11-01T12:00:00Z",
             "detection_price": 1.0,
             "technical_tp_pct": 40.0,
             "raw_record": {
+                "chain": "solana",
+                "contract_address": "TokenX",
+                "pool_address": "PoolA",
                 "outcome_classification": "TARGET_REACHED",
                 "mfe_pct": 18.0,  # Contradicts TARGET_REACHED!
                 "mae_pct": -5.0,
+                "hours_to_target": 4.0,
             },
         }
         res = evaluator._resolve_outcome(item, lookup=None)
@@ -468,10 +491,14 @@ class TestChronologicalBacktest:
         item_a = {
             "record_id": "rec_touch_outside_a",
             "market_key": "dex:solana:TokenX:PoolA",
+            "timestamp": dt.datetime(2026, 11, 1, 12, 0, tzinfo=dt.timezone.utc),
             "timestamp_utc": "2026-11-01T12:00:00Z",
             "detection_price": 1.0,
             "technical_tp_pct": 40.0,
             "raw_record": {
+                "chain": "solana",
+                "contract_address": "TokenX",
+                "pool_address": "PoolA",
                 "outcome_classification": "TARGET_REACHED",
                 "mfe_pct": 60.0,
                 "hours_to_target": 27.5,  # > 24.0h!
@@ -491,6 +518,9 @@ class TestChronologicalBacktest:
             "detection_price": 1.0,
             "technical_tp_pct": 40.0,
             "raw_record": {
+                "chain": "solana",
+                "contract_address": "TokenX",
+                "pool_address": "PoolA",
                 "outcome_classification": "TARGET_REACHED",
                 "mfe_pct": 60.0,
                 "touch_timestamp_utc": "2026-11-02T16:00:00Z",  # 28 hours later!
@@ -512,6 +542,9 @@ class TestChronologicalBacktest:
             "detection_price": 1.0,
             "technical_tp_pct": 40.0,
             "raw_record": {
+                "chain": "solana",
+                "contract_address": "TokenX",
+                "pool_address": "PoolA",
                 "outcome_classification": "TARGET_REACHED",
                 "mfe_pct": 60.0,
                 "touch_timestamp_utc": "2026-11-01T10:00:00Z",  # 2 hours before detection!
@@ -528,12 +561,17 @@ class TestChronologicalBacktest:
         item = {
             "record_id": "rec_frozen_target",
             "market_key": "dex:solana:TokenX:PoolA",
+            "timestamp": dt.datetime(2026, 11, 1, 12, 0, tzinfo=dt.timezone.utc),
             "timestamp_utc": "2026-11-01T12:00:00Z",
             "detection_price": 1.0,
             "technical_tp_pct": 50.0,  # Frozen target was +50.0%
             "raw_record": {
+                "chain": "solana",
+                "contract_address": "TokenX",
+                "pool_address": "PoolA",
                 "outcome_classification": "TARGET_REACHED",  # Provider claims reached based on +40%
                 "mfe_pct": 45.0,  # Reached 45%, which is < frozen 50% target!
+                "hours_to_target": 5.0,
             },
         }
         res = evaluator._resolve_outcome(item, lookup=None)
@@ -573,10 +611,14 @@ class TestChronologicalBacktest:
         item = {
             "record_id": "rec_exec_sep",
             "market_key": "dex:solana:TokenX:PoolA",
+            "timestamp": dt.datetime(2026, 11, 1, 12, 0, tzinfo=dt.timezone.utc),
             "timestamp_utc": "2026-11-01T12:00:00Z",
             "detection_price": 1.0,
             "technical_tp_pct": 40.0,
             "raw_record": {
+                "chain": "solana",
+                "contract_address": "TokenX",
+                "pool_address": "PoolA",
                 "outcome_classification": "TARGET_REACHED",
                 "mfe_pct": 45.0,
                 "hours_to_target": 4.0,
@@ -590,3 +632,207 @@ class TestChronologicalBacktest:
         assert res["target_reached"] is True
         assert res["execution_status"] == "EXECUTABLE"
         assert res["execution_net_return_pct"] == 36.2
+
+    def test_embedded_outcome_missing_identity_rejected(self):
+        """Regression 20: Embedded outcome missing canonical identity is strictly rejected with OUTCOME_IDENTITY_MISSING."""
+        evaluator = ChronologicalBacktestEvaluator([])
+        item = {
+            "record_id": "rec_embed_missing_id",
+            "market_key": "dex:solana:TokenX:PoolA",
+            "timestamp": dt.datetime(2026, 11, 1, 12, 0, tzinfo=dt.timezone.utc),
+            "timestamp_utc": "2026-11-01T12:00:00Z",
+            "detection_price": 1.0,
+            "raw_record": {
+                # Embedded outcome dictionary without identity fields
+                "outcome": {
+                    "outcome_classification": "TARGET_REACHED",
+                    "mfe_pct": 50.0,
+                    "hours_to_target": 3.0,
+                }
+            },
+        }
+        res = evaluator._resolve_outcome(item, lookup=None)
+        assert res["is_evaluated"] is False
+        assert res["outcome_classification"] == "OUTCOME_IDENTITY_MISSING"
+        assert "OUTCOME_IDENTITY_MISSING" in res["resolution_reason"]
+        assert evaluator.diagnostics["outcome_identity_missing_records"] == 1
+
+    def test_embedded_outcome_invalid_identity_rejected(self):
+        """Regression 21: Embedded outcome with conflicting/invalid identity is strictly rejected with OUTCOME_IDENTITY_INVALID."""
+        evaluator = ChronologicalBacktestEvaluator([])
+        item = {
+            "record_id": "rec_embed_invalid_id",
+            "market_key": "dex:solana:TokenX:PoolA",
+            "timestamp": dt.datetime(2026, 11, 1, 12, 0, tzinfo=dt.timezone.utc),
+            "timestamp_utc": "2026-11-01T12:00:00Z",
+            "detection_price": 1.0,
+            "raw_record": {
+                # Embedded outcome has conflicting pool representation in normalized_record
+                "outcome": {
+                    "chain": "solana",
+                    "contract_address": "TokenX",
+                    "pool_address": "PoolA",
+                    "normalized_record": {
+                        "pool_address": "PoolConflicting",
+                    },
+                    "outcome_classification": "TARGET_REACHED",
+                    "mfe_pct": 50.0,
+                    "hours_to_target": 3.0,
+                }
+            },
+        }
+        res = evaluator._resolve_outcome(item, lookup=None)
+        assert res["is_evaluated"] is False
+        assert res["outcome_classification"] == "OUTCOME_IDENTITY_INVALID"
+        assert "OUTCOME_IDENTITY_INVALID" in res["resolution_reason"]
+        assert evaluator.diagnostics["outcome_identity_invalid_records"] == 1
+
+    def test_embedded_outcome_different_pool_rejected(self):
+        """Regression 22: Embedded outcome for a different pool than the forecast is rejected with OUTCOME_IDENTITY_MISMATCH."""
+        evaluator = ChronologicalBacktestEvaluator([])
+        item = {
+            "record_id": "rec_embed_diff_pool",
+            "market_key": "dex:solana:TokenX:PoolA",
+            "timestamp": dt.datetime(2026, 11, 1, 12, 0, tzinfo=dt.timezone.utc),
+            "timestamp_utc": "2026-11-01T12:00:00Z",
+            "detection_price": 1.0,
+            "raw_record": {
+                # Embedded outcome has valid identity for PoolOther instead of PoolA
+                "outcome": {
+                    "chain": "solana",
+                    "contract_address": "TokenX",
+                    "pool_address": "PoolOther",
+                    "outcome_classification": "TARGET_REACHED",
+                    "mfe_pct": 50.0,
+                    "hours_to_target": 3.0,
+                }
+            },
+        }
+        res = evaluator._resolve_outcome(item, lookup=None)
+        assert res["is_evaluated"] is False
+        assert res["outcome_classification"] == "OUTCOME_IDENTITY_MISMATCH"
+        assert "OUTCOME_IDENTITY_MISMATCH" in res["resolution_reason"]
+        assert evaluator.diagnostics["outcome_identity_mismatch_records"] == 1
+
+    def test_target_reached_missing_touch_evidence_remains_unevaluated(self):
+        """Regression 23: TARGET_REACHED without verifiable touch time remains unevaluated with MISSING_TARGET_TOUCH_EVIDENCE."""
+        evaluator = ChronologicalBacktestEvaluator([])
+        item = {
+            "record_id": "rec_no_touch_time",
+            "market_key": "dex:solana:TokenX:PoolA",
+            "timestamp": dt.datetime(2026, 11, 1, 12, 0, tzinfo=dt.timezone.utc),
+            "timestamp_utc": "2026-11-01T12:00:00Z",
+            "detection_price": 1.0,
+            "raw_record": {
+                "chain": "solana",
+                "contract_address": "TokenX",
+                "pool_address": "PoolA",
+                "outcome_classification": "TARGET_REACHED",
+                "mfe_pct": 55.0,  # High MFE, but NO touch time or touch timestamp!
+                "hours_to_target": None,
+                "touch_timestamp_utc": None,
+            },
+        }
+        res = evaluator._resolve_outcome(item, lookup=None)
+        assert res["is_evaluated"] is False
+        assert res["target_reached"] is None
+        assert res["outcome_classification"] == "MISSING_TARGET_TOUCH_EVIDENCE"
+        assert evaluator.diagnostics["missing_touch_evidence_records"] == 1
+        assert evaluator.diagnostics["unresolved_outcomes"] == 1
+
+    def test_target_reached_missing_detection_time_rejected(self):
+        """Regression 24: TARGET_REACHED where detection timestamp is missing or naive is rejected as MISSING_DETECTION_TIME."""
+        evaluator = ChronologicalBacktestEvaluator([])
+        item = {
+            "record_id": "rec_naive_time",
+            "market_key": "dex:solana:TokenX:PoolA",
+            "timestamp": dt.datetime(2026, 11, 1, 12, 0),  # Naive, non-tz-aware datetime!
+            "timestamp_utc": "2026-11-01T12:00:00",
+            "detection_price": 1.0,
+            "raw_record": {
+                "chain": "solana",
+                "contract_address": "TokenX",
+                "pool_address": "PoolA",
+                "outcome_classification": "TARGET_REACHED",
+                "mfe_pct": 55.0,
+                "hours_to_target": 4.0,
+            },
+        }
+        res = evaluator._resolve_outcome(item, lookup=None)
+        assert res["is_evaluated"] is False
+        assert res["outcome_classification"] == "MISSING_DETECTION_TIME"
+        assert evaluator.diagnostics["missing_detection_time_records"] == 1
+
+    def test_conflicting_touch_timestamp_and_elapsed_time_rejected(self):
+        """Regression 25: Disagreement between touch timestamp and claimed elapsed time triggers OUTCOME_EVIDENCE_CONFLICT."""
+        evaluator = ChronologicalBacktestEvaluator([])
+        item = {
+            "record_id": "rec_touch_conflict",
+            "market_key": "dex:solana:TokenX:PoolA",
+            "timestamp": dt.datetime(2026, 11, 1, 12, 0, tzinfo=dt.timezone.utc),
+            "timestamp_utc": "2026-11-01T12:00:00Z",
+            "detection_price": 1.0,
+            "raw_record": {
+                "chain": "solana",
+                "contract_address": "TokenX",
+                "pool_address": "PoolA",
+                "outcome_classification": "TARGET_REACHED",
+                "mfe_pct": 55.0,
+                "touch_timestamp_utc": "2026-11-01T14:00:00Z",  # 2.0h elapsed
+                "hours_to_target": 7.5,  # Claimed 7.5h: disagrees by 5.5h (tolerance 0.1h)!
+            },
+        }
+        res = evaluator._resolve_outcome(item, lookup=None)
+        assert res["is_evaluated"] is False
+        assert res["outcome_classification"] == "OUTCOME_EVIDENCE_CONFLICT"
+        assert "conflicts with claimed elapsed time" in res["resolution_reason"]
+        assert evaluator.diagnostics["evidence_conflict_records"] == 1
+
+    def test_valid_target_touch_inside_24h_window_evaluated(self):
+        """Regression 26: Consistent touch timestamp and elapsed hours within 0–24h window are verified."""
+        evaluator = ChronologicalBacktestEvaluator([])
+        item = {
+            "record_id": "rec_valid_touch",
+            "market_key": "dex:solana:TokenX:PoolA",
+            "timestamp": dt.datetime(2026, 11, 1, 12, 0, tzinfo=dt.timezone.utc),
+            "timestamp_utc": "2026-11-01T12:00:00Z",
+            "detection_price": 1.0,
+            "raw_record": {
+                "chain": "solana",
+                "contract_address": "TokenX",
+                "pool_address": "PoolA",
+                "outcome_classification": "TARGET_REACHED",
+                "mfe_pct": 55.0,
+                "touch_timestamp_utc": "2026-11-01T16:30:00Z",  # 4.5h elapsed
+                "hours_to_target": 4.5,
+            },
+        }
+        res = evaluator._resolve_outcome(item, lookup=None)
+        assert res["is_evaluated"] is True
+        assert res["market_target_reached"] is True
+        assert res["target_reached"] is True
+        assert res["hours_to_target"] == 4.5
+        assert evaluator.diagnostics["successfully_matched_outcomes"] == 1
+
+    def test_cross_module_canonical_identity_unification(self):
+        """Regression 27: scripts.v418_pipeline.market_key and scripts.address_identity produce the exact same canonical identity."""
+        from scripts import v418_pipeline, address_identity
+
+        test_cases = [
+            {"chain": "solana", "contract_address": "Mint1111111111111111111111111111111111111111", "pool_address": "PoolRaydium111111111111111111111111111111111", "market_type": "dex_pool"},
+            {"chain": "base", "contract_address": "0x1234567890abcdef1234567890abcdef12345678", "pool_address": "0xabcdef1234567890abcdef1234567890abcdef12", "market_type": "dex_pool"},
+            {"chain": "ethereum", "contract_address": "0xABCDEF1234567890ABCDEF1234567890ABCDEF12", "pool_address": "0x1111222233334444555566667777888899990000", "market_type": "dex_pool"},
+        ]
+
+        for case in test_cases:
+            pipe_key = v418_pipeline.market_key(case)
+            canon_res = address_identity.validate_and_build_identity(case)
+            assert canon_res["is_valid"] is True
+            canon_key = canon_res["canonical_identity"]
+            assert pipe_key == canon_key
+            assert pipe_key.startswith("dex:")
+            # Exactly 4 colon-separated parts: dex:<chain>:<token>:<pool>
+            parts = pipe_key.split(":")
+            assert len(parts) == 4
+            assert parts[0] == "dex"
+            assert parts[1] == case["chain"].lower()
