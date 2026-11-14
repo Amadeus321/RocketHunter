@@ -1,4 +1,6 @@
 import datetime as dt
+import hashlib
+import json
 from typing import Any
 import pytest
 from scripts.chronological_backtest import ChronologicalBacktestEvaluator
@@ -24,6 +26,11 @@ def make_valid_trace(
     interval_mismatch: bool = False,
     stale_hours: float | None = None,
     out_of_order: bool = False,
+    include_captured_response: bool = True,
+    corrupt_response_hash: bool = False,
+    corrupt_response_ohlc: bool = False,
+    corrupt_response_timestamps: bool = False,
+    unparsable_response: bool = False,
 ) -> dict[str, Any]:
     trace_end_dt = detection_dt + dt.timedelta(hours=duration_hours)
     retrieved_dt_str = retrieved_utc or (trace_end_dt + dt.timedelta(minutes=5)).isoformat()
@@ -81,7 +88,51 @@ def make_valid_trace(
         if out_of_order and len(candles) >= 2:
             candles[0], candles[1] = candles[1], candles[0]
 
-    return {
+    captured_resp: dict[str, Any] | None = None
+    if include_captured_response:
+        resp_candles = [
+            {
+                "timestamp_utc": c.get("timestamp_utc"),
+                "open": c.get("open"),
+                "high": c.get("high"),
+                "low": c.get("low"),
+                "close": c.get("close"),
+            }
+            for c in candles
+        ]
+        if corrupt_response_ohlc and len(resp_candles) > 0:
+            resp_candles[0]["high"] = (resp_candles[0]["high"] or 1.0) * 1.5 + 0.5
+        if corrupt_response_timestamps and len(resp_candles) > 0:
+            resp_candles[0]["timestamp_utc"] = (detection_dt + dt.timedelta(hours=10)).isoformat()
+
+        raw_payload = {
+            "status": "success",
+            "provider": provenance,
+            "market_key": market_key,
+            "candle_interval": interval,
+            "candles": resp_candles,
+        }
+        if unparsable_response:
+            raw_body_text = "INVALID_JSON{{{"
+        else:
+            raw_body_text = json.dumps(raw_payload, sort_keys=True)
+
+        if corrupt_response_hash:
+            content_hash = "deadbeef" * 8
+        else:
+            content_hash = hashlib.sha256(raw_body_text.encode("utf-8")).hexdigest()
+
+        captured_resp = {
+            "url": source_ref,
+            "request_url": source_ref,
+            "http_status": 200,
+            "retrieved_utc": retrieved_dt_str,
+            "content_hash": content_hash,
+            "response_sha256": content_hash,
+            "raw_body": raw_body_text,
+        }
+
+    res_dict: dict[str, Any] = {
         "provider": provenance,
         "trace_provenance": provenance,
         "source_ref": source_ref,
@@ -96,6 +147,9 @@ def make_valid_trace(
         "has_gaps": has_gaps,
         "candles": candles,
     }
+    if captured_resp is not None:
+        res_dict["captured_response"] = captured_resp
+    return res_dict
 
 
 class TestChronologicalBacktest:
@@ -2329,3 +2383,205 @@ class TestChronologicalBacktest:
         assert audit["provider"] == "geckoterminal"
         assert audit["source_domain"] == "api.geckoterminal.com"
         assert audit["provider_metadata"] == {"pool_id": "PoolA", "dex": "raydium", "response_ms": 142}
+        assert audit["evidence_level"] == "PROVIDER_ATTRIBUTED_INGESTION_AUDITED"
+        assert audit["content_hash_verified"] is True
+        assert audit["response_reconciliation_verified"] is True
+
+    # --- PHASE 1 FINAL PROVENANCE AUTHENTICITY TESTS (Regressions 79-85) ---
+
+    def test_valid_url_and_provider_without_captured_response_rejected(self):
+        """Regression 79: Valid provider name and allowlisted URL with fabricated candles but NO captured response is rejected."""
+        evaluator = ChronologicalBacktestEvaluator([])
+        t = dt.datetime(2026, 11, 1, 12, 0, tzinfo=dt.timezone.utc)
+        # Omit captured response
+        trace = make_valid_trace("dex:solana:TokenX:PoolA", t, duration_hours=24.0, mfe_pct=45.0, touch_hours=2.0, include_captured_response=False)
+        item = {
+            "record_id": "rec_no_captured_resp",
+            "market_key": "dex:solana:TokenX:PoolA",
+            "timestamp": t,
+            "timestamp_utc": "2026-11-01T12:00:00Z",
+            "detection_price": 1.0,
+            "raw_record": {
+                "chain": "solana",
+                "contract_address": "TokenX",
+                "pool_address": "PoolA",
+                "outcome_classification": "TARGET_REACHED",
+                "mfe_pct": 45.0,
+                "hours_to_target": 2.0,
+                "candle_trace": trace,
+            },
+        }
+        res = evaluator._resolve_outcome(item, lookup=None)
+        assert res["is_evaluated"] is False
+        assert res["outcome_classification"] == "MISSING_RESPONSE_EVIDENCE"
+        assert "MISSING_RESPONSE_EVIDENCE" in res["resolution_reason"]
+
+    def test_captured_response_ohlc_disagree_with_supplied_candles_rejected(self):
+        """Regression 80: Captured response whose OHLC values disagree with supplied candles is rejected as RESPONSE_CANDLE_OHLC_MISMATCH."""
+        evaluator = ChronologicalBacktestEvaluator([])
+        t = dt.datetime(2026, 11, 1, 12, 0, tzinfo=dt.timezone.utc)
+        trace = make_valid_trace("dex:solana:TokenX:PoolA", t, duration_hours=24.0, mfe_pct=45.0, touch_hours=2.0, corrupt_response_ohlc=True)
+        item = {
+            "record_id": "rec_resp_ohlc_mismatch",
+            "market_key": "dex:solana:TokenX:PoolA",
+            "timestamp": t,
+            "timestamp_utc": "2026-11-01T12:00:00Z",
+            "detection_price": 1.0,
+            "raw_record": {
+                "chain": "solana",
+                "contract_address": "TokenX",
+                "pool_address": "PoolA",
+                "outcome_classification": "TARGET_REACHED",
+                "mfe_pct": 45.0,
+                "hours_to_target": 2.0,
+                "candle_trace": trace,
+            },
+        }
+        res = evaluator._resolve_outcome(item, lookup=None)
+        assert res["is_evaluated"] is False
+        assert res["outcome_classification"] == "RESPONSE_CANDLE_OHLC_MISMATCH"
+        assert "RESPONSE_CANDLE_OHLC_MISMATCH" in res["resolution_reason"]
+
+    def test_captured_response_timestamps_disagree_with_supplied_candles_rejected(self):
+        """Regression 81: Captured response whose timestamps disagree with supplied candles is rejected as RESPONSE_CANDLE_TIMESTAMP_MISMATCH."""
+        evaluator = ChronologicalBacktestEvaluator([])
+        t = dt.datetime(2026, 11, 1, 12, 0, tzinfo=dt.timezone.utc)
+        trace = make_valid_trace("dex:solana:TokenX:PoolA", t, duration_hours=24.0, mfe_pct=45.0, touch_hours=2.0, corrupt_response_timestamps=True)
+        item = {
+            "record_id": "rec_resp_ts_mismatch",
+            "market_key": "dex:solana:TokenX:PoolA",
+            "timestamp": t,
+            "timestamp_utc": "2026-11-01T12:00:00Z",
+            "detection_price": 1.0,
+            "raw_record": {
+                "chain": "solana",
+                "contract_address": "TokenX",
+                "pool_address": "PoolA",
+                "outcome_classification": "TARGET_REACHED",
+                "mfe_pct": 45.0,
+                "hours_to_target": 2.0,
+                "candle_trace": trace,
+            },
+        }
+        res = evaluator._resolve_outcome(item, lookup=None)
+        assert res["is_evaluated"] is False
+        assert res["outcome_classification"] == "RESPONSE_CANDLE_TIMESTAMP_MISMATCH"
+        assert "RESPONSE_CANDLE_TIMESTAMP_MISMATCH" in res["resolution_reason"]
+
+    def test_missing_response_evidence_rejected(self):
+        """Regression 82: Record completely lacking captured response evidence remains is_evaluated=False with MISSING_RESPONSE_EVIDENCE."""
+        evaluator = ChronologicalBacktestEvaluator([])
+        t = dt.datetime(2026, 11, 1, 12, 0, tzinfo=dt.timezone.utc)
+        trace = make_valid_trace("dex:solana:TokenX:PoolA", t, duration_hours=24.0, mfe_pct=10.0, touch_hours=None)
+        trace.pop("captured_response", None)
+        item = {
+            "record_id": "rec_missing_resp_evidence",
+            "market_key": "dex:solana:TokenX:PoolA",
+            "timestamp": t,
+            "timestamp_utc": "2026-11-01T12:00:00Z",
+            "detection_price": 1.0,
+            "raw_record": {
+                "chain": "solana",
+                "contract_address": "TokenX",
+                "pool_address": "PoolA",
+                "outcome_classification": "TARGET_NOT_REACHED",
+                "mfe_pct": 10.0,
+                "candle_trace": trace,
+            },
+        }
+        res = evaluator._resolve_outcome(item, lookup=None)
+        assert res["is_evaluated"] is False
+        assert res["outcome_classification"] == "MISSING_RESPONSE_EVIDENCE"
+
+    def test_response_content_hash_mismatch_rejected(self):
+        """Regression 83: Captured response with tampered body or mismatched content hash is rejected as RESPONSE_CONTENT_HASH_MISMATCH."""
+        evaluator = ChronologicalBacktestEvaluator([])
+        t = dt.datetime(2026, 11, 1, 12, 0, tzinfo=dt.timezone.utc)
+        trace = make_valid_trace("dex:solana:TokenX:PoolA", t, duration_hours=24.0, mfe_pct=45.0, touch_hours=2.0, corrupt_response_hash=True)
+        item = {
+            "record_id": "rec_hash_mismatch",
+            "market_key": "dex:solana:TokenX:PoolA",
+            "timestamp": t,
+            "timestamp_utc": "2026-11-01T12:00:00Z",
+            "detection_price": 1.0,
+            "raw_record": {
+                "chain": "solana",
+                "contract_address": "TokenX",
+                "pool_address": "PoolA",
+                "outcome_classification": "TARGET_REACHED",
+                "mfe_pct": 45.0,
+                "hours_to_target": 2.0,
+                "candle_trace": trace,
+            },
+        }
+        res = evaluator._resolve_outcome(item, lookup=None)
+        assert res["is_evaluated"] is False
+        assert res["outcome_classification"] == "RESPONSE_CONTENT_HASH_MISMATCH"
+        assert "RESPONSE_CONTENT_HASH_MISMATCH" in res["resolution_reason"]
+
+    def test_unparsable_response_evidence_rejected(self):
+        """Regression 84: Captured response with unparsable payload is rejected as UNPARSABLE_RESPONSE_EVIDENCE."""
+        evaluator = ChronologicalBacktestEvaluator([])
+        t = dt.datetime(2026, 11, 1, 12, 0, tzinfo=dt.timezone.utc)
+        trace = make_valid_trace("dex:solana:TokenX:PoolA", t, duration_hours=24.0, mfe_pct=45.0, touch_hours=2.0, unparsable_response=True)
+        item = {
+            "record_id": "rec_unparsable_resp",
+            "market_key": "dex:solana:TokenX:PoolA",
+            "timestamp": t,
+            "timestamp_utc": "2026-11-01T12:00:00Z",
+            "detection_price": 1.0,
+            "raw_record": {
+                "chain": "solana",
+                "contract_address": "TokenX",
+                "pool_address": "PoolA",
+                "outcome_classification": "TARGET_REACHED",
+                "mfe_pct": 45.0,
+                "hours_to_target": 2.0,
+                "candle_trace": trace,
+            },
+        }
+        res = evaluator._resolve_outcome(item, lookup=None)
+        assert res["is_evaluated"] is False
+        assert res["outcome_classification"] == "UNPARSABLE_RESPONSE_EVIDENCE"
+        assert "UNPARSABLE_RESPONSE_EVIDENCE" in res["resolution_reason"]
+
+    def test_valid_captured_response_with_correctly_derived_candles_accepted(self):
+        """Regression 85: Valid captured response matching correctly derived candles is accepted and verified."""
+        evaluator = ChronologicalBacktestEvaluator([])
+        t = dt.datetime(2026, 11, 1, 12, 0, tzinfo=dt.timezone.utc)
+        trace = make_valid_trace(
+            "dex:solana:TokenX:PoolA",
+            t,
+            duration_hours=24.0,
+            mfe_pct=48.0,
+            touch_hours=2.5,
+            provenance="birdeye",
+            source_ref="https://public-api.birdeye.so/defi/history_price?address=TokenX",
+        )
+        item = {
+            "record_id": "rec_valid_captured_accepted",
+            "market_key": "dex:solana:TokenX:PoolA",
+            "timestamp": t,
+            "timestamp_utc": "2026-11-01T12:00:00Z",
+            "detection_price": 1.0,
+            "raw_record": {
+                "chain": "solana",
+                "contract_address": "TokenX",
+                "pool_address": "PoolA",
+                "outcome_classification": "TARGET_REACHED",
+                "mfe_pct": 48.0,
+                "hours_to_target": 2.5,
+                "candle_trace": trace,
+            },
+        }
+        res = evaluator._resolve_outcome(item, lookup=None)
+        assert res["is_evaluated"] is True
+        assert res["target_reached"] is True
+        assert res["hours_to_target"] == 2.5
+        audit = res["evidence_audit"]
+        assert audit["evidence_level"] == "PROVIDER_ATTRIBUTED_INGESTION_AUDITED"
+        assert audit["provider"] == "birdeye"
+        assert audit["source_domain"] == "public-api.birdeye.so"
+        assert audit["content_hash_verified"] is True
+        assert audit["response_reconciliation_verified"] is True
+        assert "not cryptographically signed" in audit["authenticity_note"]

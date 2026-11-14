@@ -97,12 +97,71 @@ CANDLE_TRACE_SCHEMA = {
         "trace_start_utc",     # trace window start ISO timestamp
         "trace_end_utc",       # trace window end ISO timestamp
         "candles",             # non-empty array of timestamped OHLC observations
+        "captured_response",   # immutable captured provider HTTP response evidence
     ],
     "candle_fields": ["timestamp_utc", "open", "high", "low", "close"],
+    "response_evidence_fields": ["request_url", "http_status", "content_hash", "raw_body"],
     "recognized_providers": sorted(RECOGNIZED_TRACE_PROVIDERS),
     "provider_domain_allowlist": {k: sorted(v) for k, v in PROVIDER_DOMAIN_ALLOWLIST.items()},
     "recognized_intervals": list(CANDLE_INTERVAL_SECONDS.keys()),
 }
+
+
+def extract_candles_from_response_payload(payload: Any) -> list[dict[str, Any]] | None:
+    """Extract candle observation dictionaries from standard provider response payloads.
+
+    Supports:
+    - Direct candles list: {"candles": [{"timestamp_utc": ..., "open": ..., ...}, ...]}
+    - Nested data: {"data": {"candles": [...]}}
+    - GeckoTerminal format: {"data": {"attributes": {"ohlcv_list": [[ts, o, h, l, c, v], ...]}}}
+    - DexScreener format: {"pairs": [{"candles": [...]}]} or {"candles": [...]}
+    - Binance/Bybit format: [[ts_ms, "open", "high", "low", "close", ...], ...]
+    - Raw candle array: [{"t": ..., "o": ..., "h": ..., "l": ..., "c": ...}, ...]
+    """
+    if isinstance(payload, dict):
+        if "candles" in payload and isinstance(payload["candles"], list):
+            return payload["candles"]
+        if "data" in payload and isinstance(payload["data"], dict):
+            if "candles" in payload["data"] and isinstance(payload["data"]["candles"], list):
+                return payload["data"]["candles"]
+            attrs = payload["data"].get("attributes")
+            if isinstance(attrs, dict) and "ohlcv_list" in attrs and isinstance(attrs["ohlcv_list"], list):
+                extracted = []
+                for entry in attrs["ohlcv_list"]:
+                    if isinstance(entry, (list, tuple)) and len(entry) >= 5:
+                        ts = entry[0]
+                        ts_str = dt.datetime.fromtimestamp(ts, tz=dt.timezone.utc).isoformat() if isinstance(ts, (int, float)) else str(ts)
+                        extracted.append({
+                            "timestamp_utc": ts_str,
+                            "open": entry[1], "high": entry[2], "low": entry[3], "close": entry[4],
+                        })
+                return extracted
+        if "pairs" in payload and isinstance(payload["pairs"], list) and len(payload["pairs"]) > 0:
+            first_pair = payload["pairs"][0]
+            if isinstance(first_pair, dict) and "candles" in first_pair and isinstance(first_pair["candles"], list):
+                return first_pair["candles"]
+
+    if isinstance(payload, list):
+        if len(payload) == 0:
+            return []
+        if isinstance(payload[0], dict):
+            return payload
+        if isinstance(payload[0], (list, tuple)):
+            extracted = []
+            for entry in payload:
+                if len(entry) >= 5:
+                    ts = entry[0]
+                    if isinstance(ts, (int, float)):
+                        ts_s = ts / 1000.0 if ts > 1e11 else float(ts)
+                        ts_str = dt.datetime.fromtimestamp(ts_s, tz=dt.timezone.utc).isoformat()
+                    else:
+                        ts_str = str(ts)
+                    extracted.append({
+                        "timestamp_utc": ts_str,
+                        "open": entry[1], "high": entry[2], "low": entry[3], "close": entry[4],
+                    })
+            return extracted
+    return None
 
 
 def normalize_trace_provider(raw_prov: Any) -> str | None:
@@ -1358,7 +1417,195 @@ class ChronologicalBacktestEvaluator:
                     "execution_net_return_pct": None,
                 }, None
 
-        # 13. Derive and Verify MFE and First-Touch Chronology
+        # 13. Verifiable Source-Response Evidence Reconciliation & Content Hashing (Fail-Closed)
+        captured_resp = (
+            trace.get("captured_response")
+            or trace.get("response_evidence")
+            or trace.get("raw_response")
+            or outcome_data.get("captured_response")
+            or outcome_data.get("response_evidence")
+        )
+        if not isinstance(captured_resp, dict):
+            self.diagnostics["unresolved_outcomes"] += 1
+            return False, {
+                "outcome_classification": "MISSING_RESPONSE_EVIDENCE",
+                "target_reached": None,
+                "market_target_reached": None,
+                "mfe_pct": mfe_pct,
+                "mae_pct": None,
+                "hours_to_target": None,
+                "is_evaluated": False,
+                "resolution_reason": "MISSING_RESPONSE_EVIDENCE: evaluated outcome requires captured provider HTTP response evidence",
+                "execution_status": exec_status,
+                "execution_net_return_pct": None,
+            }, None
+
+        raw_body = (
+            captured_resp.get("raw_body")
+            if "raw_body" in captured_resp
+            else (captured_resp.get("body") if "body" in captured_resp else captured_resp.get("payload"))
+        )
+        declared_hash = (
+            captured_resp.get("content_hash")
+            or captured_resp.get("response_sha256")
+            or captured_resp.get("hash")
+        )
+        resp_url = captured_resp.get("request_url") or captured_resp.get("url") or source_ref
+        resp_status = captured_resp.get("http_status") or captured_resp.get("status_code") or 200
+
+        if raw_body is None or declared_hash is None or not str(declared_hash).strip():
+            self.diagnostics["unresolved_outcomes"] += 1
+            return False, {
+                "outcome_classification": "MISSING_RESPONSE_EVIDENCE",
+                "target_reached": None,
+                "market_target_reached": None,
+                "mfe_pct": mfe_pct,
+                "mae_pct": None,
+                "hours_to_target": None,
+                "is_evaluated": False,
+                "resolution_reason": "MISSING_RESPONSE_EVIDENCE: captured response missing raw_body or content_hash",
+                "execution_status": exec_status,
+                "execution_net_return_pct": None,
+            }, None
+
+        # Verify content hash (fail-closed)
+        if isinstance(raw_body, str):
+            calc_hash = hashlib.sha256(raw_body.encode("utf-8")).hexdigest()
+        else:
+            calc_hash = hashlib.sha256(json.dumps(raw_body, sort_keys=True).encode("utf-8")).hexdigest()
+
+        if calc_hash.lower() != str(declared_hash).strip().lower():
+            self.diagnostics["unresolved_outcomes"] += 1
+            return False, {
+                "outcome_classification": "RESPONSE_CONTENT_HASH_MISMATCH",
+                "target_reached": None,
+                "market_target_reached": None,
+                "mfe_pct": mfe_pct,
+                "mae_pct": None,
+                "hours_to_target": None,
+                "is_evaluated": False,
+                "resolution_reason": f"RESPONSE_CONTENT_HASH_MISMATCH: calculated sha256 {calc_hash} != declared {declared_hash}",
+                "execution_status": exec_status,
+                "execution_net_return_pct": None,
+            }, None
+
+        # Parse raw response body
+        if isinstance(raw_body, str):
+            try:
+                parsed_body = json.loads(raw_body)
+            except Exception as exc:
+                self.diagnostics["unresolved_outcomes"] += 1
+                return False, {
+                    "outcome_classification": "UNPARSABLE_RESPONSE_EVIDENCE",
+                    "target_reached": None,
+                    "market_target_reached": None,
+                    "mfe_pct": mfe_pct,
+                    "mae_pct": None,
+                    "hours_to_target": None,
+                    "is_evaluated": False,
+                    "resolution_reason": f"UNPARSABLE_RESPONSE_EVIDENCE: failed to parse response JSON: {exc}",
+                    "execution_status": exec_status,
+                    "execution_net_return_pct": None,
+                }, None
+        else:
+            parsed_body = raw_body
+
+        resp_candles_raw = extract_candles_from_response_payload(parsed_body)
+        if resp_candles_raw is None or not isinstance(resp_candles_raw, list):
+            self.diagnostics["unresolved_outcomes"] += 1
+            return False, {
+                "outcome_classification": "UNPARSABLE_RESPONSE_EVIDENCE",
+                "target_reached": None,
+                "market_target_reached": None,
+                "mfe_pct": mfe_pct,
+                "mae_pct": None,
+                "hours_to_target": None,
+                "is_evaluated": False,
+                "resolution_reason": "UNPARSABLE_RESPONSE_EVIDENCE: response does not contain recognizable candle observations",
+                "execution_status": exec_status,
+                "execution_net_return_pct": None,
+            }, None
+
+        # Reconcile parsed response candles against sorted candles
+        parsed_resp_candles = []
+        for rc in resp_candles_raw:
+            if isinstance(rc, dict):
+                rc_ts = _parse_utc(rc.get("timestamp_utc") or rc.get("timestamp") or rc.get("t") or rc.get("time_open"))
+                if rc_ts is not None:
+                    parsed_resp_candles.append({
+                        "dt": rc_ts,
+                        "open": _clean_num(rc.get("open") if "open" in rc else rc.get("o")),
+                        "high": _clean_num(rc.get("high") if "high" in rc else rc.get("h")),
+                        "low": _clean_num(rc.get("low") if "low" in rc else rc.get("l")),
+                        "close": _clean_num(rc.get("close") if "close" in rc else rc.get("c")),
+                    })
+
+        parsed_resp_candles.sort(key=lambda x: x["dt"])
+
+        if len(parsed_resp_candles) != len(sorted_candles):
+            self.diagnostics["unresolved_outcomes"] += 1
+            return False, {
+                "outcome_classification": "RESPONSE_CANDLE_COUNT_MISMATCH",
+                "target_reached": None,
+                "market_target_reached": None,
+                "mfe_pct": mfe_pct,
+                "mae_pct": None,
+                "hours_to_target": None,
+                "is_evaluated": False,
+                "resolution_reason": (
+                    f"RESPONSE_CANDLE_COUNT_MISMATCH: response contains {len(parsed_resp_candles)} candles, "
+                    f"evaluator supplied {len(sorted_candles)} candles"
+                ),
+                "execution_status": exec_status,
+                "execution_net_return_pct": None,
+            }, None
+
+        for c_idx in range(len(sorted_candles)):
+            sc = sorted_candles[c_idx]
+            rc = parsed_resp_candles[c_idx]
+
+            # Reconcile timestamp
+            if abs((sc["dt"] - rc["dt"]).total_seconds()) > 60.0:
+                self.diagnostics["unresolved_outcomes"] += 1
+                return False, {
+                    "outcome_classification": "RESPONSE_CANDLE_TIMESTAMP_MISMATCH",
+                    "target_reached": None,
+                    "market_target_reached": None,
+                    "mfe_pct": mfe_pct,
+                    "mae_pct": None,
+                    "hours_to_target": None,
+                    "is_evaluated": False,
+                    "resolution_reason": (
+                        f"RESPONSE_CANDLE_TIMESTAMP_MISMATCH: candle at index {c_idx} timestamp {sc['dt'].isoformat()} "
+                        f"conflicts with captured response timestamp {rc['dt'].isoformat()}"
+                    ),
+                    "execution_status": exec_status,
+                    "execution_net_return_pct": None,
+                }, None
+
+            # Reconcile OHLC values
+            for ohlc_key in ("open", "high", "low", "close"):
+                s_val = sc[ohlc_key]
+                r_val = rc[ohlc_key]
+                if s_val is None or r_val is None or abs(s_val - r_val) > 1e-4:
+                    self.diagnostics["unresolved_outcomes"] += 1
+                    return False, {
+                        "outcome_classification": "RESPONSE_CANDLE_OHLC_MISMATCH",
+                        "target_reached": None,
+                        "market_target_reached": None,
+                        "mfe_pct": mfe_pct,
+                        "mae_pct": None,
+                        "hours_to_target": None,
+                        "is_evaluated": False,
+                        "resolution_reason": (
+                            f"RESPONSE_CANDLE_OHLC_MISMATCH: candle at index {c_idx} {ohlc_key} {s_val} "
+                            f"conflicts with captured response {ohlc_key} {r_val}"
+                        ),
+                        "execution_status": exec_status,
+                        "execution_net_return_pct": None,
+                    }, None
+
+        # 14. Derive and Verify MFE and First-Touch Chronology
         # Pre-detection candles must never contribute to MFE, MAE or target-touch calculations
         eval_candles = [c for c in sorted_candles if c["dt"] >= detection_dt]
         detection_price_val = detection_price if detection_price > 0 else 1.0
@@ -1495,6 +1742,11 @@ class ChronologicalBacktestEvaluator:
             "provider": norm_prov,
             "source_ref": source_ref,
             "source_domain": source_domain,
+            "request_url": resp_url,
+            "http_status": resp_status,
+            "content_hash": calc_hash,
+            "content_hash_verified": True,
+            "response_reconciliation_verified": True,
             "retrieved_utc": raw_retrieved,
             "provider_metadata": trace.get("provider_metadata") or trace.get("metadata") or trace.get("raw_response_metadata"),
         }
@@ -1816,11 +2068,21 @@ class ChronologicalBacktestEvaluator:
         market_target_reached = bool(outcome_status == "TARGET_REACHED")
         self.diagnostics["successfully_matched_outcomes"] += 1
         evidence_audit = {
+            "evidence_level": "PROVIDER_ATTRIBUTED_INGESTION_AUDITED",
             "provider": trace_info.get("provider") if trace_info else None,
             "source_ref": trace_info.get("source_ref") if trace_info else None,
             "source_domain": trace_info.get("source_domain") if trace_info else None,
+            "request_url": trace_info.get("request_url") if trace_info else None,
+            "http_status": trace_info.get("http_status") if trace_info else None,
+            "content_hash": trace_info.get("content_hash") if trace_info else None,
+            "content_hash_verified": trace_info.get("content_hash_verified") if trace_info else False,
+            "response_reconciliation_verified": trace_info.get("response_reconciliation_verified") if trace_info else False,
             "retrieved_utc": trace_info.get("retrieved_utc") if trace_info else None,
             "provider_metadata": trace_info.get("provider_metadata") if trace_info else None,
+            "authenticity_note": (
+                "Evidence is provider-attributed and ingestion-audited via captured HTTP response "
+                "reconciliation and SHA-256 content hashing. It is not cryptographically signed."
+            ),
         }
         return {
             "outcome_classification": outcome_status,
