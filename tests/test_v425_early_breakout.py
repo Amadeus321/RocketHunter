@@ -775,6 +775,7 @@ class FinalActionableGateTests(unittest.TestCase):
                 "price_usd": 1.0,
                 "chain": "ethereum",
                 "quote_asset": self.quote_address,
+                "reference_asset": "USD",
                 "timestamp_utc": now_iso,
                 "source": "chainlink_oracle_usd",
                 "provider": "chainlink",

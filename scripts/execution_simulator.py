@@ -64,6 +64,7 @@ def is_valid_address(chain: Any, address: Any) -> bool:
     Verifies structural format conformity against chain-specific encoding specifications:
     - EVM: strictly '0x' followed by exactly 40 hexadecimal characters (case-insensitive, 42 chars total).
       Non-hexadecimal characters and lengths other than 42 are strictly rejected.
+      Note: This performs structural hexadecimal-format validation, not EIP-55 checksum validation.
     - Solana: strictly Base58 string of 32 to 44 characters ([1-9A-HJ-NP-Za-km-z]{32,44}).
     - Generic/other: strictly 32 to 128 alphanumeric characters ([0-9a-zA-Z_-]{32,128}).
 
@@ -189,7 +190,7 @@ def simulate(
             conv,
             expected_chain=expected_chain or book.get("chain"),
             expected_quote_asset=expected_quote_asset or book.get("quote_asset") or book.get("quote_token"),
-            as_of_utc=as_of_utc,
+            as_of_utc=as_of_utc or book.get("timestamp_utc"),
             max_conversion_age_seconds=max_conversion_age_seconds,
         )
         if not ok:
@@ -462,6 +463,388 @@ for prov_key, prov_data in RECOGNIZED_VALUATION_PROVIDERS.items():
     ALL_RECOGNIZED_PROVIDER_ALIASES.add(prov_key)
     ALL_RECOGNIZED_PROVIDER_ALIASES.update(prov_data.get("aliases", set()))
 
+PROVIDER_ALIAS_MAP: dict[str, str] = {
+    # Chainlink
+    "chainlink": "chainlink",
+    "chainlink_oracle": "chainlink",
+    "chainlink_feed": "chainlink",
+    "chainlink_oracle_usd": "chainlink",
+    "chainlink_oracle_eth_usd": "chainlink",
+    # Pyth
+    "pyth": "pyth",
+    "pyth_network": "pyth",
+    "pyth_oracle": "pyth",
+    # Uniswap v3 TWAP
+    "uniswap_v3_twap": "uniswap_v3_twap",
+    "uniswap_twap": "uniswap_v3_twap",
+    "uni_v3_twap": "uniswap_v3_twap",
+    "uniswap_v3": "uniswap_v3_twap",
+    # DefiLlama
+    "defillama": "defillama",
+    "defillama_prices": "defillama",
+    "defillama_api": "defillama",
+    # GeckoTerminal
+    "geckoterminal": "geckoterminal",
+    "geckoterminal_api": "geckoterminal",
+    "geckoterminal_price": "geckoterminal",
+    # DexScreener
+    "dexscreener": "dexscreener",
+    "dexscreener_api": "dexscreener",
+    "dexscreener_price": "dexscreener",
+    # Coinbase
+    "coinbase": "coinbase",
+    "coinbase_oracle": "coinbase",
+    "coinbase_pro": "coinbase",
+    "coinbase_exchange": "coinbase",
+    # Binance
+    "binance": "binance",
+    "binance_ticker": "binance",
+    "binance_market": "binance",
+    # Kraken
+    "kraken": "kraken",
+    "kraken_ticker": "kraken",
+    "kraken_market": "kraken",
+}
+
+PROVIDER_ALLOWED_POLICIES: dict[str, set[str]] = {
+    "chainlink": {"STABLECOIN_ORACLE_VERIFIED", "CRYPTO_ORACLE_VERIFIED", "STABLECOIN_DEVIATION_BAND_POLICY"},
+    "pyth": {"STABLECOIN_ORACLE_VERIFIED", "CRYPTO_ORACLE_VERIFIED", "STABLECOIN_DEVIATION_BAND_POLICY"},
+    "uniswap_v3_twap": {"ON_CHAIN_TWAP_VERIFIED"},
+    "defillama": {"DEX_AGGREGATOR_VERIFIED"},
+    "geckoterminal": {"DEX_AGGREGATOR_VERIFIED"},
+    "dexscreener": {"DEX_AGGREGATOR_VERIFIED"},
+    "coinbase": {"CEX_MARKET_TICKER_VERIFIED"},
+    "binance": {"CEX_MARKET_TICKER_VERIFIED"},
+    "kraken": {"CEX_MARKET_TICKER_VERIFIED"},
+}
+
+TRUSTED_CHAINLINK_FEEDS: dict[str, dict[str, Any]] = {
+    # Ethereum Mainnet
+    "0x8fa59a53f040d12d26f03bc9920373707c3c4004": {
+        "chain": "ethereum",
+        "quote_asset": "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48",  # USDC
+        "symbol": "USDC/USD",
+        "usd_reference": "USD",
+        "allowed_policies": {"STABLECOIN_ORACLE_VERIFIED", "STABLECOIN_DEVIATION_BAND_POLICY"},
+    },
+    "0x5f4ec3df9cbd43714fe2740f5e3616155c5b8419": {
+        "chain": "ethereum",
+        "quote_asset": "0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2",  # WETH
+        "symbol": "ETH/USD",
+        "usd_reference": "USD",
+        "allowed_policies": {"CRYPTO_ORACLE_VERIFIED"},
+    },
+    "0x3e7d1eab03480b83a7d35d7647822ec73a6858c6": {
+        "chain": "ethereum",
+        "quote_asset": "0xdac17f958d2ee523a2206206994597c13d831ec7",  # USDT
+        "symbol": "USDT/USD",
+        "usd_reference": "USD",
+        "allowed_policies": {"STABLECOIN_ORACLE_VERIFIED", "STABLECOIN_DEVIATION_BAND_POLICY"},
+    },
+    # Arbitrum
+    "0x50834f3163758fcc1df9973b6e91f0f0f0434ac3": {
+        "chain": "arbitrum",
+        "quote_asset": "0xaf88d065e77c8cc2239327c5edb3a432268e5831",  # USDC
+        "symbol": "USDC/USD",
+        "usd_reference": "USD",
+        "allowed_policies": {"STABLECOIN_ORACLE_VERIFIED", "STABLECOIN_DEVIATION_BAND_POLICY"},
+    },
+    "0x639fe6ab55c921f74e7fac1ee960c0b6293ba612": {
+        "chain": "arbitrum",
+        "quote_asset": "0x82af49447d8a07e3bd95bd0d56f35241523fbab1",  # WETH
+        "symbol": "ETH/USD",
+        "usd_reference": "USD",
+        "allowed_policies": {"CRYPTO_ORACLE_VERIFIED"},
+    },
+    # Base
+    "0x7e860098f58bbfc8648a4311b374b1db673b2b82": {
+        "chain": "base",
+        "quote_asset": "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913",  # USDC
+        "symbol": "USDC/USD",
+        "usd_reference": "USD",
+        "allowed_policies": {"STABLECOIN_ORACLE_VERIFIED", "STABLECOIN_DEVIATION_BAND_POLICY"},
+    },
+    "0x71041dddad3595f9ced3dccfbe3d1f4b0a16bb70": {
+        "chain": "base",
+        "quote_asset": "0x4200000000000000000000000000000000000006",  # WETH
+        "symbol": "ETH/USD",
+        "usd_reference": "USD",
+        "allowed_policies": {"CRYPTO_ORACLE_VERIFIED"},
+    },
+}
+
+TRUSTED_PYTH_FEEDS: dict[str, dict[str, Any]] = {
+    # Pyth Solana USDC/USD
+    "0xeaa020c61cc479712813461ce153894a96a6c00b21ed0cfc2798d1f9a9e9c94a": {
+        "chains": {"solana", "ethereum", "arbitrum", "base"},
+        "quote_asset": {
+            "solana": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+            "ethereum": "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48",
+            "arbitrum": "0xaf88d065e77c8cc2239327c5edb3a432268e5831",
+            "base": "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913",
+        },
+        "symbol": "Crypto.USDC/USD",
+        "usd_reference": "USD",
+        "allowed_policies": {"STABLECOIN_ORACLE_VERIFIED", "STABLECOIN_DEVIATION_BAND_POLICY"},
+    },
+    # Pyth SOL/USD
+    "0xef0d8b6fda2ceba41da15d4095d1da392a0d2f8ed0c6c7bc0f4cfac8c280b56d": {
+        "chains": {"solana"},
+        "quote_asset": {
+            "solana": "So11111111111111111111111111111111111111112",
+        },
+        "symbol": "Crypto.SOL/USD",
+        "usd_reference": "USD",
+        "allowed_policies": {"CRYPTO_ORACLE_VERIFIED"},
+    },
+    # Pyth ETH/USD
+    "0xff61491a931112ddf1bd8147cd1b641375f79f5825126d665480874634fd0ace": {
+        "chains": {"ethereum", "arbitrum", "base", "solana"},
+        "quote_asset": {
+            "ethereum": "0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2",
+            "arbitrum": "0x82af49447d8a07e3bd95bd0d56f35241523fbab1",
+            "base": "0x4200000000000000000000000000000000000006",
+        },
+        "symbol": "Crypto.ETH/USD",
+        "usd_reference": "USD",
+        "allowed_policies": {"CRYPTO_ORACLE_VERIFIED"},
+    },
+}
+
+TRUSTED_UNISWAP_V3_POOLS: dict[str, dict[str, Any]] = {
+    # Ethereum USDC / WETH 500 bps (0.05%)
+    "0x88e6a0c2ddd26feeb64f039a2c41296fcb3f5640": {
+        "chain": "ethereum",
+        "token0": "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48",  # USDC
+        "token1": "0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2",  # WETH
+        "fee": 500,
+        "usd_reference": "USD",
+        "allowed_assets": {
+            "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48",
+            "0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2",
+        },
+        "allowed_policies": {"ON_CHAIN_TWAP_VERIFIED"},
+    },
+    # Ethereum USDC / USDT 100 bps (0.01%)
+    "0x3416cf6c708da44db26246036ddf2f3939040f43": {
+        "chain": "ethereum",
+        "token0": "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48",  # USDC
+        "token1": "0xdac17f958d2ee523a2206206994597c13d831ec7",  # USDT
+        "fee": 100,
+        "usd_reference": "USD",
+        "allowed_assets": {
+            "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48",
+            "0xdac17f958d2ee523a2206206994597c13d831ec7",
+        },
+        "allowed_policies": {"ON_CHAIN_TWAP_VERIFIED"},
+    },
+    # Base WETH / USDC 500 bps (0.05%)
+    "0xd0b53d9277642d899df5c87a3966a349a798f224": {
+        "chain": "base",
+        "token0": "0x4200000000000000000000000000000000000006",  # WETH
+        "token1": "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913",  # USDC
+        "fee": 500,
+        "usd_reference": "USD",
+        "allowed_assets": {
+            "0x4200000000000000000000000000000000000006",
+            "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913",
+        },
+        "allowed_policies": {"ON_CHAIN_TWAP_VERIFIED"},
+    },
+}
+
+TRUSTED_CEX_DOMAINS: dict[str, set[str]] = {
+    "coinbase": {"api.exchange.coinbase.com", "api.coinbase.com", "exchange.coinbase.com"},
+    "binance": {"api.binance.com", "data-api.binance.vision", "api1.binance.com", "api2.binance.com", "api3.binance.com"},
+    "kraken": {"api.kraken.com"},
+}
+
+TRUSTED_CEX_MARKETS: dict[str, dict[str, dict[str, Any]]] = {
+    "coinbase": {
+        "USDC-USD": {
+            "symbol": "USDC",
+            "usd_reference": "USD",
+            "allowed_assets": {
+                "ethereum": "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48",
+                "base": "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913",
+                "arbitrum": "0xaf88d065e77c8cc2239327c5edb3a432268e5831",
+                "solana": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+            },
+        },
+        "ETH-USD": {
+            "symbol": "WETH",
+            "usd_reference": "USD",
+            "allowed_assets": {
+                "ethereum": "0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2",
+                "base": "0x4200000000000000000000000000000000000006",
+                "arbitrum": "0x82af49447d8a07e3bd95bd0d56f35241523fbab1",
+            },
+        },
+        "SOL-USD": {
+            "symbol": "SOL",
+            "usd_reference": "USD",
+            "allowed_assets": {
+                "solana": "So11111111111111111111111111111111111111112",
+            },
+        },
+        "USDT-USD": {
+            "symbol": "USDT",
+            "usd_reference": "USD",
+            "allowed_assets": {
+                "ethereum": "0xdac17f958d2ee523a2206206994597c13d831ec7",
+            },
+        },
+    },
+    "binance": {
+        "USDCUSDT": {
+            "symbol": "USDC",
+            "usd_reference": "USD",
+            "allowed_assets": {
+                "ethereum": "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48",
+                "base": "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913",
+                "arbitrum": "0xaf88d065e77c8cc2239327c5edb3a432268e5831",
+                "solana": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+            },
+        },
+        "ETHUSDT": {
+            "symbol": "WETH",
+            "usd_reference": "USD",
+            "allowed_assets": {
+                "ethereum": "0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2",
+                "base": "0x4200000000000000000000000000000000000006",
+                "arbitrum": "0x82af49447d8a07e3bd95bd0d56f35241523fbab1",
+            },
+        },
+        "SOLUSDT": {
+            "symbol": "SOL",
+            "usd_reference": "USD",
+            "allowed_assets": {
+                "solana": "So11111111111111111111111111111111111111112",
+            },
+        },
+    },
+    "kraken": {
+        "USDCUSD": {
+            "symbol": "USDC",
+            "usd_reference": "USD",
+            "allowed_assets": {
+                "ethereum": "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48",
+                "base": "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913",
+                "arbitrum": "0xaf88d065e77c8cc2239327c5edb3a432268e5831",
+                "solana": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+            },
+        },
+        "ETHUSD": {
+            "symbol": "WETH",
+            "usd_reference": "USD",
+            "allowed_assets": {
+                "ethereum": "0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2",
+                "base": "0x4200000000000000000000000000000000000006",
+                "arbitrum": "0x82af49447d8a07e3bd95bd0d56f35241523fbab1",
+            },
+        },
+        "SOLUSD": {
+            "symbol": "SOL",
+            "usd_reference": "USD",
+            "allowed_assets": {
+                "solana": "So11111111111111111111111111111111111111112",
+            },
+        },
+    },
+}
+
+TRUSTED_DEX_AGG_DOMAINS: dict[str, set[str]] = {
+    "defillama": {"coins.llama.fi", "api.llama.fi"},
+    "geckoterminal": {"api.geckoterminal.com"},
+    "dexscreener": {"api.dexscreener.com"},
+}
+
+TRUSTED_DEX_AGG_PAIRS: dict[str, dict[str, dict[str, Any]]] = {
+    "defillama": {
+        "ethereum:0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48": {
+            "chain": "ethereum",
+            "quote_asset": "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48",
+            "symbol": "USDC",
+            "usd_reference": "USD",
+        },
+        "ethereum:0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2": {
+            "chain": "ethereum",
+            "quote_asset": "0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2",
+            "symbol": "WETH",
+            "usd_reference": "USD",
+        },
+        "solana:EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v": {
+            "chain": "solana",
+            "quote_asset": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+            "symbol": "USDC",
+            "usd_reference": "USD",
+        },
+        "solana:So11111111111111111111111111111111111111112": {
+            "chain": "solana",
+            "quote_asset": "So11111111111111111111111111111111111111112",
+            "symbol": "SOL",
+            "usd_reference": "USD",
+        },
+        "base:0x833589fcd6edb6e08f4c7c32d4f71b54bda02913": {
+            "chain": "base",
+            "quote_asset": "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913",
+            "symbol": "USDC",
+            "usd_reference": "USD",
+        },
+        "arbitrum:0xaf88d065e77c8cc2239327c5edb3a432268e5831": {
+            "chain": "arbitrum",
+            "quote_asset": "0xaf88d065e77c8cc2239327c5edb3a432268e5831",
+            "symbol": "USDC",
+            "usd_reference": "USD",
+        },
+    },
+    "geckoterminal": {
+        "eth_0x88e6a0c2ddd26feeb64f039a2c41296fcb3f5640": {
+            "chain": "ethereum",
+            "quote_asset": "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48",
+            "symbol": "USDC",
+            "usd_reference": "USD",
+        },
+        "base_0xd0b53d9277642d899df5c87a3966a349a798f224": {
+            "chain": "base",
+            "quote_asset": "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913",
+            "symbol": "USDC",
+            "usd_reference": "USD",
+        },
+    },
+    "dexscreener": {
+        "ethereum/0x88e6a0c2ddd26feeb64f039a2c41296fcb3f5640": {
+            "chain": "ethereum",
+            "quote_asset": "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48",
+            "symbol": "USDC",
+            "usd_reference": "USD",
+        },
+        "base/0xd0b53d9277642d899df5c87a3966a349a798f224": {
+            "chain": "base",
+            "quote_asset": "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913",
+            "symbol": "USDC",
+            "usd_reference": "USD",
+        },
+    },
+}
+
+
+def _extract_domain(url: Any) -> str:
+    """Extract hostname/domain from an HTTP/HTTPS URL string."""
+    if not isinstance(url, str):
+        return ""
+    m = re.search(r"https?://([^/:\?#]+)", url.strip().lower())
+    return m.group(1) if m else ""
+
+
+def _extract_cex_market_from_url(provider: str, url: str) -> str | None:
+    """Extract recognized CEX market symbol from a URL path or query string."""
+    u = url.upper()
+    for m in TRUSTED_CEX_MARKETS.get(provider, {}):
+        if m in u:
+            return m
+    return None
+
 RECOGNIZED_VALUATION_POLICIES: dict[str, str] = {
     "STABLECOIN_ORACLE_VERIFIED": "Empirical price reported by trusted oracle for a fiat-backed or multi-collateral stablecoin; never assumes hardcoded $1.00.",
     "CRYPTO_ORACLE_VERIFIED": "Empirical price reported by trusted oracle for a native/crypto quote asset (e.g. WETH, SOL).",
@@ -482,16 +865,22 @@ def validate_quote_usd_conversion(
 ) -> tuple[bool, str, float | None, dict[str, Any]]:
     """Validate quote-asset/USD conversion evidence and provenance.
 
-    Requires:
-    - conversion evidence dictionary with explicit price_usd, timestamp_utc, chain, and quote_asset.
-    - price_usd must be positive and finite.
-    - chain must match expected_chain.
-    - quote_asset must match expected_quote_asset and have syntactically valid address format.
-    - timestamp_utc must be timezone-aware UTC, not future-dated, and fresh relative to as_of_utc.
-    - source/provider must identify a recognized trusted valuation provider; arbitrary strings rejected (UNVERIFIED_VALUATION_SOURCE).
-    - valuation_policy must match an approved policy; arbitrary or self-declared pegs rejected (UNRECOGNIZED_VALUATION_POLICY / UNVERIFIED_VALUATION_SOURCE).
-    - feed/provenance metadata must bind the price to the exact quote-token address and chain (MISSING_CONVERSION_PROVENANCE).
-    - does not claim cryptographic authenticity unless verified.
+    Enforces:
+    - Complete conversion dictionary with positive, finite conversion price.
+    - Explicit, timezone-aware timestamp within max_conversion_age_seconds.
+    - Explicit chain identity matching expected_chain.
+    - Explicit quote asset address matching expected_quote_asset with valid format.
+    - Explicit USD reference asset identity (e.g. 'USD', 'USDC', 'USDT').
+    - Recognized valuation provider; conflicting provider evidence fails closed.
+    - Recognized valuation policy strictly compatible with that provider and feed type.
+    - Provider-specific feed registry binding:
+        - Chainlink: feed address registered in TRUSTED_CHAINLINK_FEEDS matching chain & asset.
+        - Pyth: feed ID registered in TRUSTED_PYTH_FEEDS matching chain & asset.
+        - Uniswap v3 TWAP: pool address registered in TRUSTED_UNISWAP_V3_POOLS matching chain & asset.
+        - CEX tickers (Coinbase, Binance, Kraken): registered market ID & trusted domain.
+        - DEX aggregators (DefiLlama, GeckoTerminal, DexScreener): registered pair ID & trusted domain.
+    - Arbitrary feed addresses, feed IDs, URLs, and market IDs are strictly rejected.
+    - Documents honestly that cryptographic signatures are not evaluated.
 
     Returns:
     (is_valid, status, price_usd, details)
@@ -531,12 +920,13 @@ def validate_quote_usd_conversion(
 
     # 3. Chain validation
     conv_chain = conversion.get("chain")
+    if not conv_chain or not str(conv_chain).strip():
+        return False, "MISSING_CONVERSION_CHAIN_IDENTITY", None, {
+            "reason": "quote-asset USD conversion evidence missing chain identity"
+        }
+    norm_chain = str(conv_chain).strip().lower()
     if expected_chain:
-        if not conv_chain:
-            return False, "MISSING_CONVERSION_CHAIN_IDENTITY", None, {
-                "reason": "quote-asset USD conversion evidence missing chain identity"
-            }
-        if str(conv_chain).strip().lower() != str(expected_chain).strip().lower():
+        if norm_chain != str(expected_chain).strip().lower():
             return False, "QUOTE_CONVERSION_CHAIN_MISMATCH", None, {
                 "reason": f"conversion chain ({conv_chain}) does not match expected ({expected_chain})",
                 "actual": conv_chain,
@@ -551,28 +941,42 @@ def validate_quote_usd_conversion(
         conversion.get("address")
     )
     effective_chain = expected_chain or conv_chain or "evm"
+    if not conv_asset or not str(conv_asset).strip():
+        return False, "MISSING_CONVERSION_ASSET_IDENTITY", None, {
+            "reason": "quote-asset USD conversion evidence missing quote asset address"
+        }
+    conv_asset_str = str(conv_asset).strip()
+    if not is_valid_address(effective_chain, conv_asset_str):
+        return False, "INVALID_TOKEN_ADDRESS", None, {
+            "reason": f"conversion quote asset address format invalid: {conv_asset_str}"
+        }
     if expected_quote_asset:
-        if not conv_asset:
-            return False, "MISSING_CONVERSION_ASSET_IDENTITY", None, {
-                "reason": "quote-asset USD conversion evidence missing quote asset address"
-            }
-        if not is_valid_address(effective_chain, conv_asset):
-            return False, "INVALID_TOKEN_ADDRESS", None, {
-                "reason": f"conversion quote asset address format invalid: {conv_asset}"
-            }
-        if not same_address(effective_chain, conv_asset, expected_quote_asset):
+        if not same_address(effective_chain, conv_asset_str, expected_quote_asset):
             return False, "QUOTE_CONVERSION_ASSET_MISMATCH", None, {
-                "reason": f"conversion quote asset ({conv_asset}) does not match expected ({expected_quote_asset})",
-                "actual": conv_asset,
+                "reason": f"conversion quote asset ({conv_asset_str}) does not match expected ({expected_quote_asset})",
+                "actual": conv_asset_str,
                 "expected": expected_quote_asset,
             }
-    elif conv_asset:
-        if not is_valid_address(effective_chain, conv_asset):
-            return False, "INVALID_TOKEN_ADDRESS", None, {
-                "reason": f"conversion quote asset address format invalid: {conv_asset}"
-            }
 
-    # 5. Valuation source / provider validation
+    # 5. USD reference asset validation
+    raw_usd_ref = (
+        conversion.get("usd_reference_asset") or
+        conversion.get("reference_asset") or
+        conversion.get("usd_reference") or
+        conversion.get("quote_reference") or
+        conversion.get("target_currency")
+    )
+    if not raw_usd_ref or not str(raw_usd_ref).strip():
+        return False, "MISSING_USD_REFERENCE_IDENTITY", None, {
+            "reason": "quote-asset USD conversion evidence missing USD reference asset identity (e.g. 'USD')"
+        }
+    norm_usd_ref = str(raw_usd_ref).strip().upper()
+    if norm_usd_ref not in {"USD", "USDC", "USDT", "USD_UNIT", "USD_REFERENCE"}:
+        return False, "MISMATCHED_USD_REFERENCE", None, {
+            "reason": f"unsupported or non-USD reference asset identity: '{raw_usd_ref}'"
+        }
+
+    # 6. Valuation source / provider recognition & cross-validation
     raw_source = conversion.get("source")
     raw_provider = conversion.get("provider")
     raw_oracle = conversion.get("oracle")
@@ -582,28 +986,24 @@ def validate_quote_usd_conversion(
             "reason": "quote-asset USD conversion lacks explicit valuation source or provider"
         }
 
-    if raw_source:
-        norm_source = str(raw_source).strip().lower()
-        if norm_source not in ALL_RECOGNIZED_PROVIDER_ALIASES:
-            return False, "UNVERIFIED_VALUATION_SOURCE", None, {
-                "reason": f"arbitrary or unrecognized valuation source: {raw_source!r}"
-            }
+    resolved_providers: set[str] = set()
+    for field_name, raw_val in (("source", raw_source), ("provider", raw_provider), ("oracle", raw_oracle)):
+        if raw_val:
+            val_norm = str(raw_val).strip().lower()
+            canonical_key = PROVIDER_ALIAS_MAP.get(val_norm)
+            if not canonical_key:
+                return False, "UNVERIFIED_VALUATION_SOURCE", None, {
+                    "reason": f"arbitrary or unrecognized valuation {field_name}: {raw_val!r}"
+                }
+            resolved_providers.add(canonical_key)
 
-    if raw_provider:
-        norm_provider = str(raw_provider).strip().lower()
-        if norm_provider not in ALL_RECOGNIZED_PROVIDER_ALIASES:
-            return False, "UNVERIFIED_VALUATION_SOURCE", None, {
-                "reason": f"arbitrary or unrecognized valuation provider: {raw_provider!r}"
-            }
+    if len(resolved_providers) > 1:
+        return False, "CONFLICTING_PROVIDER_EVIDENCE", None, {
+            "reason": f"conflicting provider evidence: source '{raw_source}' vs provider '{raw_provider}'"
+        }
+    canonical_provider = next(iter(resolved_providers))
 
-    if raw_oracle:
-        norm_oracle = str(raw_oracle).strip().lower()
-        if norm_oracle not in ALL_RECOGNIZED_PROVIDER_ALIASES:
-            return False, "UNVERIFIED_VALUATION_SOURCE", None, {
-                "reason": f"arbitrary or unrecognized valuation oracle: {raw_oracle!r}"
-            }
-
-    # 6. Valuation policy validation
+    # 7. Valuation policy validation
     raw_policy = conversion.get("valuation_policy") or conversion.get("policy")
     if not raw_policy:
         return False, "UNRECOGNIZED_VALUATION_POLICY", None, {
@@ -621,42 +1021,181 @@ def validate_quote_usd_conversion(
             "reason": "self-declared stablecoin peg rejected; empirical oracle valuation required"
         }
 
-    # 7. Feed / Provenance metadata binding
-    provenance_id = (
-        conversion.get("feed_address") or
-        conversion.get("feed_id") or
-        conversion.get("aggregator_address") or
-        conversion.get("oracle_address") or
-        conversion.get("pool_id") or
-        conversion.get("pair_id") or
-        conversion.get("pair_address") or
-        conversion.get("market_id") or
-        conversion.get("source_url") or
-        conversion.get("query_id")
-    )
-    if not provenance_id or not str(provenance_id).strip():
-        return False, "MISSING_CONVERSION_PROVENANCE", None, {
-            "reason": "missing valuation provenance: feed_address, feed_id, pair_id, pool_id, or source_url required to bind USD price to asset"
+    # Verify policy compatibility with provider
+    allowed_policies = PROVIDER_ALLOWED_POLICIES.get(canonical_provider, set())
+    if norm_policy not in allowed_policies:
+        return False, "INCOMPATIBLE_VALUATION_POLICY", None, {
+            "reason": f"valuation policy '{norm_policy}' is incompatible with provider '{canonical_provider}'"
         }
-    prov_str = str(provenance_id).strip()
 
-    if "feed_address" in conversion or "aggregator_address" in conversion or "oracle_address" in conversion:
-        addr_val = str(conversion.get("feed_address") or conversion.get("aggregator_address") or conversion.get("oracle_address")).strip()
-        if not is_valid_address(effective_chain, addr_val):
-            return False, "INVALID_TOKEN_ADDRESS", None, {
-                "reason": f"invalid oracle feed address format for chain {effective_chain}: {addr_val}"
+    # 8. Provider-specific feed identity binding
+    prov_str: str = ""
+
+    if canonical_provider == "chainlink":
+        feed_addr_raw = conversion.get("feed_address") or conversion.get("aggregator_address") or conversion.get("oracle_address")
+        if not feed_addr_raw or not str(feed_addr_raw).strip():
+            return False, "MISSING_CONVERSION_PROVENANCE", None, {
+                "reason": "missing valuation provenance: Chainlink conversion requires 'feed_address'"
             }
+        feed_addr = str(feed_addr_raw).strip()
+        if not is_valid_address(effective_chain, feed_addr):
+            return False, "INVALID_TOKEN_ADDRESS", None, {
+                "reason": f"invalid oracle feed address format for chain {effective_chain}: {feed_addr}"
+            }
+        feed_key = feed_addr.lower()
+        if feed_key not in TRUSTED_CHAINLINK_FEEDS:
+            return False, "UNRECOGNIZED_FEED_ADDRESS", None, {
+                "reason": f"Chainlink feed address '{feed_addr}' is not registered in trusted feed registry"
+            }
+        feed_info = TRUSTED_CHAINLINK_FEEDS[feed_key]
+        if str(feed_info["chain"]).lower() != norm_chain:
+            return False, "QUOTE_CONVERSION_CHAIN_MISMATCH", None, {
+                "reason": f"Chainlink feed '{feed_addr}' is registered on chain '{feed_info['chain']}', not '{norm_chain}'"
+            }
+        if not same_address(effective_chain, feed_info["quote_asset"], conv_asset_str):
+            return False, "QUOTE_CONVERSION_ASSET_MISMATCH", None, {
+                "reason": f"Chainlink feed '{feed_addr}' is registered for quote asset '{feed_info['quote_asset']}' ({feed_info['symbol']}), not '{conv_asset_str}'"
+            }
+        if norm_policy not in feed_info.get("allowed_policies", set()):
+            return False, "INCOMPATIBLE_VALUATION_POLICY", None, {
+                "reason": f"Chainlink feed '{feed_addr}' does not support policy '{norm_policy}'"
+            }
+        prov_str = feed_addr
+
+    elif canonical_provider == "pyth":
+        feed_id_raw = conversion.get("feed_id") or conversion.get("price_feed_id")
+        if not feed_id_raw or not str(feed_id_raw).strip():
+            return False, "MISSING_CONVERSION_PROVENANCE", None, {
+                "reason": "missing valuation provenance: Pyth conversion requires 'feed_id'"
+            }
+        feed_id = str(feed_id_raw).strip().lower()
+        if not feed_id.startswith("0x"):
+            feed_id = "0x" + feed_id
+        if feed_id not in TRUSTED_PYTH_FEEDS:
+            return False, "UNRECOGNIZED_FEED_ID", None, {
+                "reason": f"Pyth feed ID '{feed_id}' is not registered in trusted feed registry"
+            }
+        feed_info = TRUSTED_PYTH_FEEDS[feed_id]
+        if norm_chain not in feed_info["chains"]:
+            return False, "QUOTE_CONVERSION_CHAIN_MISMATCH", None, {
+                "reason": f"Pyth feed '{feed_id}' ({feed_info['symbol']}) does not support chain '{norm_chain}'"
+            }
+        expected_asset_for_chain = feed_info["quote_asset"].get(norm_chain)
+        if not expected_asset_for_chain or not same_address(norm_chain, expected_asset_for_chain, conv_asset_str):
+            return False, "QUOTE_CONVERSION_ASSET_MISMATCH", None, {
+                "reason": f"Pyth feed '{feed_id}' represents asset '{expected_asset_for_chain}', not '{conv_asset_str}'"
+            }
+        if norm_policy not in feed_info.get("allowed_policies", set()):
+            return False, "INCOMPATIBLE_VALUATION_POLICY", None, {
+                "reason": f"Pyth feed '{feed_id}' does not support policy '{norm_policy}'"
+            }
+        prov_str = feed_id
+
+    elif canonical_provider == "uniswap_v3_twap":
+        pool_raw = conversion.get("pool_id") or conversion.get("pool_address") or conversion.get("pair_address")
+        if not pool_raw or not str(pool_raw).strip():
+            return False, "MISSING_CONVERSION_PROVENANCE", None, {
+                "reason": "missing valuation provenance: Uniswap v3 TWAP conversion requires 'pool_id' or 'pool_address'"
+            }
+        pool_addr = str(pool_raw).strip()
+        if not is_valid_address(effective_chain, pool_addr):
+            return False, "INVALID_TOKEN_ADDRESS", None, {
+                "reason": f"invalid Uniswap v3 pool address format: {pool_addr}"
+            }
+        pool_key = pool_addr.lower()
+        if pool_key not in TRUSTED_UNISWAP_V3_POOLS:
+            return False, "UNRECOGNIZED_POOL_IDENTITY", None, {
+                "reason": f"Uniswap v3 TWAP pool '{pool_addr}' is not registered in trusted TWAP pool registry"
+            }
+        pool_info = TRUSTED_UNISWAP_V3_POOLS[pool_key]
+        if str(pool_info["chain"]).lower() != norm_chain:
+            return False, "QUOTE_CONVERSION_CHAIN_MISMATCH", None, {
+                "reason": f"Uniswap v3 TWAP pool belongs to chain '{pool_info['chain']}', not '{norm_chain}'"
+            }
+        if not any(same_address(effective_chain, a, conv_asset_str) for a in pool_info["allowed_assets"]):
+            return False, "QUOTE_CONVERSION_ASSET_MISMATCH", None, {
+                "reason": f"quote asset '{conv_asset_str}' is not an asset in Uniswap v3 TWAP pool '{pool_addr}'"
+            }
+        prov_str = pool_addr
+
+    elif canonical_provider in {"coinbase", "binance", "kraken"}:
+        market_id = conversion.get("market_id") or conversion.get("pair_id") or conversion.get("pair") or conversion.get("symbol")
+        source_url = conversion.get("source_url")
+        if not market_id and not source_url:
+            return False, "MISSING_CONVERSION_PROVENANCE", None, {
+                "reason": f"missing valuation provenance: {canonical_provider} conversion requires 'market_id' or 'source_url'"
+            }
+        if source_url:
+            domain = _extract_domain(source_url)
+            if domain not in TRUSTED_CEX_DOMAINS.get(canonical_provider, set()):
+                return False, "UNTRUSTED_SOURCE_URL", None, {
+                    "reason": f"untrusted source URL domain for {canonical_provider}: '{source_url}'"
+                }
+        market_key = str(market_id).strip().upper() if market_id else None
+        if not market_key and source_url:
+            market_key = _extract_cex_market_from_url(canonical_provider, source_url)
+        if not market_key or market_key not in TRUSTED_CEX_MARKETS.get(canonical_provider, {}):
+            return False, "UNRECOGNIZED_MARKET_IDENTITY", None, {
+                "reason": f"unrecognized market identifier '{market_key or market_id}' for {canonical_provider}"
+            }
+        market_info = TRUSTED_CEX_MARKETS[canonical_provider][market_key]
+        allowed_asset_for_chain = market_info["allowed_assets"].get(norm_chain)
+        if not allowed_asset_for_chain or not same_address(norm_chain, allowed_asset_for_chain, conv_asset_str):
+            return False, "QUOTE_CONVERSION_ASSET_MISMATCH", None, {
+                "reason": f"market '{market_key}' on {canonical_provider} represents asset '{market_info['symbol']}', not quote asset '{conv_asset_str}'"
+            }
+        prov_str = market_key
+
+    elif canonical_provider in {"defillama", "geckoterminal", "dexscreener"}:
+        feed_id = conversion.get("feed_id") or conversion.get("pair_id") or conversion.get("pool_id")
+        source_url = conversion.get("source_url")
+        if not feed_id and not source_url:
+            return False, "MISSING_CONVERSION_PROVENANCE", None, {
+                "reason": f"missing valuation provenance: {canonical_provider} conversion requires feed/pair/pool id or source_url"
+            }
+        if source_url:
+            domain = _extract_domain(source_url)
+            if domain not in TRUSTED_DEX_AGG_DOMAINS.get(canonical_provider, set()):
+                return False, "UNTRUSTED_SOURCE_URL", None, {
+                    "reason": f"untrusted source URL domain for {canonical_provider}: '{source_url}'"
+                }
+        pair_key = str(feed_id).strip() if feed_id else ""
+        if not pair_key and source_url:
+            for registered_pair in TRUSTED_DEX_AGG_PAIRS.get(canonical_provider, {}):
+                if registered_pair in source_url:
+                    pair_key = registered_pair
+                    break
+        if not pair_key or pair_key not in TRUSTED_DEX_AGG_PAIRS.get(canonical_provider, {}):
+            return False, "UNRECOGNIZED_MARKET_IDENTITY", None, {
+                "reason": f"unrecognized market/pair identifier '{pair_key or feed_id}' for {canonical_provider}"
+            }
+        pair_info = TRUSTED_DEX_AGG_PAIRS[canonical_provider][pair_key]
+        if str(pair_info["chain"]).lower() != norm_chain:
+            return False, "QUOTE_CONVERSION_CHAIN_MISMATCH", None, {
+                "reason": f"pair '{pair_key}' is on chain '{pair_info['chain']}', not '{norm_chain}'"
+            }
+        if not same_address(norm_chain, pair_info["quote_asset"], conv_asset_str):
+            return False, "QUOTE_CONVERSION_ASSET_MISMATCH", None, {
+                "reason": f"pair '{pair_key}' represents quote asset '{pair_info['quote_asset']}', not '{conv_asset_str}'"
+            }
+        prov_str = pair_key
+
+    else:
+        return False, "UNVERIFIED_VALUATION_SOURCE", None, {
+            "reason": f"provider '{canonical_provider}' cannot be verified with available evidence"
+        }
 
     return True, "CONVERSION_VERIFIED", clean_price, {
         "price_usd": clean_price,
         "chain": conv_chain,
-        "quote_asset": conv_asset,
+        "quote_asset": conv_asset_str,
+        "usd_reference_asset": norm_usd_ref,
         "source": str(raw_source or raw_provider or raw_oracle).strip(),
-        "provider": str(raw_provider or raw_source or raw_oracle).strip(),
+        "provider": canonical_provider,
         "valuation_policy": norm_policy,
         "provenance_id": prov_str,
         "age_seconds": round(age, 1) if age is not None else None,
-        "verification_method": "TRUSTED_PROVIDER_FEED_METADATA_AND_FRESHNESS_VERIFIED",
+        "verification_method": f"TRUSTED_{canonical_provider.upper()}_FEED_IDENTITY_BOUND_AND_FRESHNESS_VERIFIED",
         "cryptographic_authenticity_verified": False,
     }
 
@@ -1572,7 +2111,16 @@ def simulate_multi_size(
                     "QUOTE_CONVERSION_ASSET_MISMATCH",
                     "UNVERIFIED_VALUATION_SOURCE",
                     "UNRECOGNIZED_VALUATION_POLICY",
+                    "INCOMPATIBLE_VALUATION_POLICY",
                     "MISSING_CONVERSION_PROVENANCE",
+                    "MISSING_USD_REFERENCE_IDENTITY",
+                    "MISMATCHED_USD_REFERENCE",
+                    "UNRECOGNIZED_FEED_ADDRESS",
+                    "UNRECOGNIZED_FEED_ID",
+                    "UNRECOGNIZED_POOL_IDENTITY",
+                    "UNRECOGNIZED_MARKET_IDENTITY",
+                    "UNTRUSTED_SOURCE_URL",
+                    "CONFLICTING_PROVIDER_EVIDENCE",
                 ):
                     if code in err_msg:
                         status_code = code
@@ -1769,7 +2317,16 @@ def simulate_multi_size(
                     "QUOTE_CONVERSION_ASSET_MISMATCH",
                     "UNVERIFIED_VALUATION_SOURCE",
                     "UNRECOGNIZED_VALUATION_POLICY",
+                    "INCOMPATIBLE_VALUATION_POLICY",
                     "MISSING_CONVERSION_PROVENANCE",
+                    "MISSING_USD_REFERENCE_IDENTITY",
+                    "MISMATCHED_USD_REFERENCE",
+                    "UNRECOGNIZED_FEED_ADDRESS",
+                    "UNRECOGNIZED_FEED_ID",
+                    "UNRECOGNIZED_POOL_IDENTITY",
+                    "UNRECOGNIZED_MARKET_IDENTITY",
+                    "UNTRUSTED_SOURCE_URL",
+                    "CONFLICTING_PROVIDER_EVIDENCE",
                     "MISSING_AMM_POOL_IDENTITY", "AMM_POOL_MISMATCH",
                     "MISSING_AMM_CHAIN_IDENTITY", "AMM_CHAIN_MISMATCH",
                     "MISSING_AMM_TOKEN_IDENTITY", "AMM_TOKEN_MISMATCH",

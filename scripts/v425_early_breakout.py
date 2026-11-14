@@ -1962,7 +1962,7 @@ def qualify_final_actionable_candidates(candidates: list[dict[str, Any]], now: d
             if sim_status == "QUANTITY_MISMATCH":
                 sim_blockers.append("execution simulation round-trip token quantity mismatch")
 
-            if sim_status in {
+            conv_error_codes = {
                 "MISSING_QUOTE_CONVERSION_EVIDENCE",
                 "INVALID_QUOTE_CONVERSION_PRICE",
                 "STALE_QUOTE_CONVERSION",
@@ -1972,34 +1972,20 @@ def qualify_final_actionable_candidates(candidates: list[dict[str, Any]], now: d
                 "QUOTE_CONVERSION_ASSET_MISMATCH",
                 "UNVERIFIED_VALUATION_SOURCE",
                 "UNRECOGNIZED_VALUATION_POLICY",
+                "INCOMPATIBLE_VALUATION_POLICY",
                 "MISSING_CONVERSION_PROVENANCE",
                 "MISSING_QUOTE_DENOMINATION",
-            } or sim_res.get("status") in {
-                "MISSING_QUOTE_CONVERSION_EVIDENCE",
-                "INVALID_QUOTE_CONVERSION_PRICE",
-                "STALE_QUOTE_CONVERSION",
-                "FUTURE_DATED_QUOTE_CONVERSION",
-                "INVALID_QUOTE_CONVERSION_TIMESTAMP",
-                "QUOTE_CONVERSION_CHAIN_MISMATCH",
-                "QUOTE_CONVERSION_ASSET_MISMATCH",
-                "UNVERIFIED_VALUATION_SOURCE",
-                "UNRECOGNIZED_VALUATION_POLICY",
-                "MISSING_CONVERSION_PROVENANCE",
-                "MISSING_QUOTE_DENOMINATION",
-            }:
-                err_code = sim_status if sim_status in {
-                    "MISSING_QUOTE_CONVERSION_EVIDENCE",
-                    "INVALID_QUOTE_CONVERSION_PRICE",
-                    "STALE_QUOTE_CONVERSION",
-                    "FUTURE_DATED_QUOTE_CONVERSION",
-                    "INVALID_QUOTE_CONVERSION_TIMESTAMP",
-                    "QUOTE_CONVERSION_CHAIN_MISMATCH",
-                    "QUOTE_CONVERSION_ASSET_MISMATCH",
-                    "UNVERIFIED_VALUATION_SOURCE",
-                    "UNRECOGNIZED_VALUATION_POLICY",
-                    "MISSING_CONVERSION_PROVENANCE",
-                    "MISSING_QUOTE_DENOMINATION",
-                } else sim_res.get("status")
+                "MISSING_USD_REFERENCE_IDENTITY",
+                "MISMATCHED_USD_REFERENCE",
+                "UNRECOGNIZED_FEED_ADDRESS",
+                "UNRECOGNIZED_FEED_ID",
+                "UNRECOGNIZED_POOL_IDENTITY",
+                "UNRECOGNIZED_MARKET_IDENTITY",
+                "UNTRUSTED_SOURCE_URL",
+                "CONFLICTING_PROVIDER_EVIDENCE",
+            }
+            if sim_status in conv_error_codes or sim_res.get("status") in conv_error_codes:
+                err_code = sim_status if sim_status in conv_error_codes else sim_res.get("status")
                 sim_blockers.append(f"quote-asset USD conversion verification failed: {err_code}")
 
             if sim_status in {"MISSING_QUOTE_ASSET_EVIDENCE", "QUOTE_ASSET_MISMATCH"}:

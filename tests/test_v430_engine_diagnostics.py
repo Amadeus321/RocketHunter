@@ -155,6 +155,7 @@ class TestEngineDiagnostics:
                 "price_usd": 1.0,
                 "chain": "ethereum",
                 "quote_asset": "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48",
+                "reference_asset": "USD",
                 "timestamp_utc": now.isoformat(),
                 "source": "chainlink_oracle_usd",
                 "provider": "chainlink",
