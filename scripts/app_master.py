@@ -643,6 +643,16 @@ class CustomRequestHandler(http.server.SimpleHTTPRequestHandler):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, directory=str(ROOT), **kwargs)
 
+    def end_headers(self):
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type, Authorization")
+        super().end_headers()
+
+    def do_OPTIONS(self):
+        self.send_response(200)
+        self.end_headers()
+
     def do_GET(self):
         if self.path.startswith("/api/status"):
             payload = get_live_status_payload()
@@ -758,8 +768,9 @@ class CustomRequestHandler(http.server.SimpleHTTPRequestHandler):
             self.wfile.write(data)
             return
         elif self.path.startswith("/api/journal/delete"):
-            pos_id = req_data.get("id", "")
-            res = user_trade_learning.delete_position(pos_id)
+            pos_id = req_data.get("id", "") or req_data.get("pool_address", "")
+            hard = bool(req_data.get("hard", False))
+            res = user_trade_learning.delete_position(pos_id, hard=hard)
             trigger_dashboard_refresh()
             data = json.dumps(res).encode("utf-8")
             self.send_response(200)
@@ -808,8 +819,8 @@ class DesktopAPI:
     def update_position(self, pos_id, updates):
         return user_trade_learning.update_position(pos_id, updates)
 
-    def delete_position(self, pos_id):
-        return user_trade_learning.delete_position(pos_id)
+    def delete_position(self, pos_id, hard=False):
+        return user_trade_learning.delete_position(pos_id, hard=hard)
 
     def reset_ai_memory(self):
         return user_trade_learning.reset_ai_memory()

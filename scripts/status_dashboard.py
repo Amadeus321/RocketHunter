@@ -922,7 +922,11 @@ def render(summary: dict[str, Any]) -> str:
     generation_time = _format_israel_time(dt.datetime.now(dt.timezone.utc).isoformat())
 
     journal = get_journal()
-    user_positions = journal.get("positions", [])
+    all_positions = journal.get("positions", [])
+    user_positions = [
+        p for p in all_positions
+        if not p.get("archived") and (p.get("status") or "").upper() != "ARCHIVED"
+    ]
     ai_stats = journal.get("ai_learning_stats", {})
     total_user_pos = len(user_positions)
     open_pos = len([p for p in user_positions if (p.get("status") or "OPEN") == "OPEN"])
@@ -1374,12 +1378,53 @@ function handleNotesInput(pid, inputEl) {{
   inputEl.dataset.userModified = 'true';
 }}
 
+function getLocalArchivedIds() {{
+  try {{
+    const raw = localStorage.getItem('rh_archived_positions');
+    return new Set(raw ? JSON.parse(raw) : []);
+  }} catch (_) {{
+    return new Set();
+  }}
+}}
+
+function addLocalArchivedId(id) {{
+  try {{
+    const s = getLocalArchivedIds();
+    if (id) s.add(id);
+    localStorage.setItem('rh_archived_positions', JSON.stringify(Array.from(s)));
+  }} catch (_) {{}}
+}}
+
+let _cachedApiBase = null;
+async function getApiBase() {{
+  if (_cachedApiBase !== null) return _cachedApiBase;
+  if (window.location.protocol === 'http:' || window.location.protocol === 'https:') {{
+    _cachedApiBase = '';
+    return '';
+  }}
+  const ports = [8765, 8766, 8767, 8770, 8771, 8790, 8791];
+  for (const p of ports) {{
+    try {{
+      const resp = await fetch('http://127.0.0.1:' + p + '/api/status', {{ method: 'GET', mode: 'cors' }});
+      if (resp.ok) {{
+        _cachedApiBase = 'http://127.0.0.1:' + p;
+        return _cachedApiBase;
+      }}
+    }} catch (_) {{}}
+  }}
+  _cachedApiBase = 'http://127.0.0.1:8765';
+  return _cachedApiBase;
+}}
+
 async function loadJournalData() {{
   try {{
-    const res = await fetch('/api/journal');
+    const base = await getApiBase();
+    const res = await fetch(base + '/api/journal');
     if (!res.ok) return;
     const data = await res.json();
-    const positions = data.positions || [];
+    const allPositions = data.positions || [];
+    const localArchived = getLocalArchivedIds();
+    const positions = allPositions.filter(p => !p.archived && (p.status || '').toUpperCase() !== 'ARCHIVED' && !localArchived.has(p.id) && !localArchived.has(p.pool_address));
     renderJournalTable(positions);
     renderMonitorTable(positions);
     updateTopMetrics(positions);
@@ -1547,7 +1592,8 @@ async function savePosition(id, isAutoSave = false) {{
   }};
 
   try {{
-    const res = await fetch('/api/journal/update', {{
+    const base = await getApiBase();
+    const res = await fetch(base + '/api/journal/update', {{
       method: 'POST',
       headers: {{'Content-Type': 'application/json'}},
       body: JSON.stringify(payload)
@@ -1586,10 +1632,12 @@ async function savePosition(id, isAutoSave = false) {{
       }}
 
       try {{
-        const jRes = await fetch('/api/journal');
+        const jRes = await fetch(base + '/api/journal');
         if (jRes.ok) {{
           const jData = await jRes.json();
-          const positions = jData.positions || [];
+          const allPositions = jData.positions || [];
+          const localArchived = getLocalArchivedIds();
+          const positions = allPositions.filter(p => !p.archived && (p.status || '').toUpperCase() !== 'ARCHIVED' && !localArchived.has(p.id) && !localArchived.has(p.pool_address));
           renderMonitorTable(positions);
           updateTopMetrics(positions);
         }}
@@ -1601,28 +1649,44 @@ async function savePosition(id, isAutoSave = false) {{
     }}
   }} catch (e) {{
     if (!isAutoSave) {{
-      showJournalMsg('Failed to update position.', true);
+      showJournalMsg('Failed to update position (backend server offline).', true);
     }}
   }}
 }}
 
 async function deletePosition(id) {{
-  if (!confirm('Are you sure you want to archive this position? (Historical learning data will be safely preserved)')) {{
+  if (!confirm('Are you sure you want to remove this position from your journal? (Historical learning data will be safely preserved)')) {{
     return;
   }}
+  // Immediately remove row from DOM for instant feedback
+  const row = document.getElementById('pos-row-' + id);
+  if (row) {{
+    row.remove();
+  }}
+  addLocalArchivedId(id);
+
+  // Check if table empty
+  const tbody = document.getElementById('journal-tbody');
+  if (tbody && tbody.children.length === 0) {{
+    tbody.innerHTML = '<tr><td colspan="10" class="muted" style="text-align:center;padding:18px;">No confirmed positions yet. Check "Take Position" on any candidate in Forward 24h Watchlist to begin AI follow-up tracking.</td></tr>';
+  }}
+
   try {{
-    const res = await fetch('/api/journal/delete', {{
+    const base = await getApiBase();
+    const res = await fetch(base + '/api/journal/delete', {{
       method: 'POST',
       headers: {{'Content-Type': 'application/json'}},
       body: JSON.stringify({{id: id}})
     }});
     const data = await res.json();
     if (data.status === 'OK') {{
-      showJournalMsg('Position archived (preserved in history).');
+      showJournalMsg('Position removed from active journal.');
       await loadJournalData();
+    }} else {{
+      showJournalMsg(data.message || 'Position removed from view.');
     }}
   }} catch (e) {{
-    showJournalMsg('Failed to archive position.', true);
+    showJournalMsg('Position removed from view (saved locally; backend server offline).');
   }}
 }}
 
@@ -1631,7 +1695,8 @@ async function resetAiMemory() {{
     return;
   }}
   try {{
-    const res = await fetch('/api/journal/reset_ai', {{
+    const base = await getApiBase();
+    const res = await fetch(base + '/api/journal/reset_ai', {{
       method: 'POST',
       headers: {{'Content-Type': 'application/json'}},
       body: JSON.stringify({{}})

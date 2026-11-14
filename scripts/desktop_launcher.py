@@ -161,6 +161,37 @@ def open_results() -> None:
         time.sleep(3)
 
 
+def is_local_server_running(port: int = 8765) -> bool:
+    import urllib.request
+    try:
+        req = urllib.request.Request(f"http://127.0.0.1:{port}/api/status", headers={"User-Agent": "RocketHunterLauncher"})
+        with urllib.request.urlopen(req, timeout=1.0) as resp:
+            return resp.status == 200
+    except Exception:
+        return False
+
+
+def ensure_local_server_running() -> int:
+    for port in (8765, 8766, 8767, 8770, 8771, 8790, 8791):
+        if is_local_server_running(port):
+            return port
+    py_exe = get_python_exe()
+    try:
+        creationflags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+        subprocess.Popen(
+            [py_exe, str(SCRIPTS_DIR / "app_master.py")],
+            cwd=str(ROOT),
+            creationflags=creationflags,
+        )
+        time.sleep(1.5)
+        for port in (8765, 8766, 8767, 8770, 8771, 8790, 8791):
+            if is_local_server_running(port):
+                return port
+    except Exception:
+        pass
+    return 8765
+
+
 def open_dashboard() -> None:
     py_exe = get_python_exe()
     try:
@@ -168,7 +199,13 @@ def open_dashboard() -> None:
         subprocess.run([py_exe, str(SCRIPTS_DIR / "status_dashboard.py"), "--output", str(DASHBOARD_HTML)], cwd=str(ROOT), timeout=15)
     except Exception as exc:
         print(f"[!] Dashboard refresh notice: {exc}")
-    if DASHBOARD_HTML.exists():
+
+    port = ensure_local_server_running()
+    if is_local_server_running(port):
+        dash_url = f"http://127.0.0.1:{port}/status-dashboard.html"
+        print(f"[+] Opening live interactive dashboard in your browser: {dash_url}")
+        webbrowser.open(dash_url)
+    elif DASHBOARD_HTML.exists():
         print(f"[+] Opening {DASHBOARD_HTML} in your browser...")
         webbrowser.open(str(DASHBOARD_HTML.resolve().as_uri()))
 

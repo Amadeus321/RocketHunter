@@ -29,80 +29,69 @@ Research rankings and hypothetical upside do not satisfy the technical TP or ver
 
 | Pair | Chain | Current Price | Single TP | Potential (% till TP) | Pool Address | Token Contract | Pool Age | Status |
 |---|---|---:|---:|---:|---|---|---:|---|
-| SWJ / WETH 0.01% | robinhood | 0.00001571 | 0.0000436967 | +178.15% | `0x1961cdb63d7848a86eb42b9698871633ca32083d` | `0x0e5045506fa080da8635a0b461492086f25d05a4` | 7.80h | NOT QUALIFIED |
+| FRONG / WETH 0.25% | robinhood | 0.002566 | 0.0040020834 | +55.97% | `0xacea8920877840033f0275c37f9b61550b5326917e948bcf8339714d96f9521a` | `0x6245e67affa44a23077f0ea7f981a8dc743a0c47` | 2557.22h | NOT QUALIFIED |
 | PONS / WPRL | base | 0.1229347878 | 0.4652381278 | +278.44% | `0xc4a328359592211d4e415915c6c6f4e8807f6b16` | `0x304b826a47a5e6cb2766ad9069f670651c9f847d` | 47.50h | NOT QUALIFIED |
 
 > *The 24h upside scenario is a volatility/momentum scenario from hourly candles, not a predicted return or calibrated probability. The trade plan has exactly one single TP (+40.00% minimum), with no stop loss and no trailing stop. Candle excursions are research observations, not executable fills.
 
 ## Unverified research candidate details
 
-### 1. SWJ / WETH 0.01%
+### 1. FRONG / WETH 0.25%
 
 **Qualification status: NOT QUALIFIED — research only.**
 
-**SWJ / WETH 0.01% TP: +178.15%**
+**FRONG / WETH 0.25% TP: +55.97%**
 
-- **Next-24h opportunity rank:** 23
-- **Next-24h opportunity score:** 17.17/100 (heuristic, not a probability)
-- **9-Engine Breakout Confluence:** 0.00/100
-- **24h upside scenario:** candle projection unavailable; candidate remains ranked using discovery momentum and research signals.
+- **Next-24h opportunity rank:** 1
+- **Next-24h opportunity score:** 40.25/100 (heuristic, not a probability)
+- **1h ATR:** 7.14%
+- **24h upside scenario:** +74.16% (hourly volatility/momentum heuristic; not calibrated)
+- **Scenario method:** 1H_ATR_RANGE_MOMENTUM_SCENARIO_NOT_CALIBRATED
 - **Tracked-token candle orientation:** base (contract matched)
 - **Opportunity tier:** `EARLY_DISCOVERY`
-- **Ranking model:** 70% early-breakout + 30% pre-age-guard research - risk penalties; projection unavailable
-- **Late-chase / flow-risk penalty:** 20.00 points
-- **Historical 24h return:** not comparable yet; this does not disqualify a new 24h forward opportunity.
-- **Early-breakout score:** 51.08/100 — DEVELOPING_MOMENTUM
-- **Early-breakout risk flags:** EXTREME_VOLUME_TO_LIQUIDITY_RATIO_CHECK_FOR_WASH_OR_ROTATION, ABNORMAL_SHORT_WINDOW_MOMENTUM_ACCELERATION, CURRENT_PRICE_UNVERIFIED
-- **Reference price:** `0.00001571`
-- **Single TP:** `0.0000436967`
-- **TP method:** `OBSERVED_RECENT_RANGE_HIGH`
-- **Quality gate:** `NOT_SHORTLISTED`
+- **Ranking model:** 70% pre-age-guard research + 30% volatility/momentum upside projection - risk penalties
+- **Late-chase / flow-risk penalty:** 0.00 points
+- **Reference price:** `0.002566`
+- **Single TP:** `0.0040020834`
+- **TP method:** `OBSERVED_SWING_RESISTANCE`
+- **Quality gate:** `FOLLOW_UP_SCREEN_PASSED_NOT_EXECUTION_READY`
 - **Execution ready:** `false`
 - **Next-24h research rank:** `NOT QUALIFIED`
-- **Historical age-guard disposition:** `NOT QUALIFIED`
-- **Historical 24h return comparable:** `false`
-- **Market-data timestamp (UTC):** `2026-11-14T09:41:40Z`
-- **5m momentum:** +16.51%
-- **1h momentum:** -20.97%
-- **6h momentum:** +33.61%
-- **24h momentum:** +106.04%
-- **24h volume (USD):** $1,541,845
-- **Liquidity (USD):** $54,483
-- **FDV (USD):** $188,624
-- **Pool age:** 7.80 hours
-- **24h transactions:** 7,762
-- **Evidence coverage:** 53.0%
-- **Pool address:** `0x1961cdb63d7848a86eb42b9698871633ca32083d`
-- **Market link:** https://www.geckoterminal.com/robinhood/pools/0x1961cdb63d7848a86eb42b9698871633ca32083d
-- **Quality-gate reasons:**
-  - DEX liquidity below $100k or unavailable
-  - 24h return outside 0% to 2,500% screen
+- **Entry decision:** `NOT QUALIFIED`
+- **Historical 24h return comparable:** `true`
+- **Market-data timestamp (UTC):** `2026-11-14T10:16:52Z`
+- **5m momentum:** -1.11%
+- **1h momentum:** +6.43%
+- **6h momentum:** +11.74%
+- **24h momentum:** +65.39%
+- **24h volume (USD):** $1,534,594
+- **Liquidity (USD):** $401,041
+- **Pool age:** 2557.22 hours
+- **Evidence coverage:** 41.0%
+- **Pool address:** `0xacea8920877840033f0275c37f9b61550b5326917e948bcf8339714d96f9521a`
+- **Market link:** https://www.geckoterminal.com/robinhood/pools/0xacea8920877840033f0275c37f9b61550b5326917e948bcf8339714d96f9521a
 - **Entry blockers:**
-  - price snapshot stale/unknown (> 45 min or timestamp missing)
   - independent DEX identity, safety, and two-way execution guard not PASS
   - executable buy AND sell route not verified
   - fresh trade-level spot CVD not verified (DEX swaps/CEX aggressor-side trades)
   - derivatives positioning audit incomplete/stale; check OI, funding, liquidations and long/short positioning
   - full token/contract safety checks not independently verified PASS
-  - mandatory pre-pick source/timestamp evidence incomplete: spot_cvd: source/timestamp missing; derivatives: source/timestamp missing; route_quotes: source/timestamp missing; safety: source/timestamp missing; single_take_profit: stale/future field timestamp
-  - field-level provenance incomplete/stale: price: stale/future field timestamp; volume_15m: source/timestamp missing; volume_1h: stale/future field timestamp; spot_trades: source/timestamp missing; spot_cvd: source/timestamp missing; derivatives: source/timestamp missing; order_book: source/timestamp missing; route_quotes: source/timestamp missing; safety: source/timestamp missing; single_take_profit: stale/future field timestamp
-  - loss-pattern guard evidence missing
+  - mandatory pre-pick source/timestamp evidence incomplete: spot_cvd: source/timestamp missing; derivatives: source/timestamp missing; route_quotes: source identity missing
+  - field-level provenance incomplete/stale: volume_15m: source/timestamp missing; spot_trades: source/timestamp missing; spot_cvd: source/timestamp missing; derivatives: source/timestamp missing; order_book: source/timestamp missing; route_quotes: source identity missing
+  - independent token-to-pool identity verification missing
+  - launch-allocation and connected-wallet analysis missing
+  - exact LP-position ownership/withdrawal audit missing
+  - token-security fields incomplete: cannot_sell_all
+  - fresh two-way buy and sell route quotes missing
 - **Risk flags:**
   - 24h move already >20%
-  - 7d move already >50%
   - contract/token safety is not independently verified PASS — speculative classification
   - 15m volume acceleration below 1.5x or missing
-  - 1h volume acceleration below 1.5x or missing
   - spot buyer share below 53% or missing
   - spread above 30 bps or missing
   - two-sided 2% depth below $5000 research benchmark
-  - high-risk scout: microcap/age/float/contract/liquidity risk
   - DEX_LOSS_PATTERN_GUARD_NOT_PASSED
-  - LIQUIDITY_UNDER_100000_USD
-  - NEW_POOL_UNDER_24H
-  - INSUFFICIENT_24H_HISTORY_REPORTED_MOVE_IS_SINCE_CREATION_OR_SOURCE_WINDOW
-  - 24H_RETURN_NOT_COMPARABLE_POOL_AGE_UNDER_24H_OR_UNKNOWN
-- **Calibrated 24h probability:** unavailable (resolved observations: unknown)
+- **Calibrated 24h probability:** `12.80%`
 
 ### 2. PONS / WPRL
 

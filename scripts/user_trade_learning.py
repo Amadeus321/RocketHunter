@@ -265,23 +265,35 @@ def update_position(pos_id: str, updates: dict[str, Any]) -> dict[str, Any]:
     return {"status": "ERROR", "message": f"Position {pos_id} not found."}
 
 
-def delete_position(pos_id: str) -> dict[str, Any]:
-    """Soft-archives a position on the dashboard while preserving it for historical learning."""
+def delete_position(pos_id: str, hard: bool = False) -> dict[str, Any]:
+    """Soft-archives a position on the dashboard while preserving it for historical learning.
+
+    If hard=True, physically deletes the position from the journal.
+    Supports matching either by unique position ID or pool address.
+    """
     journal = get_journal()
     positions = journal.get("positions", [])
     found = False
     curr_ver = get_software_version()
+    new_positions = []
+    target = (pos_id or "").strip()
     for p in positions:
-        if p.get("id") == pos_id:
+        pid = str(p.get("id") or "").strip()
+        pool = str(p.get("pool_address") or "").strip()
+        if (target and (pid == target or pool == target)) or (target and target in pid):
+            found = True
+            if hard:
+                continue
             p["archived"] = True
             p["status"] = "ARCHIVED"
             p["archived_at_ist"] = _now_ist_str()
             p["last_modified_in_version"] = curr_ver
-            found = True
-            break
+        new_positions.append(p)
     if found:
+        journal["positions"] = new_positions
         save_journal(journal)
-        return {"status": "OK", "message": "Position archived and preserved in history."}
+        msg = "Position deleted." if hard else "Position archived and preserved in history."
+        return {"status": "OK", "message": msg}
     return {"status": "ERROR", "message": "Position not found."}
 
 

@@ -1167,12 +1167,34 @@ function showToast(text, isError) {{
   setTimeout(() => {{ el.style.display = 'none'; }}, 3500);
 }}
 
+let _cachedWlApiBase = null;
+async function getWlApiBase() {{
+  if (_cachedWlApiBase !== null) return _cachedWlApiBase;
+  if (window.location.protocol === 'http:' || window.location.protocol === 'https:') {{
+    _cachedWlApiBase = '';
+    return '';
+  }}
+  const ports = [8765, 8766, 8767, 8770, 8771, 8790, 8791];
+  for (const p of ports) {{
+    try {{
+      const resp = await fetch('http://127.0.0.1:' + p + '/api/status', {{ method: 'GET', mode: 'cors' }});
+      if (resp.ok) {{
+        _cachedWlApiBase = 'http://127.0.0.1:' + p;
+        return _cachedWlApiBase;
+      }}
+    }} catch (_) {{}}
+  }}
+  _cachedWlApiBase = 'http://127.0.0.1:8765';
+  return _cachedWlApiBase;
+}}
+
 async function loadJournal() {{
   try {{
-    const res = await fetch('/api/journal');
+    const base = await getWlApiBase();
+    const res = await fetch(base + '/api/journal');
     if (!res.ok) return;
     const data = await res.json();
-    journalPositions = data.positions || [];
+    journalPositions = (data.positions || []).filter(p => !p.archived && (p.status || '').toUpperCase() !== 'ARCHIVED');
     syncCandidateCheckboxes();
   }} catch (e) {{
     console.error('Error loading journal:', e);
@@ -1222,7 +1244,8 @@ async function toggleCandidatePosition(el) {{
       status: 'OPEN'
     }};
     try {{
-      const res = await fetch('/api/journal/record', {{
+      const base = await getWlApiBase();
+      const res = await fetch(base + '/api/journal/record', {{
         method: 'POST',
         headers: {{'Content-Type': 'application/json'}},
         body: JSON.stringify(payload)
@@ -1233,13 +1256,14 @@ async function toggleCandidatePosition(el) {{
         await loadJournal();
       }}
     }} catch (e) {{
-      showToast('Failed to record position.', true);
+      showToast('Failed to record position (backend offline).', true);
     }}
   }} else {{
     const match = journalPositions.find(p => (pool && p.pool_address === pool) || (p.pair === pair && p.run_id === run));
     if (match) {{
       try {{
-        const res = await fetch('/api/journal/delete', {{
+        const base = await getWlApiBase();
+        const res = await fetch(base + '/api/journal/delete', {{
           method: 'POST',
           headers: {{'Content-Type': 'application/json'}},
           body: JSON.stringify({{id: match.id}})
@@ -1250,7 +1274,7 @@ async function toggleCandidatePosition(el) {{
           await loadJournal();
         }}
       }} catch (e) {{
-        showToast('Failed to remove position.', true);
+        showToast('Failed to remove position (backend offline).', true);
       }}
     }}
   }}

@@ -199,6 +199,57 @@ class TestUserTradeLearning(unittest.TestCase):
         self.assertEqual(prov["software_version"], sw_ver)
         self.assertNotEqual(prov["model_sha256"], "UNAVAILABLE")
 
+    def test_delete_position_by_pool_address_and_hard_delete(self):
+        pos = {
+            "id": "pos_target_delete_test",
+            "pair": "TEST/SOL",
+            "chain": "solana",
+            "pool_address": "PoolAddr123456789Test",
+            "entry_price": "0.01",
+            "status": "OPEN",
+        }
+        utl.record_position(pos)
+        # Delete by pool address
+        del_res = utl.delete_position("PoolAddr123456789Test")
+        self.assertEqual(del_res["status"], "OK")
+
+        journal = utl.get_journal()
+        matching = [p for p in journal["positions"] if p.get("pool_address") == "PoolAddr123456789Test"]
+        self.assertEqual(len(matching), 1)
+        self.assertTrue(matching[0].get("archived"))
+        self.assertEqual(matching[0].get("status"), "ARCHIVED")
+
+        # Now test hard delete
+        hard_res = utl.delete_position("PoolAddr123456789Test", hard=True)
+        self.assertEqual(hard_res["status"], "OK")
+        journal_after = utl.get_journal()
+        matching_after = [p for p in journal_after["positions"] if p.get("pool_address") == "PoolAddr123456789Test"]
+        self.assertEqual(len(matching_after), 0)
+
+    def test_archived_positions_excluded_from_active_dashboard_view(self):
+        utl.record_position({
+            "id": "pos_active_one",
+            "pair": "ACTIVE/SOL",
+            "pool_address": "ActivePool111",
+            "status": "OPEN",
+        })
+        utl.record_position({
+            "id": "pos_to_be_archived",
+            "pair": "REMOVE/SOL",
+            "pool_address": "RemovePool222",
+            "status": "OPEN",
+        })
+        # Archive one
+        utl.delete_position("pos_to_be_archived")
+
+        from scripts import status_dashboard
+        j = utl.get_journal()
+        all_p = j.get("positions", [])
+        active_p = [p for p in all_p if not p.get("archived") and (p.get("status") or "").upper() != "ARCHIVED"]
+
+        self.assertEqual(len(active_p), 1)
+        self.assertEqual(active_p[0]["id"], "pos_active_one")
+
 
 if __name__ == "__main__":
     unittest.main()
