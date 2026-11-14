@@ -1286,19 +1286,14 @@ class TestChronologicalBacktest:
                 "outcome_classification": "TARGET_REACHED",
                 "mfe_pct": 60.0,  # Claims 60% MFE!
                 "hours_to_target": 3.0,
-                "candle_trace": {
-                    "provider": "geckoterminal",
-                    "trace_provenance": "geckoterminal",
-                    "source_ref": "https://api.geckoterminal.com/api/v2/networks/solana/pools/PoolA/ohlcv/hour",
-                    "retrieved_utc": (t + dt.timedelta(hours=25)).isoformat(),
-                    "market_key": "dex:solana:TokenX:PoolA",
-                    "candle_interval": "1h",
-                    "trace_start_utc": t.isoformat(),
-                    "trace_end_utc": (t + dt.timedelta(hours=24)).isoformat(),
-                    "candles": [
-                        {"timestamp_utc": (t + dt.timedelta(hours=1)).isoformat(), "open": 1.0, "high": 1.20, "low": 0.95, "close": 1.15},  # Max high is 1.20 (only 20% MFE)!
-                    ],
-                },
+                # Valid complete 24h trace whose actual candles achieve only 20% MFE
+                "candle_trace": make_valid_trace(
+                    "dex:solana:TokenX:PoolA",
+                    t,
+                    duration_hours=24.0,
+                    mfe_pct=20.0,
+                    touch_hours=None,
+                ),
             },
         }
         res = evaluator._resolve_outcome(item, lookup=None)
@@ -1323,20 +1318,14 @@ class TestChronologicalBacktest:
                 "outcome_classification": "TARGET_REACHED",
                 "mfe_pct": 50.0,
                 "hours_to_target": 2.0,  # Claims touched at 2.0h!
-                "candle_trace": {
-                    "provider": "geckoterminal",
-                    "trace_provenance": "geckoterminal",
-                    "source_ref": "https://api.geckoterminal.com/api/v2/networks/solana/pools/PoolA/ohlcv/hour",
-                    "retrieved_utc": (t + dt.timedelta(hours=25)).isoformat(),
-                    "market_key": "dex:solana:TokenX:PoolA",
-                    "candle_interval": "1h",
-                    "trace_start_utc": t.isoformat(),
-                    "trace_end_utc": (t + dt.timedelta(hours=24)).isoformat(),
-                    "candles": [
-                        {"timestamp_utc": (t + dt.timedelta(hours=i)).isoformat(), "open": 1.0, "high": 1.20 if i < 8 else 1.50, "low": 0.95, "close": 1.15}
-                        for i in range(1, 9)
-                    ],
-                },
+                # Valid complete 24h trace whose target touch actually occurs at hour 8.0
+                "candle_trace": make_valid_trace(
+                    "dex:solana:TokenX:PoolA",
+                    t,
+                    duration_hours=24.0,
+                    mfe_pct=50.0,
+                    touch_hours=8.0,
+                ),
             },
         }
         res = evaluator._resolve_outcome(item, lookup=None)
@@ -1650,3 +1639,693 @@ class TestChronologicalBacktest:
         assert res["is_evaluated"] is True
         assert res["target_reached"] is True
         assert res["market_target_reached"] is True
+
+    # --- PHASE 1 FINAL INDEPENDENT REVIEW CORRECTIONS (Regressions 56-78) ---
+
+    # --- Item 1: Strict Provider and Domain Validation ---
+
+    def test_fake_provider_with_embedded_valid_name_rejected(self):
+        """Regression 56: Fake provider containing a valid provider name is rejected as UNRECOGNIZED_TRACE_PROVIDER."""
+        evaluator = ChronologicalBacktestEvaluator([])
+        t = dt.datetime(2026, 11, 1, 12, 0, tzinfo=dt.timezone.utc)
+        for fake_prov in ("geckoterminal_fake", "not_a_dexscreener", "binance_scam", "https://api.geckoterminal.com"):
+            trace = make_valid_trace("dex:solana:TokenX:PoolA", t, duration_hours=24.0, mfe_pct=45.0, touch_hours=2.0)
+            trace["provider"] = fake_prov
+            trace["trace_provenance"] = fake_prov
+            item = {
+                "record_id": f"rec_fake_prov_{fake_prov}",
+                "market_key": "dex:solana:TokenX:PoolA",
+                "timestamp": t,
+                "timestamp_utc": "2026-11-01T12:00:00Z",
+                "detection_price": 1.0,
+                "raw_record": {
+                    "chain": "solana",
+                    "contract_address": "TokenX",
+                    "pool_address": "PoolA",
+                    "outcome_classification": "TARGET_REACHED",
+                    "mfe_pct": 45.0,
+                    "hours_to_target": 2.0,
+                    "candle_trace": trace,
+                },
+            }
+            res = evaluator._resolve_outcome(item, lookup=None)
+            assert res["is_evaluated"] is False
+            assert res["outcome_classification"] == "UNRECOGNIZED_TRACE_PROVIDER"
+            assert "UNRECOGNIZED_TRACE_PROVIDER" in res["resolution_reason"]
+
+    def test_provider_domain_mismatch_rejected(self):
+        """Regression 57: Mismatch between provider and source_ref domain triggers PROVIDER_DOMAIN_MISMATCH."""
+        evaluator = ChronologicalBacktestEvaluator([])
+        t = dt.datetime(2026, 11, 1, 12, 0, tzinfo=dt.timezone.utc)
+        # Provider is geckoterminal, but URL domain is dexscreener.com
+        trace = make_valid_trace(
+            "dex:solana:TokenX:PoolA",
+            t,
+            duration_hours=24.0,
+            mfe_pct=45.0,
+            touch_hours=2.0,
+            provenance="geckoterminal",
+            source_ref="https://dexscreener.com/solana/PoolA",
+        )
+        item = {
+            "record_id": "rec_prov_mismatch",
+            "market_key": "dex:solana:TokenX:PoolA",
+            "timestamp": t,
+            "timestamp_utc": "2026-11-01T12:00:00Z",
+            "detection_price": 1.0,
+            "raw_record": {
+                "chain": "solana",
+                "contract_address": "TokenX",
+                "pool_address": "PoolA",
+                "outcome_classification": "TARGET_REACHED",
+                "mfe_pct": 45.0,
+                "hours_to_target": 2.0,
+                "candle_trace": trace,
+            },
+        }
+        res = evaluator._resolve_outcome(item, lookup=None)
+        assert res["is_evaluated"] is False
+        assert res["outcome_classification"] == "PROVIDER_DOMAIN_MISMATCH"
+        assert "PROVIDER_DOMAIN_MISMATCH" in res["resolution_reason"]
+
+    def test_unapproved_source_domain_rejected(self):
+        """Regression 58: Unapproved domain in source_ref is rejected as UNAPPROVED_SOURCE_DOMAIN."""
+        evaluator = ChronologicalBacktestEvaluator([])
+        t = dt.datetime(2026, 11, 1, 12, 0, tzinfo=dt.timezone.utc)
+        trace = make_valid_trace(
+            "dex:solana:TokenX:PoolA",
+            t,
+            duration_hours=24.0,
+            mfe_pct=45.0,
+            touch_hours=2.0,
+            provenance="geckoterminal",
+            source_ref="https://unapproved-crypto-charts.org/pool/PoolA",
+        )
+        item = {
+            "record_id": "rec_unapproved_domain",
+            "market_key": "dex:solana:TokenX:PoolA",
+            "timestamp": t,
+            "timestamp_utc": "2026-11-01T12:00:00Z",
+            "detection_price": 1.0,
+            "raw_record": {
+                "chain": "solana",
+                "contract_address": "TokenX",
+                "pool_address": "PoolA",
+                "outcome_classification": "TARGET_REACHED",
+                "mfe_pct": 45.0,
+                "hours_to_target": 2.0,
+                "candle_trace": trace,
+            },
+        }
+        res = evaluator._resolve_outcome(item, lookup=None)
+        assert res["is_evaluated"] is False
+        assert res["outcome_classification"] == "UNAPPROVED_SOURCE_DOMAIN"
+        assert "UNAPPROVED_SOURCE_DOMAIN" in res["resolution_reason"]
+
+    def test_missing_source_reference_rejected(self):
+        """Regression 59: Missing source_ref is rejected as MISSING_SOURCE_REFERENCE."""
+        evaluator = ChronologicalBacktestEvaluator([])
+        t = dt.datetime(2026, 11, 1, 12, 0, tzinfo=dt.timezone.utc)
+        trace = make_valid_trace("dex:solana:TokenX:PoolA", t, duration_hours=24.0, mfe_pct=45.0, touch_hours=2.0)
+        trace["source_ref"] = ""
+        trace["source_url"] = ""
+        item = {
+            "record_id": "rec_missing_source_ref",
+            "market_key": "dex:solana:TokenX:PoolA",
+            "timestamp": t,
+            "timestamp_utc": "2026-11-01T12:00:00Z",
+            "detection_price": 1.0,
+            "raw_record": {
+                "chain": "solana",
+                "contract_address": "TokenX",
+                "pool_address": "PoolA",
+                "outcome_classification": "TARGET_REACHED",
+                "mfe_pct": 45.0,
+                "hours_to_target": 2.0,
+                "candle_trace": trace,
+            },
+        }
+        res = evaluator._resolve_outcome(item, lookup=None)
+        assert res["is_evaluated"] is False
+        assert res["outcome_classification"] == "MISSING_SOURCE_REFERENCE"
+        assert "MISSING_SOURCE_REFERENCE" in res["resolution_reason"]
+
+    def test_valid_provider_and_matching_source_domain_accepted(self):
+        """Regression 60: A valid provider and matching allowlist domain is accepted."""
+        evaluator = ChronologicalBacktestEvaluator([])
+        t = dt.datetime(2026, 11, 1, 12, 0, tzinfo=dt.timezone.utc)
+        trace = make_valid_trace(
+            "dex:solana:TokenX:PoolA",
+            t,
+            duration_hours=24.0,
+            mfe_pct=45.0,
+            touch_hours=2.0,
+            provenance="dexscreener",
+            source_ref="https://api.dexscreener.com/latest/dex/pairs/solana/PoolA",
+        )
+        item = {
+            "record_id": "rec_dexscreener_valid",
+            "market_key": "dex:solana:TokenX:PoolA",
+            "timestamp": t,
+            "timestamp_utc": "2026-11-01T12:00:00Z",
+            "detection_price": 1.0,
+            "raw_record": {
+                "chain": "solana",
+                "contract_address": "TokenX",
+                "pool_address": "PoolA",
+                "outcome_classification": "TARGET_REACHED",
+                "mfe_pct": 45.0,
+                "hours_to_target": 2.0,
+                "candle_trace": trace,
+            },
+        }
+        res = evaluator._resolve_outcome(item, lookup=None)
+        assert res["is_evaluated"] is True
+        assert res["target_reached"] is True
+
+    def test_multiple_exact_valid_providers_accepted(self):
+        """Regression 61: Multiple exact valid providers from the registry with valid URLs are accepted."""
+        evaluator = ChronologicalBacktestEvaluator([])
+        t = dt.datetime(2026, 11, 1, 12, 0, tzinfo=dt.timezone.utc)
+        provider_samples = [
+            ("binance", "https://api.binance.com/api/v3/klines?symbol=SOLUSDT"),
+            ("coinbase", "https://api.coinbase.com/v2/prices/SOL-USD/historic"),
+            ("birdeye", "https://public-api.birdeye.so/defi/history_price?address=TokenX"),
+            ("kraken", "https://api.kraken.com/0/public/OHLC?pair=SOLUSD"),
+            ("bybit", "https://api.bybit.com/v5/market/kline?symbol=SOLUSDT"),
+            ("okx", "https://www.okx.com/api/v5/market/candles?instId=SOL-USDT"),
+        ]
+        for prov, url in provider_samples:
+            trace = make_valid_trace(
+                "dex:solana:TokenX:PoolA",
+                t,
+                duration_hours=24.0,
+                mfe_pct=45.0,
+                touch_hours=2.0,
+                provenance=prov,
+                source_ref=url,
+            )
+            item = {
+                "record_id": f"rec_{prov}",
+                "market_key": "dex:solana:TokenX:PoolA",
+                "timestamp": t,
+                "timestamp_utc": "2026-11-01T12:00:00Z",
+                "detection_price": 1.0,
+                "raw_record": {
+                    "chain": "solana",
+                    "contract_address": "TokenX",
+                    "pool_address": "PoolA",
+                    "outcome_classification": "TARGET_REACHED",
+                    "mfe_pct": 45.0,
+                    "hours_to_target": 2.0,
+                    "candle_trace": trace,
+                },
+            }
+            res = evaluator._resolve_outcome(item, lookup=None)
+            assert res["is_evaluated"] is True, f"Failed for provider {prov}"
+
+    # --- Item 2: Complete OHLC Data ---
+
+    def test_candle_missing_open_rejected(self):
+        """Regression 62: Candle missing required 'open' field is rejected as MISSING_CANDLE_OHLC."""
+        evaluator = ChronologicalBacktestEvaluator([])
+        t = dt.datetime(2026, 11, 1, 12, 0, tzinfo=dt.timezone.utc)
+        trace = make_valid_trace("dex:solana:TokenX:PoolA", t, duration_hours=24.0, mfe_pct=10.0, touch_hours=None)
+        del trace["candles"][0]["open"]
+        item = {
+            "record_id": "rec_missing_open",
+            "market_key": "dex:solana:TokenX:PoolA",
+            "timestamp": t,
+            "timestamp_utc": "2026-11-01T12:00:00Z",
+            "detection_price": 1.0,
+            "raw_record": {
+                "chain": "solana",
+                "contract_address": "TokenX",
+                "pool_address": "PoolA",
+                "outcome_classification": "TARGET_NOT_REACHED",
+                "mfe_pct": 10.0,
+                "candle_trace": trace,
+            },
+        }
+        res = evaluator._resolve_outcome(item, lookup=None)
+        assert res["is_evaluated"] is False
+        assert res["outcome_classification"] == "INCOMPLETE_OBSERVATION"
+        assert "MISSING_CANDLE_OHLC" in res["resolution_reason"]
+        assert "'open'" in res["resolution_reason"]
+
+    def test_candle_missing_high_rejected(self):
+        """Regression 63: Candle missing required 'high' field is rejected as MISSING_CANDLE_OHLC."""
+        evaluator = ChronologicalBacktestEvaluator([])
+        t = dt.datetime(2026, 11, 1, 12, 0, tzinfo=dt.timezone.utc)
+        trace = make_valid_trace("dex:solana:TokenX:PoolA", t, duration_hours=24.0, mfe_pct=10.0, touch_hours=None)
+        del trace["candles"][0]["high"]
+        item = {
+            "record_id": "rec_missing_high",
+            "market_key": "dex:solana:TokenX:PoolA",
+            "timestamp": t,
+            "timestamp_utc": "2026-11-01T12:00:00Z",
+            "detection_price": 1.0,
+            "raw_record": {
+                "chain": "solana",
+                "contract_address": "TokenX",
+                "pool_address": "PoolA",
+                "outcome_classification": "TARGET_NOT_REACHED",
+                "mfe_pct": 10.0,
+                "candle_trace": trace,
+            },
+        }
+        res = evaluator._resolve_outcome(item, lookup=None)
+        assert res["is_evaluated"] is False
+        assert res["outcome_classification"] == "INCOMPLETE_OBSERVATION"
+        assert "MISSING_CANDLE_OHLC" in res["resolution_reason"]
+        assert "'high'" in res["resolution_reason"]
+
+    def test_candle_missing_low_rejected(self):
+        """Regression 64: Candle missing required 'low' field is rejected as MISSING_CANDLE_OHLC."""
+        evaluator = ChronologicalBacktestEvaluator([])
+        t = dt.datetime(2026, 11, 1, 12, 0, tzinfo=dt.timezone.utc)
+        trace = make_valid_trace("dex:solana:TokenX:PoolA", t, duration_hours=24.0, mfe_pct=10.0, touch_hours=None)
+        del trace["candles"][0]["low"]
+        item = {
+            "record_id": "rec_missing_low",
+            "market_key": "dex:solana:TokenX:PoolA",
+            "timestamp": t,
+            "timestamp_utc": "2026-11-01T12:00:00Z",
+            "detection_price": 1.0,
+            "raw_record": {
+                "chain": "solana",
+                "contract_address": "TokenX",
+                "pool_address": "PoolA",
+                "outcome_classification": "TARGET_NOT_REACHED",
+                "mfe_pct": 10.0,
+                "candle_trace": trace,
+            },
+        }
+        res = evaluator._resolve_outcome(item, lookup=None)
+        assert res["is_evaluated"] is False
+        assert res["outcome_classification"] == "INCOMPLETE_OBSERVATION"
+        assert "MISSING_CANDLE_OHLC" in res["resolution_reason"]
+        assert "'low'" in res["resolution_reason"]
+
+    def test_candle_missing_close_rejected(self):
+        """Regression 65: Candle missing required 'close' field is rejected as MISSING_CANDLE_OHLC."""
+        evaluator = ChronologicalBacktestEvaluator([])
+        t = dt.datetime(2026, 11, 1, 12, 0, tzinfo=dt.timezone.utc)
+        trace = make_valid_trace("dex:solana:TokenX:PoolA", t, duration_hours=24.0, mfe_pct=10.0, touch_hours=None)
+        del trace["candles"][0]["close"]
+        item = {
+            "record_id": "rec_missing_close",
+            "market_key": "dex:solana:TokenX:PoolA",
+            "timestamp": t,
+            "timestamp_utc": "2026-11-01T12:00:00Z",
+            "detection_price": 1.0,
+            "raw_record": {
+                "chain": "solana",
+                "contract_address": "TokenX",
+                "pool_address": "PoolA",
+                "outcome_classification": "TARGET_NOT_REACHED",
+                "mfe_pct": 10.0,
+                "candle_trace": trace,
+            },
+        }
+        res = evaluator._resolve_outcome(item, lookup=None)
+        assert res["is_evaluated"] is False
+        assert res["outcome_classification"] == "INCOMPLETE_OBSERVATION"
+        assert "MISSING_CANDLE_OHLC" in res["resolution_reason"]
+        assert "'close'" in res["resolution_reason"]
+
+    def test_candle_with_nan_ohlc_rejected(self):
+        """Regression 66: Candle with NaN OHLC value is rejected as INVALID_CANDLE_OHLC."""
+        evaluator = ChronologicalBacktestEvaluator([])
+        t = dt.datetime(2026, 11, 1, 12, 0, tzinfo=dt.timezone.utc)
+        trace = make_valid_trace("dex:solana:TokenX:PoolA", t, duration_hours=24.0, mfe_pct=10.0, touch_hours=None)
+        trace["candles"][0]["high"] = float("nan")
+        item = {
+            "record_id": "rec_nan_ohlc",
+            "market_key": "dex:solana:TokenX:PoolA",
+            "timestamp": t,
+            "timestamp_utc": "2026-11-01T12:00:00Z",
+            "detection_price": 1.0,
+            "raw_record": {
+                "chain": "solana",
+                "contract_address": "TokenX",
+                "pool_address": "PoolA",
+                "outcome_classification": "TARGET_NOT_REACHED",
+                "mfe_pct": 10.0,
+                "candle_trace": trace,
+            },
+        }
+        res = evaluator._resolve_outcome(item, lookup=None)
+        assert res["is_evaluated"] is False
+        assert res["outcome_classification"] == "INCOMPLETE_OBSERVATION"
+        assert "INVALID_CANDLE_OHLC" in res["resolution_reason"]
+
+    def test_candle_with_infinity_ohlc_rejected(self):
+        """Regression 67: Candle with infinity OHLC value is rejected as INVALID_CANDLE_OHLC."""
+        evaluator = ChronologicalBacktestEvaluator([])
+        t = dt.datetime(2026, 11, 1, 12, 0, tzinfo=dt.timezone.utc)
+        trace = make_valid_trace("dex:solana:TokenX:PoolA", t, duration_hours=24.0, mfe_pct=10.0, touch_hours=None)
+        trace["candles"][0]["close"] = float("inf")
+        item = {
+            "record_id": "rec_inf_ohlc",
+            "market_key": "dex:solana:TokenX:PoolA",
+            "timestamp": t,
+            "timestamp_utc": "2026-11-01T12:00:00Z",
+            "detection_price": 1.0,
+            "raw_record": {
+                "chain": "solana",
+                "contract_address": "TokenX",
+                "pool_address": "PoolA",
+                "outcome_classification": "TARGET_NOT_REACHED",
+                "mfe_pct": 10.0,
+                "candle_trace": trace,
+            },
+        }
+        res = evaluator._resolve_outcome(item, lookup=None)
+        assert res["is_evaluated"] is False
+        assert res["outcome_classification"] == "INCOMPLETE_OBSERVATION"
+        assert "INVALID_CANDLE_OHLC" in res["resolution_reason"]
+
+    def test_candle_with_zero_ohlc_rejected(self):
+        """Regression 68: Candle with zero OHLC value is rejected as INVALID_CANDLE_OHLC."""
+        evaluator = ChronologicalBacktestEvaluator([])
+        t = dt.datetime(2026, 11, 1, 12, 0, tzinfo=dt.timezone.utc)
+        trace = make_valid_trace("dex:solana:TokenX:PoolA", t, duration_hours=24.0, mfe_pct=10.0, touch_hours=None)
+        trace["candles"][0]["low"] = 0.0
+        item = {
+            "record_id": "rec_zero_ohlc",
+            "market_key": "dex:solana:TokenX:PoolA",
+            "timestamp": t,
+            "timestamp_utc": "2026-11-01T12:00:00Z",
+            "detection_price": 1.0,
+            "raw_record": {
+                "chain": "solana",
+                "contract_address": "TokenX",
+                "pool_address": "PoolA",
+                "outcome_classification": "TARGET_NOT_REACHED",
+                "mfe_pct": 10.0,
+                "candle_trace": trace,
+            },
+        }
+        res = evaluator._resolve_outcome(item, lookup=None)
+        assert res["is_evaluated"] is False
+        assert res["outcome_classification"] == "INCOMPLETE_OBSERVATION"
+        assert "INVALID_CANDLE_OHLC" in res["resolution_reason"]
+
+    def test_candle_with_negative_ohlc_rejected(self):
+        """Regression 69: Candle with negative OHLC value is rejected as INVALID_CANDLE_OHLC."""
+        evaluator = ChronologicalBacktestEvaluator([])
+        t = dt.datetime(2026, 11, 1, 12, 0, tzinfo=dt.timezone.utc)
+        trace = make_valid_trace("dex:solana:TokenX:PoolA", t, duration_hours=24.0, mfe_pct=10.0, touch_hours=None)
+        trace["candles"][0]["open"] = -1.5
+        item = {
+            "record_id": "rec_neg_ohlc",
+            "market_key": "dex:solana:TokenX:PoolA",
+            "timestamp": t,
+            "timestamp_utc": "2026-11-01T12:00:00Z",
+            "detection_price": 1.0,
+            "raw_record": {
+                "chain": "solana",
+                "contract_address": "TokenX",
+                "pool_address": "PoolA",
+                "outcome_classification": "TARGET_NOT_REACHED",
+                "mfe_pct": 10.0,
+                "candle_trace": trace,
+            },
+        }
+        res = evaluator._resolve_outcome(item, lookup=None)
+        assert res["is_evaluated"] is False
+        assert res["outcome_classification"] == "INCOMPLETE_OBSERVATION"
+        assert "INVALID_CANDLE_OHLC" in res["resolution_reason"]
+
+    def test_candle_invalid_geometry_low_gt_high_rejected(self):
+        """Regression 70: Candle with low > high is rejected as INVALID_CANDLE_GEOMETRY."""
+        evaluator = ChronologicalBacktestEvaluator([])
+        t = dt.datetime(2026, 11, 1, 12, 0, tzinfo=dt.timezone.utc)
+        trace = make_valid_trace("dex:solana:TokenX:PoolA", t, duration_hours=24.0, mfe_pct=10.0, touch_hours=None)
+        trace["candles"][0]["low"] = 1.80
+        trace["candles"][0]["high"] = 1.10
+        item = {
+            "record_id": "rec_low_gt_high",
+            "market_key": "dex:solana:TokenX:PoolA",
+            "timestamp": t,
+            "timestamp_utc": "2026-11-01T12:00:00Z",
+            "detection_price": 1.0,
+            "raw_record": {
+                "chain": "solana",
+                "contract_address": "TokenX",
+                "pool_address": "PoolA",
+                "outcome_classification": "TARGET_NOT_REACHED",
+                "mfe_pct": 10.0,
+                "candle_trace": trace,
+            },
+        }
+        res = evaluator._resolve_outcome(item, lookup=None)
+        assert res["is_evaluated"] is False
+        assert res["outcome_classification"] == "INCOMPLETE_OBSERVATION"
+        assert "INVALID_CANDLE_GEOMETRY" in res["resolution_reason"]
+
+    def test_candle_invalid_geometry_low_gt_open_close_rejected(self):
+        """Regression 71: Candle with low > min(open, close) is rejected as INVALID_CANDLE_GEOMETRY."""
+        evaluator = ChronologicalBacktestEvaluator([])
+        t = dt.datetime(2026, 11, 1, 12, 0, tzinfo=dt.timezone.utc)
+        trace = make_valid_trace("dex:solana:TokenX:PoolA", t, duration_hours=24.0, mfe_pct=10.0, touch_hours=None)
+        trace["candles"][0]["open"] = 1.00
+        trace["candles"][0]["low"] = 1.05  # low exceeds open!
+        trace["candles"][0]["close"] = 1.10
+        trace["candles"][0]["high"] = 1.20
+        item = {
+            "record_id": "rec_low_gt_open",
+            "market_key": "dex:solana:TokenX:PoolA",
+            "timestamp": t,
+            "timestamp_utc": "2026-11-01T12:00:00Z",
+            "detection_price": 1.0,
+            "raw_record": {
+                "chain": "solana",
+                "contract_address": "TokenX",
+                "pool_address": "PoolA",
+                "outcome_classification": "TARGET_NOT_REACHED",
+                "mfe_pct": 10.0,
+                "candle_trace": trace,
+            },
+        }
+        res = evaluator._resolve_outcome(item, lookup=None)
+        assert res["is_evaluated"] is False
+        assert res["outcome_classification"] == "INCOMPLETE_OBSERVATION"
+        assert "INVALID_CANDLE_GEOMETRY" in res["resolution_reason"]
+
+    def test_candle_invalid_geometry_high_lt_open_close_rejected(self):
+        """Regression 72: Candle with high < max(open, close) is rejected as INVALID_CANDLE_GEOMETRY."""
+        evaluator = ChronologicalBacktestEvaluator([])
+        t = dt.datetime(2026, 11, 1, 12, 0, tzinfo=dt.timezone.utc)
+        trace = make_valid_trace("dex:solana:TokenX:PoolA", t, duration_hours=24.0, mfe_pct=10.0, touch_hours=None)
+        trace["candles"][0]["open"] = 1.00
+        trace["candles"][0]["low"] = 0.95
+        trace["candles"][0]["close"] = 1.25
+        trace["candles"][0]["high"] = 1.15  # high is below close!
+        item = {
+            "record_id": "rec_high_lt_close",
+            "market_key": "dex:solana:TokenX:PoolA",
+            "timestamp": t,
+            "timestamp_utc": "2026-11-01T12:00:00Z",
+            "detection_price": 1.0,
+            "raw_record": {
+                "chain": "solana",
+                "contract_address": "TokenX",
+                "pool_address": "PoolA",
+                "outcome_classification": "TARGET_NOT_REACHED",
+                "mfe_pct": 10.0,
+                "candle_trace": trace,
+            },
+        }
+        res = evaluator._resolve_outcome(item, lookup=None)
+        assert res["is_evaluated"] is False
+        assert res["outcome_classification"] == "INCOMPLETE_OBSERVATION"
+        assert "INVALID_CANDLE_GEOMETRY" in res["resolution_reason"]
+
+    # --- Item 3: Actual Observation Boundaries ---
+
+    def test_candle_before_detection_rejected(self):
+        """Regression 73: A candle timestamp preceding detection_dt is rejected as CANDLE_PRECEDES_DETECTION."""
+        evaluator = ChronologicalBacktestEvaluator([])
+        t = dt.datetime(2026, 11, 1, 12, 0, tzinfo=dt.timezone.utc)
+        trace = make_valid_trace("dex:solana:TokenX:PoolA", t, duration_hours=24.0, mfe_pct=10.0, touch_hours=None)
+        # Prepend a candle with timestamp 1 hour BEFORE detection
+        trace["candles"].insert(0, {
+            "timestamp_utc": (t - dt.timedelta(hours=1)).isoformat(),
+            "open": 1.0, "high": 1.05, "low": 0.95, "close": 1.02,
+        })
+        item = {
+            "record_id": "rec_candle_before_detection",
+            "market_key": "dex:solana:TokenX:PoolA",
+            "timestamp": t,
+            "timestamp_utc": "2026-11-01T12:00:00Z",
+            "detection_price": 1.0,
+            "raw_record": {
+                "chain": "solana",
+                "contract_address": "TokenX",
+                "pool_address": "PoolA",
+                "outcome_classification": "TARGET_NOT_REACHED",
+                "mfe_pct": 10.0,
+                "candle_trace": trace,
+            },
+        }
+        res = evaluator._resolve_outcome(item, lookup=None)
+        assert res["is_evaluated"] is False
+        assert res["outcome_classification"] == "INCOMPLETE_OBSERVATION"
+        assert "CANDLE_PRECEDES_DETECTION" in res["resolution_reason"]
+
+    def test_trace_metadata_inconsistent_with_actual_first_candle_rejected(self):
+        """Regression 74: Trace metadata start_utc inconsistent with actual first candle is rejected as TRACE_START_MISMATCH."""
+        evaluator = ChronologicalBacktestEvaluator([])
+        t = dt.datetime(2026, 11, 1, 12, 0, tzinfo=dt.timezone.utc)
+        trace = make_valid_trace("dex:solana:TokenX:PoolA", t, duration_hours=24.0, mfe_pct=10.0, touch_hours=None)
+        # Claim trace started 5 hours before actual first candle
+        trace["trace_start_utc"] = (t - dt.timedelta(minutes=3)).isoformat()
+        # First candle is at t + 10 hours
+        for c in trace["candles"]:
+            c_dt = dt.datetime.fromisoformat(c["timestamp_utc"])
+            c["timestamp_utc"] = (c_dt + dt.timedelta(hours=10)).isoformat()
+        trace["trace_end_utc"] = (t + dt.timedelta(hours=34)).isoformat()
+        trace["retrieved_utc"] = (t + dt.timedelta(hours=35)).isoformat()
+
+        item = {
+            "record_id": "rec_trace_start_mismatch",
+            "market_key": "dex:solana:TokenX:PoolA",
+            "timestamp": t,
+            "timestamp_utc": "2026-11-01T12:00:00Z",
+            "detection_price": 1.0,
+            "raw_record": {
+                "chain": "solana",
+                "contract_address": "TokenX",
+                "pool_address": "PoolA",
+                "outcome_classification": "TARGET_NOT_REACHED",
+                "mfe_pct": 10.0,
+                "candle_trace": trace,
+            },
+        }
+        res = evaluator._resolve_outcome(item, lookup=None)
+        assert res["is_evaluated"] is False
+        assert res["outcome_classification"] == "INCOMPLETE_OBSERVATION"
+        assert "TRACE_START_MISMATCH" in res["resolution_reason"]
+
+    def test_trace_metadata_inconsistent_with_actual_last_candle_rejected(self):
+        """Regression 75: Trace metadata end_utc inconsistent with actual last candle is rejected as TRACE_END_MISMATCH."""
+        evaluator = ChronologicalBacktestEvaluator([])
+        t = dt.datetime(2026, 11, 1, 12, 0, tzinfo=dt.timezone.utc)
+        # 24h declared trace, but actual candles stop at hour 12
+        trace = make_valid_trace("dex:solana:TokenX:PoolA", t, duration_hours=24.0, mfe_pct=10.0, touch_hours=None, stale_hours=12.0)
+        item = {
+            "record_id": "rec_trace_end_mismatch",
+            "market_key": "dex:solana:TokenX:PoolA",
+            "timestamp": t,
+            "timestamp_utc": "2026-11-01T12:00:00Z",
+            "detection_price": 1.0,
+            "raw_record": {
+                "chain": "solana",
+                "contract_address": "TokenX",
+                "pool_address": "PoolA",
+                "outcome_classification": "TARGET_NOT_REACHED",
+                "mfe_pct": 10.0,
+                "candle_trace": trace,
+            },
+        }
+        res = evaluator._resolve_outcome(item, lookup=None)
+        assert res["is_evaluated"] is False
+        assert res["outcome_classification"] == "INCOMPLETE_OBSERVATION"
+        assert "TRACE_END_MISMATCH" in res["resolution_reason"]
+
+    def test_trace_end_timestamp_before_start_timestamp_rejected(self):
+        """Regression 76: A trace whose end timestamp precedes start timestamp is rejected as TRACE_END_BEFORE_START."""
+        evaluator = ChronologicalBacktestEvaluator([])
+        t = dt.datetime(2026, 11, 1, 12, 0, tzinfo=dt.timezone.utc)
+        trace = make_valid_trace("dex:solana:TokenX:PoolA", t, duration_hours=24.0, mfe_pct=10.0, touch_hours=None)
+        # Invert start and end timestamps
+        trace["trace_start_utc"] = (t + dt.timedelta(hours=24)).isoformat()
+        trace["trace_end_utc"] = t.isoformat()
+        item = {
+            "record_id": "rec_end_before_start",
+            "market_key": "dex:solana:TokenX:PoolA",
+            "timestamp": t,
+            "timestamp_utc": "2026-11-01T12:00:00Z",
+            "detection_price": 1.0,
+            "raw_record": {
+                "chain": "solana",
+                "contract_address": "TokenX",
+                "pool_address": "PoolA",
+                "outcome_classification": "TARGET_NOT_REACHED",
+                "mfe_pct": 10.0,
+                "candle_trace": trace,
+            },
+        }
+        res = evaluator._resolve_outcome(item, lookup=None)
+        assert res["is_evaluated"] is False
+        assert res["outcome_classification"] == "TRACE_END_BEFORE_START"
+        assert "TRACE_END_BEFORE_START" in res["resolution_reason"]
+
+    def test_future_dated_candle_relative_to_retrieval_rejected(self):
+        """Regression 77: A candle timestamped after evidence retrieval timestamp is rejected as CANDLE_FUTURE_DATED."""
+        evaluator = ChronologicalBacktestEvaluator([])
+        t = dt.datetime(2026, 11, 1, 12, 0, tzinfo=dt.timezone.utc)
+        trace = make_valid_trace("dex:solana:TokenX:PoolA", t, duration_hours=24.0, mfe_pct=10.0, touch_hours=None)
+        # Set retrieved_utc to hour 10, but candles run up to hour 24
+        trace["retrieved_utc"] = (t + dt.timedelta(hours=10)).isoformat()
+        item = {
+            "record_id": "rec_future_dated_candle",
+            "market_key": "dex:solana:TokenX:PoolA",
+            "timestamp": t,
+            "timestamp_utc": "2026-11-01T12:00:00Z",
+            "detection_price": 1.0,
+            "raw_record": {
+                "chain": "solana",
+                "contract_address": "TokenX",
+                "pool_address": "PoolA",
+                "outcome_classification": "TARGET_NOT_REACHED",
+                "mfe_pct": 10.0,
+                "candle_trace": trace,
+            },
+        }
+        res = evaluator._resolve_outcome(item, lookup=None)
+        assert res["is_evaluated"] is False
+        assert res["outcome_classification"] == "INCOMPLETE_OBSERVATION"
+        assert "CANDLE_FUTURE_DATED" in res["resolution_reason"]
+
+    def test_valid_complete_trace_evidence_audit_preserved(self):
+        """Regression 78: A valid complete trace successfully evaluates and preserves provider audit evidence."""
+        evaluator = ChronologicalBacktestEvaluator([])
+        t = dt.datetime(2026, 11, 1, 12, 0, tzinfo=dt.timezone.utc)
+        trace = make_valid_trace(
+            "dex:solana:TokenX:PoolA",
+            t,
+            duration_hours=24.0,
+            mfe_pct=50.0,
+            touch_hours=3.0,
+            provenance="geckoterminal",
+            source_ref="https://api.geckoterminal.com/api/v2/networks/solana/pools/PoolA/ohlcv/hour",
+        )
+        trace["provider_metadata"] = {"pool_id": "PoolA", "dex": "raydium", "response_ms": 142}
+        item = {
+            "record_id": "rec_audit_preserved",
+            "market_key": "dex:solana:TokenX:PoolA",
+            "timestamp": t,
+            "timestamp_utc": "2026-11-01T12:00:00Z",
+            "detection_price": 1.0,
+            "raw_record": {
+                "chain": "solana",
+                "contract_address": "TokenX",
+                "pool_address": "PoolA",
+                "outcome_classification": "TARGET_REACHED",
+                "mfe_pct": 50.0,
+                "hours_to_target": 3.0,
+                "candle_trace": trace,
+            },
+        }
+        res = evaluator._resolve_outcome(item, lookup=None)
+        assert res["is_evaluated"] is True
+        assert res["target_reached"] is True
+        assert res["hours_to_target"] == 3.0
+        assert "evidence_audit" in res
+        audit = res["evidence_audit"]
+        assert audit["provider"] == "geckoterminal"
+        assert audit["source_domain"] == "api.geckoterminal.com"
+        assert audit["provider_metadata"] == {"pool_id": "PoolA", "dex": "raydium", "response_ms": 142}

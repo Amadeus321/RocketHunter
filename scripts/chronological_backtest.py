@@ -19,6 +19,7 @@ import json
 import math
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 BACKTEST_VERSION = "4.30.0"
 MANDATORY_TARGET_PCT = 40.0
@@ -37,6 +38,45 @@ RECOGNIZED_TRACE_PROVIDERS = {
     "gateio",
 }
 
+PROVIDER_ALIASES: dict[str, str] = {
+    "geckoterminal": "geckoterminal",
+    "gecko_terminal": "geckoterminal",
+    "gecko-terminal": "geckoterminal",
+    "dexscreener": "dexscreener",
+    "dex_screener": "dexscreener",
+    "dex-screener": "dexscreener",
+    "birdeye": "birdeye",
+    "bird_eye": "birdeye",
+    "bird-eye": "birdeye",
+    "dexpaprika": "dexpaprika",
+    "dex_paprika": "dexpaprika",
+    "dex-paprika": "dexpaprika",
+    "binance": "binance",
+    "coinbase": "coinbase",
+    "kraken": "kraken",
+    "bybit": "bybit",
+    "okx": "okx",
+    "kucoin": "kucoin",
+    "gateio": "gateio",
+    "gate_io": "gateio",
+    "gate-io": "gateio",
+    "gate.io": "gateio",
+}
+
+PROVIDER_DOMAIN_ALLOWLIST: dict[str, set[str]] = {
+    "geckoterminal": {"geckoterminal.com", "api.geckoterminal.com"},
+    "dexscreener": {"dexscreener.com", "api.dexscreener.com", "io.dexscreener.com"},
+    "birdeye": {"birdeye.so", "public-api.birdeye.so"},
+    "dexpaprika": {"dexpaprika.com", "api.dexpaprika.com"},
+    "binance": {"binance.com", "api.binance.com", "data-api.binance.vision"},
+    "coinbase": {"coinbase.com", "api.coinbase.com", "api.exchange.coinbase.com"},
+    "kraken": {"kraken.com", "api.kraken.com"},
+    "bybit": {"bybit.com", "api.bybit.com"},
+    "okx": {"okx.com", "www.okx.com", "aws.okx.com"},
+    "kucoin": {"kucoin.com", "api.kucoin.com"},
+    "gateio": {"gate.io", "api.gateio.ws", "www.gate.io"},
+}
+
 CANDLE_INTERVAL_SECONDS = {
     "1m": 60,
     "5m": 300,
@@ -49,8 +89,8 @@ CANDLE_INTERVAL_SECONDS = {
 
 CANDLE_TRACE_SCHEMA = {
     "required_fields": [
-        "provider",            # recognized data source (e.g. geckoterminal, dexscreener, binance)
-        "source_ref",          # reference URL or query ID
+        "provider",            # recognized exact data source identifier
+        "source_ref",          # reference URL with approved domain
         "retrieved_utc",       # timestamp of evidence retrieval
         "market_key",          # exact canonical market identity
         "candle_interval",     # declared candle resolution (1m, 5m, 15m, 30m, 1h, 4h, 1d)
@@ -60,19 +100,64 @@ CANDLE_TRACE_SCHEMA = {
     ],
     "candle_fields": ["timestamp_utc", "open", "high", "low", "close"],
     "recognized_providers": sorted(RECOGNIZED_TRACE_PROVIDERS),
+    "provider_domain_allowlist": {k: sorted(v) for k, v in PROVIDER_DOMAIN_ALLOWLIST.items()},
     "recognized_intervals": list(CANDLE_INTERVAL_SECONDS.keys()),
 }
 
 
 def normalize_trace_provider(raw_prov: Any) -> str | None:
-    """Extract and normalize recognized data provider from provenance string or identifier."""
+    """Extract and normalize recognized data provider from exact identifier.
+
+    Rejects substring matching, arbitrary URLs, and fabricated identifiers.
+    """
     if not raw_prov or not isinstance(raw_prov, str):
         return None
-    cleaned = raw_prov.strip().lower().replace("-", "").replace("_", "")
-    for prov in RECOGNIZED_TRACE_PROVIDERS:
-        if prov in cleaned:
-            return prov
-    return cleaned
+    cleaned = raw_prov.strip().lower()
+    # Reject URLs and paths passed as provider identifiers
+    if "://" in cleaned or "/" in cleaned or "\\" in cleaned:
+        return None
+    return PROVIDER_ALIASES.get(cleaned)
+
+
+def extract_source_domain(source_ref: Any) -> str | None:
+    """Extract lowercase network hostname/domain from a source reference or URL."""
+    if not source_ref or not isinstance(source_ref, str):
+        return None
+    s = source_ref.strip()
+    if not s:
+        return None
+    try:
+        if "://" in s:
+            parsed = urlparse(s)
+            host = parsed.netloc.lower()
+        else:
+            host = s.split("/")[0].lower()
+        if ":" in host:
+            host = host.split(":")[0]
+        if "." in host and " " not in host and len(host) >= 4:
+            return host
+        return None
+    except Exception:
+        return None
+
+
+def validate_provider_source_domain(provider: str, domain: str) -> tuple[bool, str]:
+    """Verify that domain matches provider allowlist and detect provider/domain mismatch.
+
+    Returns (is_valid, status_code).
+    """
+    allowed_domains = PROVIDER_DOMAIN_ALLOWLIST.get(provider, set())
+    is_match = any(domain == allowed or domain.endswith("." + allowed) for allowed in allowed_domains)
+    if is_match:
+        return True, "OK"
+
+    # Check if domain belongs to another recognized provider
+    for other_prov, other_domains in PROVIDER_DOMAIN_ALLOWLIST.items():
+        if other_prov != provider:
+            if any(domain == allowed or domain.endswith("." + allowed) for allowed in other_domains):
+                return False, "PROVIDER_DOMAIN_MISMATCH"
+
+    return False, "UNAPPROVED_SOURCE_DOMAIN"
 
 try:
     from scripts.address_identity import validate_and_build_identity
@@ -98,6 +183,22 @@ def _clean_num(val: Any) -> float | None:
     try:
         v = float(val)
         return v if math.isfinite(v) else None
+    except (ValueError, TypeError):
+        return None
+
+
+def _clean_strictly_positive_num(val: Any) -> float | None:
+    """Validate and return float only if numeric, finite, and strictly positive (> 0).
+
+    Rejects booleans, None, empty strings, NaN, infinity, zero, and negative numbers.
+    """
+    if val is None or val == "" or isinstance(val, bool):
+        return None
+    try:
+        v = float(val)
+        if math.isnan(v) or math.isinf(v) or v <= 0.0:
+            return None
+        return v
     except (ValueError, TypeError):
         return None
 
@@ -657,7 +758,7 @@ class ChronologicalBacktestEvaluator:
             }, None
 
         norm_prov = normalize_trace_provider(raw_prov)
-        if norm_prov not in RECOGNIZED_TRACE_PROVIDERS:
+        if norm_prov is None or norm_prov not in RECOGNIZED_TRACE_PROVIDERS:
             self.diagnostics["unresolved_outcomes"] += 1
             return False, {
                 "outcome_classification": "UNRECOGNIZED_TRACE_PROVIDER",
@@ -667,7 +768,7 @@ class ChronologicalBacktestEvaluator:
                 "mae_pct": None,
                 "hours_to_target": None,
                 "is_evaluated": False,
-                "resolution_reason": f"UNRECOGNIZED_TRACE_PROVIDER: provider '{raw_prov}' is not a recognized market data provider",
+                "resolution_reason": f"UNRECOGNIZED_TRACE_PROVIDER: provider '{raw_prov}' is not an exact recognized market data provider",
                 "execution_status": exec_status,
                 "execution_net_return_pct": None,
             }, None
@@ -741,6 +842,21 @@ class ChronologicalBacktestEvaluator:
                 "execution_net_return_pct": None,
             }, None
 
+        if trace_end_dt < trace_start_dt:
+            self.diagnostics["unresolved_outcomes"] += 1
+            return False, {
+                "outcome_classification": "TRACE_END_BEFORE_START",
+                "target_reached": None,
+                "market_target_reached": None,
+                "mfe_pct": mfe_pct,
+                "mae_pct": None,
+                "hours_to_target": None,
+                "is_evaluated": False,
+                "resolution_reason": f"TRACE_END_BEFORE_START: trace_end_utc {trace_end_dt.isoformat()} precedes trace_start_utc {trace_start_dt.isoformat()}",
+                "execution_status": exec_status,
+                "execution_net_return_pct": None,
+            }, None
+
         if trace_start_dt < (detection_dt - dt.timedelta(minutes=5)):
             self.diagnostics["unresolved_outcomes"] += 1
             return False, {
@@ -756,7 +872,7 @@ class ChronologicalBacktestEvaluator:
                 "execution_net_return_pct": None,
             }, None
 
-        # 5. Source Reference / Retrieval Evidence
+        # 5. Source Reference / Retrieval Evidence & Domain Validation
         source_ref = (
             trace.get("source_ref")
             or trace.get("source_url")
@@ -779,6 +895,52 @@ class ChronologicalBacktestEvaluator:
                 "execution_status": exec_status,
                 "execution_net_return_pct": None,
             }, None
+
+        source_domain = extract_source_domain(source_ref)
+        if not source_domain:
+            self.diagnostics["unresolved_outcomes"] += 1
+            return False, {
+                "outcome_classification": "UNAPPROVED_SOURCE_DOMAIN",
+                "target_reached": None,
+                "market_target_reached": None,
+                "mfe_pct": mfe_pct,
+                "mae_pct": None,
+                "hours_to_target": None,
+                "is_evaluated": False,
+                "resolution_reason": f"UNAPPROVED_SOURCE_DOMAIN: source reference '{source_ref}' does not contain an approved domain",
+                "execution_status": exec_status,
+                "execution_net_return_pct": None,
+            }, None
+
+        is_domain_valid, domain_status = validate_provider_source_domain(norm_prov, source_domain)
+        if not is_domain_valid:
+            self.diagnostics["unresolved_outcomes"] += 1
+            if domain_status == "PROVIDER_DOMAIN_MISMATCH":
+                return False, {
+                    "outcome_classification": "PROVIDER_DOMAIN_MISMATCH",
+                    "target_reached": None,
+                    "market_target_reached": None,
+                    "mfe_pct": mfe_pct,
+                    "mae_pct": None,
+                    "hours_to_target": None,
+                    "is_evaluated": False,
+                    "resolution_reason": f"PROVIDER_DOMAIN_MISMATCH: provider '{norm_prov}' does not match source domain '{source_domain}'",
+                    "execution_status": exec_status,
+                    "execution_net_return_pct": None,
+                }, None
+            else:
+                return False, {
+                    "outcome_classification": "UNAPPROVED_SOURCE_DOMAIN",
+                    "target_reached": None,
+                    "market_target_reached": None,
+                    "mfe_pct": mfe_pct,
+                    "mae_pct": None,
+                    "hours_to_target": None,
+                    "is_evaluated": False,
+                    "resolution_reason": f"UNAPPROVED_SOURCE_DOMAIN: domain '{source_domain}' is not approved for provider '{norm_prov}'",
+                    "execution_status": exec_status,
+                    "execution_net_return_pct": None,
+                }, None
 
         # 6. Evidence Retrieval Timestamp
         raw_retrieved = (
@@ -859,6 +1021,38 @@ class ChronologicalBacktestEvaluator:
                     "execution_net_return_pct": None,
                 }, None
 
+            # Boundary 1: No candle may precede detection
+            if c_dt < detection_dt:
+                self.diagnostics["unresolved_outcomes"] += 1
+                return False, {
+                    "outcome_classification": "INCOMPLETE_OBSERVATION",
+                    "target_reached": None,
+                    "market_target_reached": None,
+                    "mfe_pct": mfe_pct,
+                    "mae_pct": None,
+                    "hours_to_target": None,
+                    "is_evaluated": False,
+                    "resolution_reason": f"CANDLE_PRECEDES_DETECTION: candle at index {idx} timestamp {c_dt.isoformat()} precedes detection {detection_dt.isoformat()}",
+                    "execution_status": exec_status,
+                    "execution_net_return_pct": None,
+                }, None
+
+            # Boundary 2: Reject future-dated candle relative to retrieval timestamp
+            if c_dt > retrieved_dt:
+                self.diagnostics["unresolved_outcomes"] += 1
+                return False, {
+                    "outcome_classification": "INCOMPLETE_OBSERVATION",
+                    "target_reached": None,
+                    "market_target_reached": None,
+                    "mfe_pct": mfe_pct,
+                    "mae_pct": None,
+                    "hours_to_target": None,
+                    "is_evaluated": False,
+                    "resolution_reason": f"CANDLE_FUTURE_DATED: candle at index {idx} timestamp {c_dt.isoformat()} is future-dated relative to retrieval timestamp {retrieved_dt.isoformat()}",
+                    "execution_status": exec_status,
+                    "execution_net_return_pct": None,
+                }, None
+
             # Detect duplicate timestamps
             if c_dt in seen_timestamps:
                 self.diagnostics["unresolved_outcomes"] += 1
@@ -876,8 +1070,31 @@ class ChronologicalBacktestEvaluator:
                 }, None
             seen_timestamps.add(c_dt)
 
-            c_high = _clean_num(c.get("high") or c.get("h"))
-            if c_high is None or c_high <= 0:
+            # Check required OHLC fields existence: open, high, low, close
+            ohlc_fields = [("open", ("open", "o")), ("high", ("high", "h")), ("low", ("low", "l")), ("close", ("close", "c"))]
+            for field_name, aliases in ohlc_fields:
+                val_present = any(a in c and c[a] is not None for a in aliases)
+                if not val_present:
+                    self.diagnostics["unresolved_outcomes"] += 1
+                    return False, {
+                        "outcome_classification": "INCOMPLETE_OBSERVATION",
+                        "target_reached": None,
+                        "market_target_reached": None,
+                        "mfe_pct": mfe_pct,
+                        "mae_pct": None,
+                        "hours_to_target": None,
+                        "is_evaluated": False,
+                        "resolution_reason": f"MISSING_CANDLE_OHLC: candle at index {idx} missing required field '{field_name}'",
+                        "execution_status": exec_status,
+                        "execution_net_return_pct": None,
+                    }, None
+
+            c_open = _clean_strictly_positive_num(c.get("open") if "open" in c else c.get("o"))
+            c_high = _clean_strictly_positive_num(c.get("high") if "high" in c else c.get("h"))
+            c_low = _clean_strictly_positive_num(c.get("low") if "low" in c else c.get("l"))
+            c_close = _clean_strictly_positive_num(c.get("close") if "close" in c else c.get("c"))
+
+            if c_open is None or c_high is None or c_low is None or c_close is None:
                 self.diagnostics["unresolved_outcomes"] += 1
                 return False, {
                     "outcome_classification": "INCOMPLETE_OBSERVATION",
@@ -887,58 +1104,59 @@ class ChronologicalBacktestEvaluator:
                     "mae_pct": None,
                     "hours_to_target": None,
                     "is_evaluated": False,
-                    "resolution_reason": f"INVALID_CANDLE_OHLC: candle at index {idx} has invalid high '{c_high}'",
+                    "resolution_reason": f"INVALID_CANDLE_OHLC: candle at index {idx} has non-numeric, NaN, infinite, zero, or negative OHLC values",
                     "execution_status": exec_status,
                     "execution_net_return_pct": None,
                 }, None
 
-            c_open = _clean_num(c.get("open") or c.get("o"))
-            c_low = _clean_num(c.get("low") or c.get("l"))
-            c_close = _clean_num(c.get("close") or c.get("c"))
+            # Enforce Candle Geometry:
+            # low <= min(open, close)
+            # high >= max(open, close)
+            # low <= high
+            if c_low > c_high:
+                self.diagnostics["unresolved_outcomes"] += 1
+                return False, {
+                    "outcome_classification": "INCOMPLETE_OBSERVATION",
+                    "target_reached": None,
+                    "market_target_reached": None,
+                    "mfe_pct": mfe_pct,
+                    "mae_pct": None,
+                    "hours_to_target": None,
+                    "is_evaluated": False,
+                    "resolution_reason": f"INVALID_CANDLE_GEOMETRY: candle at index {idx} low {c_low} > high {c_high}",
+                    "execution_status": exec_status,
+                    "execution_net_return_pct": None,
+                }, None
 
-            if c_low is not None:
-                if c_low <= 0 or c_low > c_high:
-                    self.diagnostics["unresolved_outcomes"] += 1
-                    return False, {
-                        "outcome_classification": "INCOMPLETE_OBSERVATION",
-                        "target_reached": None,
-                        "market_target_reached": None,
-                        "mfe_pct": mfe_pct,
-                        "mae_pct": None,
-                        "hours_to_target": None,
-                        "is_evaluated": False,
-                        "resolution_reason": f"INVALID_CANDLE_OHLC: candle at index {idx} has low {c_low} > high {c_high}",
-                        "execution_status": exec_status,
-                        "execution_net_return_pct": None,
-                    }, None
-                if c_open is not None and (c_open < c_low or c_open > c_high):
-                    self.diagnostics["unresolved_outcomes"] += 1
-                    return False, {
-                        "outcome_classification": "INCOMPLETE_OBSERVATION",
-                        "target_reached": None,
-                        "market_target_reached": None,
-                        "mfe_pct": mfe_pct,
-                        "mae_pct": None,
-                        "hours_to_target": None,
-                        "is_evaluated": False,
-                        "resolution_reason": f"INVALID_CANDLE_OHLC: candle at index {idx} open {c_open} outside low/high [{c_low}, {c_high}]",
-                        "execution_status": exec_status,
-                        "execution_net_return_pct": None,
-                    }, None
-                if c_close is not None and (c_close < c_low or c_close > c_high):
-                    self.diagnostics["unresolved_outcomes"] += 1
-                    return False, {
-                        "outcome_classification": "INCOMPLETE_OBSERVATION",
-                        "target_reached": None,
-                        "market_target_reached": None,
-                        "mfe_pct": mfe_pct,
-                        "mae_pct": None,
-                        "hours_to_target": None,
-                        "is_evaluated": False,
-                        "resolution_reason": f"INVALID_CANDLE_OHLC: candle at index {idx} close {c_close} outside low/high [{c_low}, {c_high}]",
-                        "execution_status": exec_status,
-                        "execution_net_return_pct": None,
-                    }, None
+            if c_low > min(c_open, c_close):
+                self.diagnostics["unresolved_outcomes"] += 1
+                return False, {
+                    "outcome_classification": "INCOMPLETE_OBSERVATION",
+                    "target_reached": None,
+                    "market_target_reached": None,
+                    "mfe_pct": mfe_pct,
+                    "mae_pct": None,
+                    "hours_to_target": None,
+                    "is_evaluated": False,
+                    "resolution_reason": f"INVALID_CANDLE_GEOMETRY: candle at index {idx} low {c_low} > min(open, close) {min(c_open, c_close)}",
+                    "execution_status": exec_status,
+                    "execution_net_return_pct": None,
+                }, None
+
+            if c_high < max(c_open, c_close):
+                self.diagnostics["unresolved_outcomes"] += 1
+                return False, {
+                    "outcome_classification": "INCOMPLETE_OBSERVATION",
+                    "target_reached": None,
+                    "market_target_reached": None,
+                    "mfe_pct": mfe_pct,
+                    "mae_pct": None,
+                    "hours_to_target": None,
+                    "is_evaluated": False,
+                    "resolution_reason": f"INVALID_CANDLE_GEOMETRY: candle at index {idx} high {c_high} < max(open, close) {max(c_open, c_close)}",
+                    "execution_status": exec_status,
+                    "execution_net_return_pct": None,
+                }, None
 
             parsed_candles.append({
                 "dt": c_dt,
@@ -1012,9 +1230,78 @@ class ChronologicalBacktestEvaluator:
                 "execution_net_return_pct": None,
             }, None
 
-        # 11. Observation Window Coverage
+        # 11. Observation Window Coverage & Trace Metadata Agreement
         first_candle_dt = sorted_candles[0]["dt"]
         last_candle_dt = sorted_candles[-1]["dt"]
+        candle_boundary_tolerance_s = max(60.0, step_seconds * 1.5)
+
+        if first_candle_dt < (trace_start_dt - dt.timedelta(seconds=60)):
+            self.diagnostics["unresolved_outcomes"] += 1
+            return False, {
+                "outcome_classification": "INCOMPLETE_OBSERVATION",
+                "target_reached": None,
+                "market_target_reached": None,
+                "mfe_pct": mfe_pct,
+                "mae_pct": None,
+                "hours_to_target": None,
+                "is_evaluated": False,
+                "resolution_reason": f"TRACE_START_MISMATCH: actual first candle {first_candle_dt.isoformat()} precedes trace_start_utc {trace_start_dt.isoformat()}",
+                "execution_status": exec_status,
+                "execution_net_return_pct": None,
+            }, None
+
+        if (first_candle_dt - trace_start_dt).total_seconds() > candle_boundary_tolerance_s:
+            self.diagnostics["unresolved_outcomes"] += 1
+            return False, {
+                "outcome_classification": "INCOMPLETE_OBSERVATION",
+                "target_reached": None,
+                "market_target_reached": None,
+                "mfe_pct": mfe_pct,
+                "mae_pct": None,
+                "hours_to_target": None,
+                "is_evaluated": False,
+                "resolution_reason": (
+                    f"TRACE_START_MISMATCH: actual first candle {first_candle_dt.isoformat()} starts "
+                    f"{(first_candle_dt - trace_start_dt).total_seconds():.1f}s after trace_start_utc {trace_start_dt.isoformat()}, "
+                    f"exceeding tolerance {candle_boundary_tolerance_s:.1f}s"
+                ),
+                "execution_status": exec_status,
+                "execution_net_return_pct": None,
+            }, None
+
+        if last_candle_dt > (trace_end_dt + dt.timedelta(seconds=60)):
+            self.diagnostics["unresolved_outcomes"] += 1
+            return False, {
+                "outcome_classification": "INCOMPLETE_OBSERVATION",
+                "target_reached": None,
+                "market_target_reached": None,
+                "mfe_pct": mfe_pct,
+                "mae_pct": None,
+                "hours_to_target": None,
+                "is_evaluated": False,
+                "resolution_reason": f"TRACE_END_MISMATCH: actual last candle {last_candle_dt.isoformat()} exceeds trace_end_utc {trace_end_dt.isoformat()}",
+                "execution_status": exec_status,
+                "execution_net_return_pct": None,
+            }, None
+
+        if (trace_end_dt - last_candle_dt).total_seconds() > candle_boundary_tolerance_s:
+            self.diagnostics["unresolved_outcomes"] += 1
+            return False, {
+                "outcome_classification": "INCOMPLETE_OBSERVATION",
+                "target_reached": None,
+                "market_target_reached": None,
+                "mfe_pct": mfe_pct,
+                "mae_pct": None,
+                "hours_to_target": None,
+                "is_evaluated": False,
+                "resolution_reason": (
+                    f"TRACE_END_MISMATCH: STALE_FINAL_CANDLE actual last candle {last_candle_dt.isoformat()} terminates "
+                    f"{(trace_end_dt - last_candle_dt).total_seconds():.1f}s before declared trace_end_utc {trace_end_dt.isoformat()}, "
+                    f"exceeding tolerance {candle_boundary_tolerance_s:.1f}s"
+                ),
+                "execution_status": exec_status,
+                "execution_net_return_pct": None,
+            }, None
 
         max_allowed_first_dt = detection_dt + dt.timedelta(seconds=step_seconds + 300)
         if first_candle_dt > max_allowed_first_dt:
@@ -1072,8 +1359,10 @@ class ChronologicalBacktestEvaluator:
                 }, None
 
         # 13. Derive and Verify MFE and First-Touch Chronology
+        # Pre-detection candles must never contribute to MFE, MAE or target-touch calculations
+        eval_candles = [c for c in sorted_candles if c["dt"] >= detection_dt]
         detection_price_val = detection_price if detection_price > 0 else 1.0
-        max_high = max(c["high"] for c in sorted_candles)
+        max_high = max(c["high"] for c in eval_candles)
         derived_mfe = round(((max_high - detection_price_val) / detection_price_val) * 100.0, 2)
 
         if mfe_pct is not None and abs(derived_mfe - mfe_pct) > 1.0:
@@ -1093,7 +1382,7 @@ class ChronologicalBacktestEvaluator:
             }, None
 
         target_price = detection_price_val * (1.0 + effective_target_pct / 100.0)
-        touching_candles = [c for c in sorted_candles if c["high"] >= target_price]
+        touching_candles = [c for c in eval_candles if c["high"] >= target_price]
 
         derived_touch_hours: float | None = None
         derived_touch_dt: dt.datetime | None = None
@@ -1203,6 +1492,11 @@ class ChronologicalBacktestEvaluator:
             "derived_touch_dt": derived_touch_dt,
             "candles_count": len(sorted_candles),
             "sorted_candles": sorted_candles,
+            "provider": norm_prov,
+            "source_ref": source_ref,
+            "source_domain": source_domain,
+            "retrieved_utc": raw_retrieved,
+            "provider_metadata": trace.get("provider_metadata") or trace.get("metadata") or trace.get("raw_response_metadata"),
         }
 
     def _resolve_outcome(self, item: dict[str, Any], lookup: dict[str, dict[str, Any]] | None) -> dict[str, Any]:
@@ -1521,6 +1815,13 @@ class ChronologicalBacktestEvaluator:
         # 10. Valid, non-contradictory verified outcome
         market_target_reached = bool(outcome_status == "TARGET_REACHED")
         self.diagnostics["successfully_matched_outcomes"] += 1
+        evidence_audit = {
+            "provider": trace_info.get("provider") if trace_info else None,
+            "source_ref": trace_info.get("source_ref") if trace_info else None,
+            "source_domain": trace_info.get("source_domain") if trace_info else None,
+            "retrieved_utc": trace_info.get("retrieved_utc") if trace_info else None,
+            "provider_metadata": trace_info.get("provider_metadata") if trace_info else None,
+        }
         return {
             "outcome_classification": outcome_status,
             "target_reached": market_target_reached,
@@ -1532,6 +1833,7 @@ class ChronologicalBacktestEvaluator:
             "resolution_reason": source_reason,
             "execution_status": exec_status,
             "execution_net_return_pct": exec_net_return,
+            "evidence_audit": evidence_audit,
         }
 
     def _calculate_metrics(self, evaluations: list[dict[str, Any]]) -> dict[str, Any]:
