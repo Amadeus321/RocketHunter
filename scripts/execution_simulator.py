@@ -936,6 +936,18 @@ def simulate_multi_size(
             elif expected_token_address and not same_address(expected_chain or book_chain, book_token, expected_token_address):
                 book_ident_status = "BOOK_TOKEN_MISMATCH"
                 book_ident_reason = f"order book token ({book_token}) does not match expected ({expected_token_address})"
+            elif require_quote_asset and not book_quote:
+                book_ident_status = "MISSING_QUOTE_ASSET_EVIDENCE"
+                book_ident_reason = "order book evidence missing explicit quote asset identity"
+            elif expected_quote_asset and not book_quote:
+                book_ident_status = "MISSING_QUOTE_ASSET_EVIDENCE"
+                book_ident_reason = "order book evidence missing quote asset identity to verify against expected quote asset"
+            elif book_quote and not is_valid_address(book_chain, book_quote):
+                book_ident_status = "INVALID_TOKEN_ADDRESS"
+                book_ident_reason = f"order book quote asset address format invalid: {book_quote}"
+            elif book_quote and book_token and same_address(book_chain, book_token, book_quote):
+                book_ident_status = "INVALID_TOKEN_ADDRESS"
+                book_ident_reason = "order book token and quote asset cannot be the same address"
             elif expected_quote_asset and book_quote and not same_address(expected_chain or book_chain, book_quote, expected_quote_asset):
                 book_ident_status = "QUOTE_ASSET_MISMATCH"
                 book_ident_reason = f"order book quote asset ({book_quote}) does not match expected ({expected_quote_asset})"
@@ -1050,8 +1062,8 @@ def simulate_multi_size(
             # DO NOT inherit missing identity from parent candidate! Must be provided by reserve snapshot itself.
             res_chain = amm_reserves.get("chain")
             res_pool = amm_reserves.get("pool_address") or amm_reserves.get("pool")
-            res_t0 = amm_reserves.get("token0") or amm_reserves.get("base_token")
-            res_t1 = amm_reserves.get("token1") or amm_reserves.get("quote_token")
+            res_t0 = amm_reserves.get("token0")
+            res_t1 = amm_reserves.get("token1")
 
             if not res_chain:
                 size_evaluations[size_key] = {
@@ -1086,6 +1098,12 @@ def simulate_multi_size(
                 continue
 
             if not res_t0 or not res_t1:
+                has_aliases = bool(amm_reserves.get("base_token") or amm_reserves.get("quote_token"))
+                reason = (
+                    "reserve snapshot uses ambiguous base_token/quote_token aliases without explicit token0/token1 pool ordering"
+                    if has_aliases else
+                    "reserve snapshot missing token0 or token1 identity"
+                )
                 size_evaluations[size_key] = {
                     "size_usd": size,
                     "status": "MISSING_AMM_TOKEN_IDENTITY",
@@ -1095,9 +1113,9 @@ def simulate_multi_size(
                     "quote_verified_for_size": False,
                     "size_verification_status": "ORDER_SIZE_UNVERIFIED_ESTIMATE",
                     "quote_age_seconds": round(res_age, 1) if res_age is not None else None,
-                    "reason": "reserve snapshot missing token0 or token1 identity",
-                    "buy": {"status": "UNAVAILABLE", "reason": "Missing AMM token identity"},
-                    "sell": {"status": "UNAVAILABLE", "reason": "Missing AMM token identity"},
+                    "reason": reason,
+                    "buy": {"status": "UNAVAILABLE", "reason": reason},
+                    "sell": {"status": "UNAVAILABLE", "reason": reason},
                 }
                 continue
 

@@ -1302,6 +1302,233 @@ class AdversarialPhase2ExecutionTests(unittest.TestCase):
         self.assertEqual(qualified[0]["execution_simulation"]["reserve_base"], 10_000.0)
         self.assertEqual(qualified[0]["execution_simulation"]["reserve_quote"], 50_000.0)
 
+    # 29. AMM ambiguous base_token/quote_token aliases cannot silently establish orientation
+    def test_29_amm_ambiguous_aliases_cannot_establish_orientation(self):
+        src_aliases = {
+            "chain": VALID_EVM_CHAIN,
+            "pool_address": VALID_POOL_ADDR,
+            "contract_address": VALID_TOKEN_ADDR,
+            "liquidity_usd": 100_000.0,
+            "amm_reserves": {
+                "chain": VALID_EVM_CHAIN,
+                "pool_address": VALID_POOL_ADDR,
+                "base_token": VALID_TOKEN_ADDR,   # Ambiguous alias without explicit token0
+                "quote_token": VALID_QUOTE_ADDR,  # Ambiguous alias without explicit token1
+                "reserve0": 10_000.0,
+                "reserve1": 50_000.0,
+                "timestamp_utc": self.as_of_utc,
+            },
+        }
+        res = simulate_multi_size(
+            src_aliases, sizes_usd=[100.0], as_of_utc=self.as_of_utc,
+            expected_token_address=VALID_TOKEN_ADDR, expected_quote_asset=VALID_QUOTE_ADDR,
+        )
+        s100 = res["size_evaluations"]["$100"]
+        self.assertFalse(s100["route_available"])
+        self.assertEqual(s100["status"], "MISSING_AMM_TOKEN_IDENTITY")
+        self.assertIn("ambiguous base_token/quote_token aliases", s100["reason"])
+
+    # 30. Missing explicit AMM token ordering fails closed
+    def test_30_missing_explicit_amm_token_ordering_fails_closed(self):
+        src_no_order = {
+            "chain": VALID_EVM_CHAIN,
+            "pool_address": VALID_POOL_ADDR,
+            "contract_address": VALID_TOKEN_ADDR,
+            "liquidity_usd": 100_000.0,
+            "amm_reserves": {
+                "chain": VALID_EVM_CHAIN,
+                "pool_address": VALID_POOL_ADDR,
+                "reserve0": 10_000.0,
+                "reserve1": 50_000.0,
+                "timestamp_utc": self.as_of_utc,
+            },
+        }
+        res = simulate_multi_size(
+            src_no_order, sizes_usd=[100.0], as_of_utc=self.as_of_utc,
+            expected_token_address=VALID_TOKEN_ADDR,
+        )
+        self.assertFalse(res["size_evaluations"]["$100"]["route_available"])
+        self.assertEqual(res["size_evaluations"]["$100"]["status"], "MISSING_AMM_TOKEN_IDENTITY")
+
+    # 31. Valid order book with correct quote asset passes identity validation
+    def test_31_order_book_valid_quote_asset_passes(self):
+        book = {
+            "chain": VALID_EVM_CHAIN,
+            "pool_address": VALID_POOL_ADDR,
+            "token_address": VALID_TOKEN_ADDR,
+            "quote_asset": VALID_QUOTE_ADDR,
+            "timestamp_utc": self.as_of_utc,
+            "bids": [[99.0, 10.0]],
+            "asks": [[101.0, 10.0]],
+        }
+        res = simulate_multi_size(
+            book, sizes_usd=[100.0], as_of_utc=self.as_of_utc,
+            expected_token_address=VALID_TOKEN_ADDR, expected_chain=VALID_EVM_CHAIN,
+            expected_pool=VALID_POOL_ADDR, expected_quote_asset=VALID_QUOTE_ADDR,
+            require_quote_asset=True,
+        )
+        s100 = res["size_evaluations"]["$100"]
+        self.assertTrue(s100["route_available"])
+        self.assertEqual(s100["status"], "EXECUTABLE_DEPTH_AVAILABLE")
+
+    # 32. Order book with missing quote asset fails when quote verification is required
+    def test_32_order_book_missing_quote_asset_fails_when_required(self):
+        # 1. Missing quote asset with require_quote_asset=True
+        book_no_quote = {
+            "chain": VALID_EVM_CHAIN,
+            "pool_address": VALID_POOL_ADDR,
+            "token_address": VALID_TOKEN_ADDR,
+            "timestamp_utc": self.as_of_utc,
+            "bids": [[99.0, 10.0]],
+            "asks": [[101.0, 10.0]],
+        }
+        res1 = simulate_multi_size(
+            book_no_quote, sizes_usd=[100.0], as_of_utc=self.as_of_utc,
+            expected_token_address=VALID_TOKEN_ADDR, expected_chain=VALID_EVM_CHAIN,
+            expected_pool=VALID_POOL_ADDR, require_quote_asset=True,
+        )
+        s1 = res1["size_evaluations"]["$100"]
+        self.assertFalse(s1["route_available"])
+        self.assertEqual(s1["status"], "MISSING_QUOTE_ASSET_EVIDENCE")
+
+        # 2. Missing quote asset when expected_quote_asset is specified
+        res2 = simulate_multi_size(
+            book_no_quote, sizes_usd=[100.0], as_of_utc=self.as_of_utc,
+            expected_token_address=VALID_TOKEN_ADDR, expected_chain=VALID_EVM_CHAIN,
+            expected_pool=VALID_POOL_ADDR, expected_quote_asset=VALID_QUOTE_ADDR,
+        )
+        s2 = res2["size_evaluations"]["$100"]
+        self.assertFalse(s2["route_available"])
+        self.assertEqual(s2["status"], "MISSING_QUOTE_ASSET_EVIDENCE")
+
+    # 33. Order book with incorrect quote asset fails
+    def test_33_order_book_incorrect_quote_asset_fails(self):
+        # 1. Quote asset mismatch against expected_quote_asset
+        book_mismatch = {
+            "chain": VALID_EVM_CHAIN,
+            "pool_address": VALID_POOL_ADDR,
+            "token_address": VALID_TOKEN_ADDR,
+            "quote_asset": VALID_ALT_QUOTE,  # WETH instead of USDC
+            "timestamp_utc": self.as_of_utc,
+            "bids": [[99.0, 10.0]],
+            "asks": [[101.0, 10.0]],
+        }
+        res_mismatch = simulate_multi_size(
+            book_mismatch, sizes_usd=[100.0], as_of_utc=self.as_of_utc,
+            expected_token_address=VALID_TOKEN_ADDR, expected_quote_asset=VALID_QUOTE_ADDR,
+            require_quote_asset=True,
+        )
+        s_mismatch = res_mismatch["size_evaluations"]["$100"]
+        self.assertFalse(s_mismatch["route_available"])
+        self.assertEqual(s_mismatch["status"], "QUOTE_ASSET_MISMATCH")
+
+        # 2. Invalid quote asset address format
+        book_invalid_addr = {
+            "chain": VALID_EVM_CHAIN,
+            "pool_address": VALID_POOL_ADDR,
+            "token_address": VALID_TOKEN_ADDR,
+            "quote_asset": "0xinvalid_quote_address_with_bad_format",
+            "timestamp_utc": self.as_of_utc,
+            "bids": [[99.0, 10.0]],
+            "asks": [[101.0, 10.0]],
+        }
+        res_invalid = simulate_multi_size(
+            book_invalid_addr, sizes_usd=[100.0], as_of_utc=self.as_of_utc,
+            expected_token_address=VALID_TOKEN_ADDR, require_quote_asset=True,
+        )
+        s_invalid = res_invalid["size_evaluations"]["$100"]
+        self.assertFalse(s_invalid["route_available"])
+        self.assertEqual(s_invalid["status"], "INVALID_TOKEN_ADDRESS")
+
+        # 3. Candidate token and quote asset cannot be the same address
+        book_same_addr = {
+            "chain": VALID_EVM_CHAIN,
+            "pool_address": VALID_POOL_ADDR,
+            "token_address": VALID_TOKEN_ADDR,
+            "quote_asset": VALID_TOKEN_ADDR,  # Token equals quote asset
+            "timestamp_utc": self.as_of_utc,
+            "bids": [[99.0, 10.0]],
+            "asks": [[101.0, 10.0]],
+        }
+        res_same = simulate_multi_size(
+            book_same_addr, sizes_usd=[100.0], as_of_utc=self.as_of_utc,
+            expected_token_address=VALID_TOKEN_ADDR, require_quote_asset=True,
+        )
+        s_same = res_same["size_evaluations"]["$100"]
+        self.assertFalse(s_same["route_available"])
+        self.assertEqual(s_same["status"], "INVALID_TOKEN_ADDRESS")
+
+    # 34. Production qualification gate rejects missing-quote-asset order book
+    def test_34_production_gate_rejects_missing_quote_asset_order_book(self):
+        cand_book_missing_quote = {
+            "chain": VALID_EVM_CHAIN,
+            "pool_address": VALID_POOL_ADDR,
+            "contract_address": VALID_TOKEN_ADDR,
+            "final_pool_address": VALID_POOL_ADDR,
+            "final_token_contract": VALID_TOKEN_ADDR,
+            "final_quote_chain": VALID_EVM_CHAIN,
+            "final_quote_token_orientation_verified": True,
+            "final_price_verified": True,
+            "token_symbol": "ROCKET",
+            "market_type": "dex_pool",
+            "expected_quote_asset": VALID_QUOTE_ADDR,
+            "quote_token_address": VALID_QUOTE_ADDR,
+            "final_price_usd": 100.0,
+            "target_price": 140.0,  # +40.0% upside
+            "target_price_source": "7D_SWING_RESISTANCE",
+            "final_price_timestamp_utc": self.as_of_utc,
+            "intended_trade_size_usd": 100.0,
+            "liquidity_usd": 100_000.0,
+            "fee_bps": 30.0,
+            "technical_tp_validation": {
+                "status": "PASS",
+                "chain": VALID_EVM_CHAIN,
+                "pool_address": VALID_POOL_ADDR,
+                "token_address": VALID_TOKEN_ADDR,
+                "token_orientation_verified": True,
+                "target_price": 140.0,
+                "target_price_source": "7D_SWING_RESISTANCE",
+                "current_price": 100.0,
+                "atr_1h_pct": 10.0,
+                "maximum_tp_distance_pct": 40.0,
+                "candle_retrieved_utc": self.as_of_utc,
+            },
+            "trade_plan": {"single_take_profit": 140.0, "intended_trade_size_usd": 100.0, "quote_token_address": VALID_QUOTE_ADDR},
+            "dex_loss_guard_status": "PASS",
+            "dex_loss_guard_evidence": {
+                "status": "PASS",
+                "checks": {
+                    "exact_token_and_pool_identity": True,
+                    "launch_wallet_analysis": True,
+                    "lp_position_audit": True,
+                    "token_security_audit": True,
+                    "two_way_route_quotes": True,
+                },
+            },
+            "safety_verified": True,
+            "executable_route_verified": True,
+            "dex_execution_quotes": copy.deepcopy(self.valid_quote_source["dex_execution_quotes"]),
+            # Order book depth snapshot missing quote_asset
+            "order_book": {
+                "chain": VALID_EVM_CHAIN,
+                "pool_address": VALID_POOL_ADDR,
+                "token_address": VALID_TOKEN_ADDR,
+                # "quote_asset" is deliberately omitted
+                "timestamp_utc": self.as_of_utc,
+                "bids": [[99.0, 10.0]],
+                "asks": [[101.0, 10.0]],
+            },
+        }
+
+        qualified = v425.qualify_final_actionable_candidates([cand_book_missing_quote], self.now_dt)
+        self.assertEqual(len(qualified), 0)
+        self.assertIn("qualification_blockers", cand_book_missing_quote)
+        self.assertTrue(
+            any("quote asset verification failed" in b for b in cand_book_missing_quote["qualification_blockers"]),
+            f"Expected quote asset failure in blockers: {cand_book_missing_quote['qualification_blockers']}"
+        )
+        self.assertEqual(cand_book_missing_quote["execution_simulation"]["status"], "MISSING_QUOTE_ASSET_EVIDENCE")
+
 
 if __name__ == "__main__":
     unittest.main()
