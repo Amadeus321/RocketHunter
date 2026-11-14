@@ -1776,7 +1776,12 @@ def _update_position(position: dict[str, Any], bars: list[dict[str, Any]],
     return position
 
 
-def qualify_final_actionable_candidates(candidates: list[dict[str, Any]], now: datetime) -> list[dict[str, Any]]:
+def qualify_final_actionable_candidates(
+    candidates: list[dict[str, Any]],
+    now: datetime,
+    *,
+    allow_mocked_transport: bool = False,
+) -> list[dict[str, Any]]:
     """Filter discovery rows through the deterministic production action gate."""
     try:
         from scripts.tp_gate import canonical_tp_upside
@@ -2004,6 +2009,10 @@ def qualify_final_actionable_candidates(candidates: list[dict[str, Any]], now: d
                 "INVALID_DEX_AGGREGATOR_PAYLOAD",
                 "CONFLICTING_PROVIDER_EVIDENCE",
                 "FABRICATED_PROVIDER_RESPONSE",
+                "OBSERVATION_MUTATION_DETECTED",
+                "PAYLOAD_HASH_MISMATCH",
+                "CALLER_CREATED_OBSERVATION_OBJECT",
+                "INVALID_PROVENANCE_SIGNATURE",
                 "UNVERIFIED_PROVIDER_OBSERVATION",
                 "STRUCTURALLY_CONSISTENT_UNVERIFIED_PROVENANCE",
                 "PROVIDER_DATA_UNAVAILABLE",
@@ -2012,6 +2021,20 @@ def qualify_final_actionable_candidates(candidates: list[dict[str, Any]], now: d
             if sim_status in conv_error_codes or sim_res.get("status") in conv_error_codes:
                 err_code = sim_status if sim_status in conv_error_codes else sim_res.get("status")
                 sim_blockers.append(f"quote-asset USD conversion verification failed: {err_code}")
+
+            sim_conv = sim_res.get("quote_conversion") or (sim_eval.get("quote_conversion") if isinstance(sim_eval, dict) else None)
+            if sim_conv:
+                conv_st = sim_conv.get("conversion_status")
+                tr_type = sim_conv.get("transport_type")
+                if conv_st in conv_error_codes:
+                    if not any(f"quote-asset USD conversion verification failed: {conv_st}" in b for b in sim_blockers):
+                        sim_blockers.append(f"quote-asset USD conversion verification failed: {conv_st}")
+                elif not allow_mocked_transport and (tr_type == "MOCKED_TRANSPORT" or conv_st == "TEST_MOCKED_OBSERVATION_VALIDATED"):
+                    sim_blockers.append("quote-asset USD conversion uses MOCKED_TRANSPORT and cannot qualify for production")
+                elif sim_conv.get("provider_acquired") is not True:
+                    sim_blockers.append("quote-asset USD conversion lacks genuine authenticated provider acquisition")
+                elif not allow_mocked_transport and conv_st != "PROVIDER_RESPONSE_ACQUIRED_AND_VALIDATED":
+                    sim_blockers.append(f"quote-asset USD conversion verification failed: {conv_st}")
 
             if sim_status in {"MISSING_QUOTE_ASSET_EVIDENCE", "QUOTE_ASSET_MISMATCH"}:
                 sim_blockers.append(f"quote asset verification failed: {sim_status}")

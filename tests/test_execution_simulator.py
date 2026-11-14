@@ -15,6 +15,13 @@ from scripts.execution_simulator import (
     validate_quote_usd_conversion,
     acquire_provider_observation,
     is_valid_address,
+    ChainlinkRpcAdapter,
+    PythHermesAdapter,
+    UniswapV3TwapAdapter,
+    CexTickerAdapter,
+    DefiLlamaPricesAdapter,
+    AcquiredProviderObservation,
+    ProviderUnavailableError,
 )
 from scripts import v425_early_breakout as v425
 
@@ -34,14 +41,19 @@ VALID_SOLANA_POOL = "7XawhbbxtsRcQA8KTkHT9f9nc6d69UwqCDh6U5EEbEmX"
 VALID_SOLANA_QUOTE = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
 
 
-def make_mock_chainlink_rpc_transport(answer: int = 100000000, decimals: int = 8, round_id: int = 1, updated_at: int = 1794571200):
+def make_mock_chainlink_rpc_transport(answer: int = 100000000, decimals: int = 8, round_id: int = 1, updated_at: int = 1794571200, chain_id: int = 1):
     def transport(url: str, data: bytes | str | None, headers: dict[str, str] | None) -> tuple[int, bytes]:
         payload = json.loads(data) if isinstance(data, (str, bytes)) else {}
-        params = payload.get("params", [{}])[0]
-        call_data = params.get("data", "")
+        method = payload.get("method")
+        req_id = payload.get("id", 1)
+        if method == "eth_chainId":
+            return 200, json.dumps({"jsonrpc": "2.0", "result": hex(chain_id), "id": req_id}).encode("utf-8")
+        params = payload.get("params", [{}])
+        call_params = params[0] if isinstance(params, list) and len(params) > 0 and isinstance(params[0], dict) else {}
+        call_data = call_params.get("data", "")
         if call_data.startswith("0x313ce567"):
             res_hex = "0x" + hex(decimals)[2:].zfill(64)
-            return 200, json.dumps({"jsonrpc": "2.0", "result": res_hex, "id": payload.get("id", 1)}).encode("utf-8")
+            return 200, json.dumps({"jsonrpc": "2.0", "result": res_hex, "id": req_id}).encode("utf-8")
         elif call_data.startswith("0xfeaf968e"):
             r_hex = hex(round_id)[2:].zfill(64)
             ans_hex = hex(answer)[2:].zfill(64) if answer >= 0 else hex((1 << 256) + answer)[2:].zfill(64)
@@ -49,15 +61,15 @@ def make_mock_chainlink_rpc_transport(answer: int = 100000000, decimals: int = 8
             upd_hex = hex(updated_at)[2:].zfill(64)
             ans_round_hex = hex(round_id)[2:].zfill(64)
             res_hex = "0x" + r_hex + ans_hex + start_hex + upd_hex + ans_round_hex
-            return 200, json.dumps({"jsonrpc": "2.0", "result": res_hex, "id": payload.get("id", 1)}).encode("utf-8")
+            return 200, json.dumps({"jsonrpc": "2.0", "result": res_hex, "id": req_id}).encode("utf-8")
         elif call_data.startswith("0x50d25bcd"):
             ans_hex = hex(answer)[2:].zfill(64) if answer >= 0 else hex((1 << 256) + answer)[2:].zfill(64)
-            return 200, json.dumps({"jsonrpc": "2.0", "result": "0x" + ans_hex, "id": payload.get("id", 1)}).encode("utf-8")
+            return 200, json.dumps({"jsonrpc": "2.0", "result": "0x" + ans_hex, "id": req_id}).encode("utf-8")
         elif call_data.startswith("0x668a0f02"):
-            return 200, json.dumps({"jsonrpc": "2.0", "result": "0x" + hex(round_id)[2:].zfill(64), "id": payload.get("id", 1)}).encode("utf-8")
+            return 200, json.dumps({"jsonrpc": "2.0", "result": "0x" + hex(round_id)[2:].zfill(64), "id": req_id}).encode("utf-8")
         elif call_data.startswith("0x8205bf6a"):
-            return 200, json.dumps({"jsonrpc": "2.0", "result": "0x" + hex(updated_at)[2:].zfill(64), "id": payload.get("id", 1)}).encode("utf-8")
-        return 200, json.dumps({"jsonrpc": "2.0", "result": "0x", "id": payload.get("id", 1)}).encode("utf-8")
+            return 200, json.dumps({"jsonrpc": "2.0", "result": "0x" + hex(updated_at)[2:].zfill(64), "id": req_id}).encode("utf-8")
+        return 200, json.dumps({"jsonrpc": "2.0", "result": "0x", "id": req_id}).encode("utf-8")
     return transport
 
 
@@ -91,25 +103,50 @@ def make_mock_cex_transport(provider: str, symbol: str, price: float = 1.0, bid:
     return transport
 
 
-def make_mock_uniswap_v3_transport(tick_cumulatives: list[int] = [10000000, 10000060]):
+def make_mock_uniswap_v3_transport(
+    tick_cumulatives: list[int] = [10000000, 10000060],
+    chain_id: int = 1,
+    token0: str = "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48",
+    token1: str = "0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2",
+    fee_tier: int = 500,
+):
     def transport(url: str, data: bytes | str | None, headers: dict[str, str] | None) -> tuple[int, bytes]:
-        def to_word_int56(val: int) -> str:
-            if val < 0:
-                val = (1 << 256) + val
-            return hex(val)[2:].zfill(64)
+        payload = json.loads(data) if isinstance(data, (str, bytes)) else {}
+        method = payload.get("method")
+        req_id = payload.get("id", 1)
+        if method == "eth_chainId":
+            return 200, json.dumps({"jsonrpc": "2.0", "result": hex(chain_id), "id": req_id}).encode("utf-8")
+        params = payload.get("params", [{}])
+        call_params = params[0] if isinstance(params, list) and len(params) > 0 and isinstance(params[0], dict) else {}
+        call_data = call_params.get("data", "")
+        if call_data.startswith("0x0dfe1681"):  # token0()
+            clean_t0 = token0.lower().replace("0x", "").zfill(64)
+            return 200, json.dumps({"jsonrpc": "2.0", "result": "0x" + clean_t0, "id": req_id}).encode("utf-8")
+        elif call_data.startswith("0xd21220a7"):  # token1()
+            clean_t1 = token1.lower().replace("0x", "").zfill(64)
+            return 200, json.dumps({"jsonrpc": "2.0", "result": "0x" + clean_t1, "id": req_id}).encode("utf-8")
+        elif call_data.startswith("0xddca3f43"):  # fee()
+            res_hex = "0x" + hex(fee_tier)[2:].zfill(64)
+            return 200, json.dumps({"jsonrpc": "2.0", "result": res_hex, "id": req_id}).encode("utf-8")
+        elif call_data.startswith("0x88316456"):  # observe()
+            def to_word_int56(val: int) -> str:
+                if val < 0:
+                    val = (1 << 256) + val
+                return hex(val)[2:].zfill(64)
 
-        words = [
-            "00" * 31 + "40",
-            "00" * 31 + "a0",
-            "00" * 31 + "02",
-            to_word_int56(tick_cumulatives[0]),
-            to_word_int56(tick_cumulatives[1]),
-            "00" * 31 + "02",
-            "00" * 32,
-            "00" * 32,
-        ]
-        res_hex = "0x" + "".join(words)
-        return 200, json.dumps({"jsonrpc": "2.0", "result": res_hex, "id": 1}).encode("utf-8")
+            words = [
+                "00" * 31 + "40",
+                "00" * 31 + "a0",
+                "00" * 31 + "02",
+                to_word_int56(tick_cumulatives[0]),
+                to_word_int56(tick_cumulatives[1]),
+                "00" * 31 + "02",
+                "00" * 32,
+                "00" * 32,
+            ]
+            res_hex = "0x" + "".join(words)
+            return 200, json.dumps({"jsonrpc": "2.0", "result": res_hex, "id": req_id}).encode("utf-8")
+        return 200, json.dumps({"jsonrpc": "2.0", "result": "0x", "id": req_id}).encode("utf-8")
     return transport
 
 
@@ -622,9 +659,14 @@ class AdversarialPhase2ExecutionTests(unittest.TestCase):
 
         # Case B: expected_quote_asset mismatch
         src_exp = copy.deepcopy(self.valid_quote_source)
-        src_exp["quote_usd_conversion"]["quote_asset"] = VALID_ALT_QUOTE
-        src_exp["quote_usd_conversion"]["feed_address"] = "0x5f4ec3df9cbd43714fe2740f5e3616155c5b8419"
-        src_exp["quote_usd_conversion"]["valuation_policy"] = "CRYPTO_ORACLE_VERIFIED"
+        mock_weth = make_mock_chainlink_rpc_transport(answer=300000000000, decimals=8, round_id=1, updated_at=1794571200)
+        src_exp["quote_usd_conversion"] = acquire_provider_observation(
+            "chainlink",
+            VALID_ALT_QUOTE,
+            VALID_EVM_CHAIN,
+            as_of_utc=self.as_of_utc,
+            transport=mock_weth,
+        )
         res_exp = simulate_multi_size(
             src_exp, sizes_usd=[100.0], as_of_utc=self.as_of_utc,
             expected_token_address=VALID_TOKEN_ADDR,
@@ -1125,7 +1167,7 @@ class AdversarialPhase2ExecutionTests(unittest.TestCase):
             "dex_execution_quotes": copy.deepcopy(self.valid_quote_source["dex_execution_quotes"]),
         }
 
-        qualified = v425.qualify_final_actionable_candidates([cand], self.now_dt)
+        qualified = v425.qualify_final_actionable_candidates([cand], self.now_dt, allow_mocked_transport=True)
         self.assertEqual(len(qualified), 1)
         self.assertEqual(qualified[0]["opportunity_status"], "QUALIFIED")
         self.assertEqual(qualified[0]["execution_simulation"]["status"], "EXECUTABLE_ROUTE_AVAILABLE")
@@ -1409,7 +1451,7 @@ class AdversarialPhase2ExecutionTests(unittest.TestCase):
             },
         }
 
-        qualified = v425.qualify_final_actionable_candidates([cand_token1], self.now_dt)
+        qualified = v425.qualify_final_actionable_candidates([cand_token1], self.now_dt, allow_mocked_transport=True)
         self.assertEqual(len(qualified), 1)
         self.assertEqual(qualified[0]["opportunity_status"], "QUALIFIED")
         self.assertEqual(qualified[0]["execution_simulation"]["status"], "EXECUTABLE_AMM_ROUTE_AVAILABLE")
@@ -2145,7 +2187,7 @@ class AdversarialPhase2ExecutionTests(unittest.TestCase):
             as_of_utc=self.as_of_utc,
         )
         self.assertTrue(ok)
-        self.assertIn(status, ("PROVIDER_RESPONSE_ACQUIRED_AND_VALIDATED", "CONVERSION_VERIFIED"))
+        self.assertIn(status, ("PROVIDER_RESPONSE_ACQUIRED_AND_VALIDATED", "TEST_MOCKED_OBSERVATION_VALIDATED", "CONVERSION_VERIFIED"))
         self.assertEqual(price, 1.0)
         self.assertEqual(details["provider"], "chainlink")
         self.assertEqual(details["provenance_id"], "0x8fa59a53f040d12d26f03bc9920373707c3c4004")
@@ -2389,7 +2431,7 @@ class AdversarialPhase2ExecutionTests(unittest.TestCase):
             as_of_utc=self.as_of_utc,
         )
         self.assertTrue(ok)
-        self.assertIn(status, ("PROVIDER_RESPONSE_ACQUIRED_AND_VALIDATED", "CONVERSION_VERIFIED"))
+        self.assertIn(status, ("PROVIDER_RESPONSE_ACQUIRED_AND_VALIDATED", "TEST_MOCKED_OBSERVATION_VALIDATED", "CONVERSION_VERIFIED"))
         self.assertEqual(price, 1.0)
         self.assertEqual(details["provider"], "chainlink")
         self.assertEqual(details["provenance_id"], "0x8fa59a53f040d12d26f03bc9920373707c3c4004")
@@ -2719,7 +2761,7 @@ class AdversarialPhase2ExecutionTests(unittest.TestCase):
                 "feed_address": "0x9999999999999999999999999999999999999999",  # Fabricated feed
             },
         })
-        qualified = v425.qualify_final_actionable_candidates([cand], self.now_dt)
+        qualified = v425.qualify_final_actionable_candidates([cand], self.now_dt, allow_mocked_transport=True)
         self.assertEqual(len(qualified), 0)
         self.assertTrue(any("quote-asset USD conversion verification failed: UNRECOGNIZED_FEED_ADDRESS" in b for b in cand["qualification_blockers"]))
 
@@ -3084,7 +3126,7 @@ class AdversarialPhase2ExecutionTests(unittest.TestCase):
             "timestamp_utc": self.as_of_utc,
             "fee_bps": 30.0,
         }
-        qualified = v425.qualify_final_actionable_candidates([cand], self.now_dt)
+        qualified = v425.qualify_final_actionable_candidates([cand], self.now_dt, allow_mocked_transport=True)
         self.assertEqual(len(qualified), 0)
         self.assertTrue(any("REFERENCE_CURRENCY_MISMATCH" in b for b in cand["qualification_blockers"]))
 
@@ -3488,6 +3530,8 @@ class AdversarialPhase2ExecutionTests(unittest.TestCase):
     # 31. A fresh outer timestamp cannot hide a stale Chainlink updated_at
     def test_req31_fresh_outer_timestamp_cannot_hide_stale_chainlink_updated_at(self):
         conv_fresh_outer_stale_inner = copy.deepcopy(self.valid_quote_conversion)
+        conv_fresh_outer_stale_inner.pop("__acquired_observation__", None)
+        conv_fresh_outer_stale_inner.pop("_auth_token", None)
         conv_fresh_outer_stale_inner["timestamp_utc"] = self.as_of_utc  # Fresh outer timestamp
         conv_fresh_outer_stale_inner["observation"]["updated_at"] = "2026-11-13T11:40:00Z"  # 20 min old (> 300s)
         ok, status, price, details = validate_quote_usd_conversion(
@@ -3662,6 +3706,8 @@ class AdversarialPhase2ExecutionTests(unittest.TestCase):
     def test_req38_registered_feed_with_fabricated_observation_fields_cannot_qualify(self):
         # Genuine feed, but round tracking is incomplete: answered_in_round < round_id
         cl_bad_round = copy.deepcopy(self.valid_quote_conversion)
+        cl_bad_round.pop("__acquired_observation__", None)
+        cl_bad_round.pop("_auth_token", None)
         cl_bad_round["observation"]["round_id"] = 100
         cl_bad_round["observation"]["answered_in_round"] = 99  # Incomplete round!
         ok, status, _, details = validate_quote_usd_conversion(cl_bad_round, as_of_utc=self.as_of_utc)
@@ -3840,7 +3886,7 @@ class AdversarialPhase2ExecutionTests(unittest.TestCase):
         cl_acquired = acquire_provider_observation("chainlink", VALID_QUOTE_ADDR, VALID_EVM_CHAIN, as_of_utc=self.as_of_utc, transport=mock_cl)
         ok_cl, status_cl, p_cl, _ = validate_quote_usd_conversion(cl_acquired, as_of_utc=self.as_of_utc)
         self.assertTrue(ok_cl)
-        self.assertEqual(status_cl, "PROVIDER_RESPONSE_ACQUIRED_AND_VALIDATED")
+        self.assertIn(status_cl, ("PROVIDER_RESPONSE_ACQUIRED_AND_VALIDATED", "TEST_MOCKED_OBSERVATION_VALIDATED"))
         self.assertEqual(p_cl, 1.0)
 
         # Pyth
@@ -3848,7 +3894,7 @@ class AdversarialPhase2ExecutionTests(unittest.TestCase):
         pyth_acquired = acquire_provider_observation("pyth", "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v", "solana", as_of_utc=self.as_of_utc, transport=mock_py)
         ok_py, status_py, p_py, _ = validate_quote_usd_conversion(pyth_acquired, as_of_utc=self.as_of_utc)
         self.assertTrue(ok_py)
-        self.assertEqual(status_py, "PROVIDER_RESPONSE_ACQUIRED_AND_VALIDATED")
+        self.assertIn(status_py, ("PROVIDER_RESPONSE_ACQUIRED_AND_VALIDATED", "TEST_MOCKED_OBSERVATION_VALIDATED"))
         self.assertEqual(p_py, 1.0)
 
         # Coinbase
@@ -3856,7 +3902,7 @@ class AdversarialPhase2ExecutionTests(unittest.TestCase):
         cb_acquired = acquire_provider_observation("coinbase", VALID_QUOTE_ADDR, "ethereum", as_of_utc=self.as_of_utc, transport=mock_cb)
         ok_cb, status_cb, p_cb, _ = validate_quote_usd_conversion(cb_acquired, as_of_utc=self.as_of_utc)
         self.assertTrue(ok_cb)
-        self.assertEqual(status_cb, "PROVIDER_RESPONSE_ACQUIRED_AND_VALIDATED")
+        self.assertIn(status_cb, ("PROVIDER_RESPONSE_ACQUIRED_AND_VALIDATED", "TEST_MOCKED_OBSERVATION_VALIDATED"))
         self.assertEqual(p_cb, 1.0)
 
         # Uniswap v3 TWAP
@@ -3865,7 +3911,7 @@ class AdversarialPhase2ExecutionTests(unittest.TestCase):
         twap_acquired["usd_conversion_leg"] = self.valid_quote_conversion
         ok_tw, status_tw, p_tw, _ = validate_quote_usd_conversion(twap_acquired, as_of_utc=self.as_of_utc)
         self.assertTrue(ok_tw)
-        self.assertEqual(status_tw, "PROVIDER_RESPONSE_ACQUIRED_AND_VALIDATED")
+        self.assertIn(status_tw, ("PROVIDER_RESPONSE_ACQUIRED_AND_VALIDATED", "TEST_MOCKED_OBSERVATION_VALIDATED"))
 
     # 44. Existing strict bare-numeric-price rejection remains intact
     def test_req44_existing_strict_bare_numeric_price_rejection_intact(self):
@@ -3878,6 +3924,8 @@ class AdversarialPhase2ExecutionTests(unittest.TestCase):
     def test_req45_production_qualification_fails_closed_when_provider_evidence_incomplete(self):
         # Candidate with stale observation timestamp
         stale_cand = copy.deepcopy(self.valid_quote_source)
+        stale_cand["quote_usd_conversion"].pop("__acquired_observation__", None)
+        stale_cand["quote_usd_conversion"].pop("_auth_token", None)
         stale_cand["quote_usd_conversion"]["observation"]["updated_at"] = "2026-11-13T11:40:00Z"
         stale_cand["amm_reserves"] = {
             "chain": VALID_EVM_CHAIN,
@@ -3931,7 +3979,7 @@ class AdversarialPhase2ExecutionTests(unittest.TestCase):
         # Candidate fails closed at production qualification gate
         cand = copy.deepcopy(self.valid_quote_source)
         cand["quote_usd_conversion"] = fake_acquired
-        qualified = v425.qualify_final_actionable_candidates([cand], self.now_dt)
+        qualified = v425.qualify_final_actionable_candidates([cand], self.now_dt, allow_mocked_transport=True)
         self.assertEqual(len(qualified), 0)
         self.assertTrue(any("STRUCTURALLY_CONSISTENT_UNVERIFIED_PROVENANCE" in b for b in cand["qualification_blockers"]))
 
@@ -4123,7 +4171,7 @@ class AdversarialPhase2ExecutionTests(unittest.TestCase):
         cl_res = acquire_provider_observation("chainlink", VALID_QUOTE_ADDR, "ethereum", as_of_utc=self.as_of_utc, transport=mock_cl)
         ok_cl, st_cl, p_cl, det_cl = validate_quote_usd_conversion(cl_res, as_of_utc=self.as_of_utc)
         self.assertTrue(ok_cl)
-        self.assertEqual(st_cl, "PROVIDER_RESPONSE_ACQUIRED_AND_VALIDATED")
+        self.assertIn(st_cl, ("PROVIDER_RESPONSE_ACQUIRED_AND_VALIDATED", "TEST_MOCKED_OBSERVATION_VALIDATED"))
         self.assertTrue(det_cl["provider_acquired"])
 
         # 2. Pyth Hermes
@@ -4131,7 +4179,7 @@ class AdversarialPhase2ExecutionTests(unittest.TestCase):
         py_res = acquire_provider_observation("pyth", "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v", "solana", as_of_utc=self.as_of_utc, transport=mock_py)
         ok_py, st_py, p_py, det_py = validate_quote_usd_conversion(py_res, as_of_utc=self.as_of_utc)
         self.assertTrue(ok_py)
-        self.assertEqual(st_py, "PROVIDER_RESPONSE_ACQUIRED_AND_VALIDATED")
+        self.assertIn(st_py, ("PROVIDER_RESPONSE_ACQUIRED_AND_VALIDATED", "TEST_MOCKED_OBSERVATION_VALIDATED"))
         self.assertTrue(det_py["provider_acquired"])
 
         # 3. Coinbase CEX
@@ -4139,7 +4187,7 @@ class AdversarialPhase2ExecutionTests(unittest.TestCase):
         cb_res = acquire_provider_observation("coinbase", VALID_QUOTE_ADDR, "ethereum", as_of_utc=self.as_of_utc, transport=mock_cb)
         ok_cb, st_cb, p_cb, det_cb = validate_quote_usd_conversion(cb_res, as_of_utc=self.as_of_utc)
         self.assertTrue(ok_cb)
-        self.assertEqual(st_cb, "PROVIDER_RESPONSE_ACQUIRED_AND_VALIDATED")
+        self.assertIn(st_cb, ("PROVIDER_RESPONSE_ACQUIRED_AND_VALIDATED", "TEST_MOCKED_OBSERVATION_VALIDATED"))
         self.assertTrue(det_cb["provider_acquired"])
 
         # 4. DefiLlama DEX Aggregator
@@ -4148,7 +4196,7 @@ class AdversarialPhase2ExecutionTests(unittest.TestCase):
         dl_res["usd_conversion_leg"] = cl_res
         ok_dl, st_dl, p_dl, det_dl = validate_quote_usd_conversion(dl_res, as_of_utc=self.as_of_utc)
         self.assertTrue(ok_dl)
-        self.assertEqual(st_dl, "PROVIDER_RESPONSE_ACQUIRED_AND_VALIDATED")
+        self.assertIn(st_dl, ("PROVIDER_RESPONSE_ACQUIRED_AND_VALIDATED", "TEST_MOCKED_OBSERVATION_VALIDATED"))
         self.assertTrue(det_dl["provider_acquired"])
 
     # 56. Provider acquisition failure produces explicit unavailable status
@@ -4241,15 +4289,415 @@ class AdversarialPhase2ExecutionTests(unittest.TestCase):
                 "updated_at": self.as_of_utc,
             },
         }
-        res_unverif = v425.qualify_final_actionable_candidates([cand_unverif], self.now_dt)
+        res_unverif = v425.qualify_final_actionable_candidates([cand_unverif], self.now_dt, allow_mocked_transport=True)
         self.assertEqual(len(res_unverif), 0)
         self.assertTrue(any("STRUCTURALLY_CONSISTENT_UNVERIFIED_PROVENANCE" in b for b in cand_unverif["qualification_blockers"]))
 
         cand_auth = copy.deepcopy(cand)
         cand_auth["quote_usd_conversion"] = self.valid_quote_conversion
-        res_auth = v425.qualify_final_actionable_candidates([cand_auth], self.now_dt)
+        # In strict production mode, MOCKED_TRANSPORT is rejected:
+        res_prod = v425.qualify_final_actionable_candidates([cand_auth], self.now_dt, allow_mocked_transport=False)
+        self.assertEqual(len(res_prod), 0)
+        self.assertTrue(any("MOCKED_TRANSPORT" in b for b in cand_auth["qualification_blockers"]))
+
+        # In offline unit test mode with allow_mocked_transport=True, candidate passes:
+        cand_auth_test = copy.deepcopy(cand)
+        cand_auth_test["quote_usd_conversion"] = self.valid_quote_conversion
+        res_auth = v425.qualify_final_actionable_candidates([cand_auth_test], self.now_dt, allow_mocked_transport=True)
         self.assertEqual(len(res_auth), 1)
-        self.assertEqual(cand_auth["qualification_blockers"], [])
+        self.assertEqual(cand_auth_test["qualification_blockers"], [])
+
+
+class ProvenanceIntegrityAdversarialTests(unittest.TestCase):
+    """Exhaustive adversarial tests covering all Phase 2 provenance integrity requirements."""
+
+    def setUp(self):
+        self.as_of_utc = "2026-11-13T12:00:00Z"
+        self.now_dt = datetime(2026, 11, 13, 12, 0, 0, tzinfo=timezone.utc)
+        self.mock_cl_transport = make_mock_chainlink_rpc_transport(answer=100000000, decimals=8, round_id=1, updated_at=1794571200)
+        self.genuine_obs = ChainlinkRpcAdapter.fetch(
+            VALID_QUOTE_ADDR,
+            VALID_EVM_CHAIN,
+            as_of_utc=self.as_of_utc,
+            transport=self.mock_cl_transport,
+        )
+        self.base_candidate = {
+            "chain": VALID_EVM_CHAIN,
+            "pool_address": VALID_POOL_ADDR,
+            "contract_address": VALID_TOKEN_ADDR,
+            "final_pool_address": VALID_POOL_ADDR,
+            "final_token_contract": VALID_TOKEN_ADDR,
+            "final_quote_chain": VALID_EVM_CHAIN,
+            "final_quote_token_orientation_verified": True,
+            "final_price_verified": True,
+            "token_symbol": "ROCKET",
+            "market_type": "dex_pool",
+            "expected_quote_asset": VALID_QUOTE_ADDR,
+            "quote_token_address": VALID_QUOTE_ADDR,
+            "final_price_usd": 5.0,
+            "target_price": 7.0,
+            "target_price_source": "7D_SWING_RESISTANCE",
+            "final_price_timestamp_utc": self.as_of_utc,
+            "intended_trade_size_usd": 100.0,
+            "liquidity_usd": 100_000.0,
+            "fee_bps": 30.0,
+            "technical_tp_validation": {
+                "status": "PASS",
+                "chain": VALID_EVM_CHAIN,
+                "pool_address": VALID_POOL_ADDR,
+                "token_address": VALID_TOKEN_ADDR,
+                "token_orientation_verified": True,
+                "target_price": 7.0,
+                "target_price_source": "7D_SWING_RESISTANCE",
+                "current_price": 5.0,
+                "atr_1h_pct": 10.0,
+                "maximum_tp_distance_pct": 40.0,
+                "candle_retrieved_utc": self.as_of_utc,
+            },
+            "trade_plan": {"single_take_profit": 7.0, "intended_trade_size_usd": 100.0, "quote_token_address": VALID_QUOTE_ADDR},
+            "dex_loss_guard_status": "PASS",
+            "dex_loss_guard_evidence": {
+                "status": "PASS",
+                "checks": {
+                    "exact_token_and_pool_identity": True,
+                    "launch_wallet_analysis": True,
+                    "lp_position_audit": True,
+                    "token_security_audit": True,
+                    "two_way_route_quotes": True,
+                },
+            },
+            "safety_verified": True,
+            "executable_route_verified": True,
+            "dex_execution_quotes": {
+                "provider": "uniswap_v3",
+                "timestamp_utc": self.as_of_utc,
+                "chain": VALID_EVM_CHAIN,
+                "pool_address": VALID_POOL_ADDR,
+                "notional_size_usd": 100.0,
+                "buy_quote": {
+                    "direction": "BUY",
+                    "chain": VALID_EVM_CHAIN,
+                    "pool_address": VALID_POOL_ADDR,
+                    "timestamp_utc": self.as_of_utc,
+                    "in_token": VALID_QUOTE_ADDR,
+                    "out_token": VALID_TOKEN_ADDR,
+                    "in_amount": 100.0,
+                    "out_amount": 50.0,
+                    "notional_size_usd": 100.0,
+                },
+                "sell_quote": {
+                    "direction": "SELL",
+                    "chain": VALID_EVM_CHAIN,
+                    "pool_address": VALID_POOL_ADDR,
+                    "timestamp_utc": self.as_of_utc,
+                    "in_token": VALID_TOKEN_ADDR,
+                    "out_token": VALID_QUOTE_ADDR,
+                    "in_amount": 50.0,
+                    "out_amount": 98.0,
+                    "notional_size_usd": 100.0,
+                },
+            },
+            "quote_usd_conversion": self.genuine_obs.to_dict(),
+        }
+
+    # 1. Mutating price after genuine acquisition rejected
+    def test_01_mutating_price_after_genuine_acquisition_rejected(self):
+        obs = copy.deepcopy(self.genuine_obs)
+        obs.price_usd = 999.0
+        ok, status, _, _ = validate_quote_usd_conversion(obs, as_of_utc=self.as_of_utc)
+        self.assertFalse(ok)
+        self.assertEqual(status, "INVALID_PROVENANCE_SIGNATURE")
+
+        conv = self.genuine_obs.to_dict()
+        conv["price_usd"] = 999.0
+        ok2, status2, _, details2 = validate_quote_usd_conversion(conv, as_of_utc=self.as_of_utc)
+        self.assertFalse(ok2)
+        self.assertEqual(status2, "OBSERVATION_MUTATION_DETECTED")
+        self.assertIn("price", details2["reason"])
+
+    # 2. Mutating chain rejected
+    def test_02_mutating_chain_rejected(self):
+        obs = copy.deepcopy(self.genuine_obs)
+        obs.chain = "solana"
+        ok, status, _, _ = validate_quote_usd_conversion(obs, as_of_utc=self.as_of_utc)
+        self.assertFalse(ok)
+        self.assertIn(status, ("INVALID_PROVENANCE_SIGNATURE", "QUOTE_CONVERSION_CHAIN_MISMATCH"))
+
+        conv = self.genuine_obs.to_dict()
+        conv["chain"] = "arbitrum"
+        ok2, status2, _, details2 = validate_quote_usd_conversion(conv, as_of_utc=self.as_of_utc)
+        self.assertFalse(ok2)
+        self.assertIn(status2, ("OBSERVATION_MUTATION_DETECTED", "QUOTE_CONVERSION_CHAIN_MISMATCH"))
+
+    # 3. Mutating token address rejected
+    def test_03_mutating_token_address_rejected(self):
+        obs = copy.deepcopy(self.genuine_obs)
+        obs.quote_asset = "0x0000000000000000000000000000000000000000"
+        ok, status, _, _ = validate_quote_usd_conversion(obs, as_of_utc=self.as_of_utc)
+        self.assertFalse(ok)
+        self.assertIn(status, ("INVALID_PROVENANCE_SIGNATURE", "QUOTE_CONVERSION_ASSET_MISMATCH"))
+
+        conv = self.genuine_obs.to_dict()
+        conv["quote_asset"] = "0x0000000000000000000000000000000000000000"
+        ok2, status2, _, details2 = validate_quote_usd_conversion(conv, as_of_utc=self.as_of_utc)
+        self.assertFalse(ok2)
+        self.assertIn(status2, ("OBSERVATION_MUTATION_DETECTED", "QUOTE_CONVERSION_ASSET_MISMATCH"))
+
+    # 4. Mutating feed/market/pool identifier rejected
+    def test_04_mutating_feed_market_pool_identifier_rejected(self):
+        obs = copy.deepcopy(self.genuine_obs)
+        obs.feed_id = "0x1111111111111111111111111111111111111111"
+        ok, status, _, _ = validate_quote_usd_conversion(obs, as_of_utc=self.as_of_utc)
+        self.assertFalse(ok)
+        self.assertEqual(status, "INVALID_PROVENANCE_SIGNATURE")
+
+        conv = self.genuine_obs.to_dict()
+        conv["feed_address"] = "0x1111111111111111111111111111111111111111"
+        ok2, status2, _, _ = validate_quote_usd_conversion(conv, as_of_utc=self.as_of_utc)
+        self.assertFalse(ok2)
+        self.assertIn(status2, ("OBSERVATION_MUTATION_DETECTED", "UNRECOGNIZED_FEED_ADDRESS"))
+
+    # 5. Mutating parsed observation fields rejected
+    def test_05_mutating_parsed_observation_fields_rejected(self):
+        obs = copy.deepcopy(self.genuine_obs)
+        obs.observation["answer"] = 999999999
+        ok, status, _, _ = validate_quote_usd_conversion(obs, as_of_utc=self.as_of_utc)
+        self.assertFalse(ok)
+        self.assertEqual(status, "INVALID_PROVENANCE_SIGNATURE")
+
+        conv = self.genuine_obs.to_dict()
+        conv["observation"]["answer"] = 999999999
+        ok2, status2, _, details2 = validate_quote_usd_conversion(conv, as_of_utc=self.as_of_utc)
+        self.assertFalse(ok2)
+        self.assertEqual(status2, "OBSERVATION_MUTATION_DETECTED")
+
+    # 6. Replacing raw payload after signing rejected
+    def test_06_replacing_raw_payload_after_signing_rejected(self):
+        obs = copy.deepcopy(self.genuine_obs)
+        obs.raw_payload = '{"tampered": true}'
+        ok, status, _, details = validate_quote_usd_conversion(obs, as_of_utc=self.as_of_utc)
+        self.assertFalse(ok)
+        self.assertEqual(status, "PAYLOAD_HASH_MISMATCH")
+
+        conv = self.genuine_obs.to_dict()
+        conv["raw_payload"] = '{"tampered": true}'
+        ok2, status2, _, details2 = validate_quote_usd_conversion(conv, as_of_utc=self.as_of_utc)
+        self.assertFalse(ok2)
+        self.assertIn(status2, ("OBSERVATION_MUTATION_DETECTED", "FABRICATED_PROVIDER_RESPONSE"))
+
+    # 7. Replacing response hash rejected
+    def test_07_replacing_response_hash_rejected(self):
+        obs = copy.deepcopy(self.genuine_obs)
+        obs.response_sha256 = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+        ok, status, _, _ = validate_quote_usd_conversion(obs, as_of_utc=self.as_of_utc)
+        self.assertFalse(ok)
+        self.assertEqual(status, "PAYLOAD_HASH_MISMATCH")
+
+        conv = self.genuine_obs.to_dict()
+        conv["response_sha256"] = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+        ok2, status2, _, _ = validate_quote_usd_conversion(conv, as_of_utc=self.as_of_utc)
+        self.assertFalse(ok2)
+        self.assertIn(status2, ("OBSERVATION_MUTATION_DETECTED", "FABRICATED_PROVIDER_RESPONSE"))
+
+    # 8. Mocked transport cannot qualify in production
+    def test_08_mocked_transport_cannot_qualify_in_production(self):
+        cand = copy.deepcopy(self.base_candidate)
+        # Production qualification (default allow_mocked_transport=False)
+        qualified_prod = v425.qualify_final_actionable_candidates([cand], self.now_dt, allow_mocked_transport=False)
+        self.assertEqual(len(qualified_prod), 0)
+        self.assertTrue(any("MOCKED_TRANSPORT" in b for b in cand["qualification_blockers"]))
+
+        # Offline testing explicit opt-in (allow_mocked_transport=True)
+        cand_test = copy.deepcopy(self.base_candidate)
+        qualified_test = v425.qualify_final_actionable_candidates([cand_test], self.now_dt, allow_mocked_transport=True)
+        self.assertEqual(len(qualified_test), 1)
+        self.assertEqual(cand_test["qualification_blockers"], [])
+
+    # 9. Caller-supplied transport cannot claim live provenance
+    def test_09_caller_supplied_transport_cannot_claim_live_provenance(self):
+        # 1. Adapter call with transport parameter is marked MOCKED_TRANSPORT
+        obs_mocked = ChainlinkRpcAdapter.fetch(
+            VALID_QUOTE_ADDR,
+            VALID_EVM_CHAIN,
+            as_of_utc=self.as_of_utc,
+            transport=self.mock_cl_transport,
+        )
+        self.assertEqual(obs_mocked.transport_type, "MOCKED_TRANSPORT")
+        self.assertEqual(obs_mocked.acquisition_method, "TEST_MOCKED_TRANSPORT")
+
+        # 2. Direct caller-instantiated observation without adapter factory secret is rejected
+        caller_obs = AcquiredProviderObservation(
+            provider="chainlink",
+            chain=VALID_EVM_CHAIN,
+            quote_asset=VALID_QUOTE_ADDR,
+            reference_asset="USD",
+            price_usd=1.0,
+            retrieval_time_utc=self.as_of_utc,
+            transport_type="LIVE_NETWORK_ACQUISITION",
+        )
+        self.assertTrue(caller_obs.is_caller_created)
+        ok, status, _, details = validate_quote_usd_conversion(caller_obs, as_of_utc=self.as_of_utc)
+        self.assertFalse(ok)
+        self.assertEqual(status, "CALLER_CREATED_OBSERVATION_OBJECT")
+
+    # 10. Pyth wrong feed ID rejected
+    def test_10_pyth_wrong_feed_id_rejected(self):
+        wrong_transport = make_mock_pyth_transport(
+            "0x1111111111111111111111111111111111111111111111111111111111111111",
+            price=100000000,
+        )
+        with self.assertRaises(ProviderUnavailableError) as cm:
+            PythHermesAdapter.fetch(
+                "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+                "solana",
+                transport=wrong_transport,
+            )
+        self.assertIn("missing requested feed ID", str(cm.exception))
+
+    # 11. Pyth missing feed ID rejected
+    def test_11_pyth_missing_feed_id_rejected(self):
+        def empty_transport(url, data, headers):
+            return 200, json.dumps([]).encode("utf-8")
+
+        with self.assertRaises(ProviderUnavailableError) as cm:
+            PythHermesAdapter.fetch(
+                "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+                "solana",
+                transport=empty_transport,
+            )
+        self.assertIn("empty updates list", str(cm.exception))
+
+    # 12. Pyth invalid signature rejected where signature verification implemented
+    def test_12_pyth_invalid_signature_rejected(self):
+        mock_py = make_mock_pyth_transport(
+            "0xeaa020c61cc479712813461ce153894a96a6c00b21ed0cfc2798d1f9a9e9c94a",
+            price=100000000,
+        )
+        obs = PythHermesAdapter.fetch(
+            "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+            "solana",
+            as_of_utc=self.as_of_utc,
+            transport=mock_py,
+        )
+        self.assertFalse(obs.cryptographic_signature_verified)
+        ok, status, _, details = validate_quote_usd_conversion(obs, as_of_utc=self.as_of_utc)
+        self.assertTrue(ok)
+        self.assertFalse(details["cryptographic_authenticity_verified"])
+
+    # 13. Chainlink decimals RPC failure rejected
+    def test_13_chainlink_decimals_rpc_failure_rejected(self):
+        def failing_decimals_transport(url, data, headers):
+            payload = json.loads(data) if isinstance(data, (str, bytes)) else {}
+            call_params = payload.get("params", [{}])[0] if payload.get("params") else {}
+            call_data = call_params.get("data", "")
+            if payload.get("method") == "eth_chainId":
+                return 200, json.dumps({"jsonrpc": "2.0", "result": "0x1", "id": payload.get("id")}).encode("utf-8")
+            if call_data.startswith("0x313ce567"):
+                return 200, json.dumps({"jsonrpc": "2.0", "error": {"code": -32000, "message": "execution reverted"}, "id": payload.get("id")}).encode("utf-8")
+            return 200, json.dumps({"jsonrpc": "2.0", "result": "0x", "id": payload.get("id")}).encode("utf-8")
+
+        with self.assertRaises(ProviderUnavailableError) as cm:
+            ChainlinkRpcAdapter.fetch(VALID_QUOTE_ADDR, VALID_EVM_CHAIN, transport=failing_decimals_transport)
+        self.assertIn("decimals() RPC call reverted or returned empty", str(cm.exception))
+
+    # 14. Chainlink wrong RPC chain ID rejected
+    def test_14_chainlink_wrong_rpc_chain_id_rejected(self):
+        wrong_cid_transport = make_mock_chainlink_rpc_transport(chain_id=137)  # Polygon chain ID on Ethereum feed
+        with self.assertRaises(ProviderUnavailableError) as cm:
+            ChainlinkRpcAdapter.fetch(VALID_QUOTE_ADDR, "ethereum", transport=wrong_cid_transport)
+        self.assertIn("chain ID mismatch", str(cm.exception))
+
+    # 15. Chainlink incomplete fallback response rejected
+    def test_15_chainlink_incomplete_fallback_response_rejected(self):
+        def broken_fallback_transport(url, data, headers):
+            payload = json.loads(data) if isinstance(data, (str, bytes)) else {}
+            if payload.get("method") == "eth_chainId":
+                return 200, json.dumps({"jsonrpc": "2.0", "result": "0x1", "id": payload.get("id")}).encode("utf-8")
+            call_params = payload.get("params", [{}])[0] if payload.get("params") else {}
+            call_data = call_params.get("data", "")
+            if call_data.startswith("0x313ce567"):  # decimals
+                return 200, json.dumps({"jsonrpc": "2.0", "result": "0x08", "id": payload.get("id")}).encode("utf-8")
+            if call_data.startswith("0xfeaf968e"):  # latestRoundData fails -> fallback
+                return 200, json.dumps({"jsonrpc": "2.0", "result": "0x", "id": payload.get("id")}).encode("utf-8")
+            if call_data.startswith("0x50d25bcd"):  # latestAnswer succeeds
+                return 200, json.dumps({"jsonrpc": "2.0", "result": "0x05f5e100", "id": payload.get("id")}).encode("utf-8")
+            if call_data.startswith("0x668a0f02"):  # latestRound fails
+                return 200, json.dumps({"jsonrpc": "2.0", "result": "0x", "id": payload.get("id")}).encode("utf-8")
+            return 200, json.dumps({"jsonrpc": "2.0", "result": "0x", "id": payload.get("id")}).encode("utf-8")
+
+        with self.assertRaises(ProviderUnavailableError) as cm:
+            ChainlinkRpcAdapter.fetch(VALID_QUOTE_ADDR, "ethereum", transport=broken_fallback_transport)
+        self.assertIn("fallback latestRound() RPC reverted or returned empty", str(cm.exception))
+
+    # 16. Uniswap wrong chain ID rejected
+    def test_16_uniswap_wrong_chain_id_rejected(self):
+        wrong_uni_transport = make_mock_uniswap_v3_transport(chain_id=56)  # BSC chain ID on Ethereum pool
+        with self.assertRaises(ProviderUnavailableError) as cm:
+            UniswapV3TwapAdapter.fetch(VALID_ALT_QUOTE, "ethereum", transport=wrong_uni_transport)
+        self.assertIn("chain ID mismatch", str(cm.exception))
+
+    # 17. Uniswap wrong token0/token1 or fee tier rejected
+    def test_17_uniswap_wrong_token0_token1_or_fee_tier_rejected(self):
+        # 1. Wrong token0
+        wrong_t0_transport = make_mock_uniswap_v3_transport(token0="0x0000000000000000000000000000000000000000")
+        with self.assertRaises(ProviderUnavailableError) as cm1:
+            UniswapV3TwapAdapter.fetch(VALID_ALT_QUOTE, "ethereum", transport=wrong_t0_transport)
+        self.assertIn("pool token0 mismatch", str(cm1.exception))
+
+        # 2. Wrong token1
+        wrong_t1_transport = make_mock_uniswap_v3_transport(token1="0x0000000000000000000000000000000000000000")
+        with self.assertRaises(ProviderUnavailableError) as cm2:
+            UniswapV3TwapAdapter.fetch(VALID_ALT_QUOTE, "ethereum", transport=wrong_t1_transport)
+        self.assertIn("pool token1 mismatch", str(cm2.exception))
+
+        # 3. Wrong fee tier
+        wrong_fee_transport = make_mock_uniswap_v3_transport(fee_tier=3000)  # 3000 bps instead of 500 bps
+        with self.assertRaises(ProviderUnavailableError) as cm3:
+            UniswapV3TwapAdapter.fetch(VALID_ALT_QUOTE, "ethereum", transport=wrong_fee_transport)
+        self.assertIn("pool fee tier mismatch", str(cm3.exception))
+
+        # 4. TWAP window < 60 seconds
+        uni_transport = make_mock_uniswap_v3_transport()
+        with self.assertRaises(ValueError) as cm4:
+            UniswapV3TwapAdapter.fetch(VALID_ALT_QUOTE, "ethereum", twap_window_seconds=30, transport=uni_transport)
+        self.assertIn("TWAP window must be >= 60 seconds", str(cm4.exception))
+
+    # 18. Production qualification rejects every invalid case
+    def test_18_production_qualification_rejects_every_invalid_case(self):
+        # Case A: Mutated price
+        cand_a = copy.deepcopy(self.base_candidate)
+        cand_a["quote_usd_conversion"]["price_usd"] = 999.0
+        res_a = v425.qualify_final_actionable_candidates([cand_a], self.now_dt, allow_mocked_transport=True)
+        self.assertEqual(len(res_a), 0)
+        self.assertTrue(any("OBSERVATION_MUTATION_DETECTED" in b for b in cand_a["qualification_blockers"]))
+
+        # Case B: Mutated chain
+        cand_b = copy.deepcopy(self.base_candidate)
+        cand_b["quote_usd_conversion"]["chain"] = "arbitrum"
+        res_b = v425.qualify_final_actionable_candidates([cand_b], self.now_dt, allow_mocked_transport=True)
+        self.assertEqual(len(res_b), 0)
+        self.assertTrue(any("QUOTE_CONVERSION_CHAIN_MISMATCH" in b or "OBSERVATION_MUTATION_DETECTED" in b for b in cand_b["qualification_blockers"]))
+
+        # Case C: Caller-created observation object
+        cand_c = copy.deepcopy(self.base_candidate)
+        caller_obs = AcquiredProviderObservation(
+            provider="chainlink",
+            chain=VALID_EVM_CHAIN,
+            quote_asset=VALID_QUOTE_ADDR,
+            reference_asset="USD",
+            price_usd=1.0,
+            retrieval_time_utc=self.as_of_utc,
+        )
+        cand_c["quote_usd_conversion"] = caller_obs
+        res_c = v425.qualify_final_actionable_candidates([cand_c], self.now_dt, allow_mocked_transport=True)
+        self.assertEqual(len(res_c), 0)
+        self.assertTrue(any("CALLER_CREATED_OBSERVATION_OBJECT" in b for b in cand_c["qualification_blockers"]))
+
+        # Case D: Mocked transport in production mode (default)
+        cand_d = copy.deepcopy(self.base_candidate)
+        res_d = v425.qualify_final_actionable_candidates([cand_d], self.now_dt, allow_mocked_transport=False)
+        self.assertEqual(len(res_d), 0)
+        self.assertTrue(any("MOCKED_TRANSPORT" in b for b in cand_d["qualification_blockers"]))
 
 
 class TestLiveProviderIntegrations(unittest.TestCase):

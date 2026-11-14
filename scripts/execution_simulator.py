@@ -660,9 +660,11 @@ TRUSTED_UNISWAP_V3_POOLS: dict[str, dict[str, Any]] = {
     # Ethereum USDC / WETH 500 bps (0.05%)
     "0x88e6a0c2ddd26feeb64f039a2c41296fcb3f5640": {
         "chain": "ethereum",
+        "chain_id": 1,
         "token0": "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48",  # USDC
         "token1": "0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2",  # WETH
         "fee": 500,
+        "fee_tier": 500,
         "usd_reference": "USDC",
         "intermediate_quote": "USDC",
         "requires_chained_usd_conversion": True,
@@ -675,9 +677,11 @@ TRUSTED_UNISWAP_V3_POOLS: dict[str, dict[str, Any]] = {
     # Ethereum USDC / USDT 100 bps (0.01%)
     "0x3416cf6c708da44db26246036ddf2f3939040f43": {
         "chain": "ethereum",
+        "chain_id": 1,
         "token0": "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48",  # USDC
         "token1": "0xdac17f958d2ee523a2206206994597c13d831ec7",  # USDT
         "fee": 100,
+        "fee_tier": 100,
         "usd_reference": "USDC",
         "intermediate_quote": "USDC",
         "requires_chained_usd_conversion": True,
@@ -690,9 +694,11 @@ TRUSTED_UNISWAP_V3_POOLS: dict[str, dict[str, Any]] = {
     # Base WETH / USDC 500 bps (0.05%)
     "0xd0b53d9277642d899df5c87a3966a349a798f224": {
         "chain": "base",
+        "chain_id": 8453,
         "token0": "0x4200000000000000000000000000000000000006",  # WETH
         "token1": "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913",  # USDC
         "fee": 500,
+        "fee_tier": 500,
         "usd_reference": "USDC",
         "intermediate_quote": "USDC",
         "requires_chained_usd_conversion": True,
@@ -1013,19 +1019,71 @@ def validate_observation_timestamp_freshness(
 
 
 _PROVENANCE_SECRET = secrets.token_bytes(32)
+_ADAPTER_FACTORY_SECRET = object()
 
 
-def _generate_provenance_token(provider: str, retrieval_time_utc: str, payload_hash: str, request_url: str) -> str:
-    msg = f"{provider}:{retrieval_time_utc}:{payload_hash}:{request_url}".encode("utf-8")
-    return hmac.new(_PROVENANCE_SECRET, msg, hashlib.sha256).hexdigest()
+def _canonical_observation_payload(
+    *,
+    provider: str,
+    provider_identifier: str,
+    chain: str,
+    chain_id: int | str,
+    quote_asset: str,
+    feed_or_pool_id: str,
+    reference_asset: str,
+    valuation_policy: str,
+    price_usd: float,
+    observation: dict[str, Any],
+    observation_timestamp: str,
+    retrieval_timestamp_utc: str,
+    http_status: int,
+    rpc_method: str | None,
+    raw_payload: str,
+    response_sha256: str,
+    transport_type: str,
+    acquisition_method: str,
+) -> bytes:
+    canonical_dict = {
+        "acquisition_method": str(acquisition_method or "").strip(),
+        "chain": str(chain or "").lower().strip(),
+        "chain_id": str(chain_id or "").strip(),
+        "feed_or_pool_id": str(feed_or_pool_id or "").lower().strip(),
+        "http_status": int(http_status or 200),
+        "observation": observation or {},
+        "observation_timestamp": str(observation_timestamp or "").strip(),
+        "price_usd": round(float(price_usd), 8) if price_usd is not None else 0.0,
+        "provider": str(provider or "").lower().strip(),
+        "provider_identifier": str(provider_identifier or "").lower().strip(),
+        "quote_asset": str(quote_asset or "").lower().strip(),
+        "raw_payload_sha256": str(response_sha256 or "").lower().strip(),
+        "reference_asset": str(reference_asset or "").strip().upper(),
+        "retrieval_timestamp_utc": str(retrieval_timestamp_utc or "").strip(),
+        "rpc_method": str(rpc_method or "").strip(),
+        "transport_type": str(transport_type or "").strip(),
+        "valuation_policy": str(valuation_policy or "").strip(),
+    }
+    canonical_json = json.dumps(canonical_dict, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+    return canonical_json.encode("utf-8")
+
+
+def _generate_provenance_token(payload_bytes: bytes) -> str:
+    return hmac.new(_PROVENANCE_SECRET, payload_bytes, hashlib.sha256).hexdigest()
 
 
 def _verify_provenance_token(obs: Any) -> bool:
     if not isinstance(obs, AcquiredProviderObservation):
         return False
+    if getattr(obs, "is_caller_created", False):
+        return False
     if not getattr(obs, "_auth_token", None):
         return False
-    expected = _generate_provenance_token(obs.provider, obs.retrieval_time_utc, obs.response_sha256, obs.request_url)
+    # Validate raw_payload sha256 consistency
+    if obs.raw_payload:
+        actual_hash = hashlib.sha256(obs.raw_payload.encode("utf-8")).hexdigest()
+        if actual_hash.lower() != obs.response_sha256.lower():
+            return False
+    canonical_bytes = obs.canonical_bytes()
+    expected = _generate_provenance_token(canonical_bytes)
     return hmac.compare_digest(obs._auth_token, expected)
 
 
@@ -1050,7 +1108,7 @@ class AcquiredProviderObservation:
         reference_asset: str,
         price_usd: float,
         retrieval_time_utc: str,
-        request_url: str,
+        request_url: str = "",
         rpc_method: str | None = None,
         http_status: int = 200,
         raw_payload: str = "",
@@ -1060,46 +1118,102 @@ class AcquiredProviderObservation:
         market_id: str | None = None,
         pool_address: str | None = None,
         valuation_policy: str = "ORACLE_VERIFIED",
-        transport_type: str = "LIVE_HTTP",
+        transport_type: str = "LIVE_NETWORK_ACQUISITION",
+        acquisition_method: str = "GENUINE_READ_ONLY_HTTP_RPC",
+        chain_id: int | str = "",
+        observation_timestamp: str = "",
+        cryptographic_signature_verified: bool = False,
         _auth_token: str | None = None,
+        _internal_seal: Any = None,
     ):
-        self.provider = provider
-        self.chain = chain
-        self.quote_asset = quote_asset
-        self.reference_asset = reference_asset
-        self.price_usd = price_usd
-        self.retrieval_time_utc = retrieval_time_utc
-        self.request_url = request_url
-        self.rpc_method = rpc_method
-        self.http_status = http_status
-        self.raw_payload = raw_payload
-        self.response_sha256 = response_sha256 or hashlib.sha256(raw_payload.encode("utf-8")).hexdigest()
-        self.observation = observation or {}
-        self.feed_id = feed_id
-        self.market_id = market_id
-        self.pool_address = pool_address
-        self.valuation_policy = valuation_policy
-        self.transport_type = transport_type
-        self._auth_token = _auth_token
+        self.provider = str(provider).strip().lower()
+        self.chain = str(chain).strip().lower()
+        self.chain_id = chain_id
+        self.quote_asset = str(quote_asset).strip()
+        self.reference_asset = str(reference_asset).strip().upper()
+        self.price_usd = float(price_usd)
+        self.retrieval_time_utc = str(retrieval_time_utc).strip()
+        self.request_url = str(request_url).strip()
+        self.rpc_method = str(rpc_method).strip() if rpc_method else None
+        self.http_status = int(http_status)
+        self.raw_payload = str(raw_payload)
+        self.response_sha256 = str(response_sha256 or (hashlib.sha256(raw_payload.encode("utf-8")).hexdigest() if raw_payload else "")).lower().strip()
+        self.observation = copy.deepcopy(observation) if observation else {}
+        self.feed_id = str(feed_id).strip() if feed_id else None
+        self.market_id = str(market_id).strip() if market_id else None
+        self.pool_address = str(pool_address).strip() if pool_address else None
+        self.valuation_policy = str(valuation_policy).strip()
+        self.transport_type = str(transport_type).strip()
+        self.acquisition_method = str(acquisition_method).strip()
+        self.observation_timestamp = str(observation_timestamp or retrieval_time_utc).strip()
+        self.cryptographic_signature_verified = bool(cryptographic_signature_verified)
+
+        # Reject caller-created observation objects that bypass genuine adapter factory
+        if _internal_seal is not _ADAPTER_FACTORY_SECRET:
+            self.is_caller_created = True
+        else:
+            self.is_caller_created = False
+
+        if _auth_token is not None:
+            self._auth_token = _auth_token
+        else:
+            self._auth_token = _generate_provenance_token(self.canonical_bytes())
+
+    @classmethod
+    def _create(cls, **kwargs: Any) -> "AcquiredProviderObservation":
+        return cls(_internal_seal=_ADAPTER_FACTORY_SECRET, **kwargs)
+
+    @property
+    def provider_identifier(self) -> str:
+        return self.feed_id or self.market_id or self.pool_address or self.quote_asset
+
+    def canonical_bytes(self) -> bytes:
+        return _canonical_observation_payload(
+            provider=self.provider,
+            provider_identifier=self.provider_identifier,
+            chain=self.chain,
+            chain_id=self.chain_id,
+            quote_asset=self.quote_asset,
+            feed_or_pool_id=self.provider_identifier,
+            reference_asset=self.reference_asset,
+            valuation_policy=self.valuation_policy,
+            price_usd=self.price_usd,
+            observation=self.observation,
+            observation_timestamp=self.observation_timestamp,
+            retrieval_timestamp_utc=self.retrieval_time_utc,
+            http_status=self.http_status,
+            rpc_method=self.rpc_method,
+            raw_payload=self.raw_payload,
+            response_sha256=self.response_sha256,
+            transport_type=self.transport_type,
+            acquisition_method=self.acquisition_method,
+        )
 
     def to_dict(self) -> dict[str, Any]:
         d = {
             "price_usd": self.price_usd,
             "chain": self.chain,
+            "chain_id": self.chain_id,
             "quote_asset": self.quote_asset,
             "reference_asset": self.reference_asset,
             "timestamp_utc": self.retrieval_time_utc,
             "source": self.provider,
             "provider": self.provider,
+            "provider_identifier": self.provider_identifier,
             "valuation_policy": self.valuation_policy,
             "request_url": self.request_url,
             "rpc_method": self.rpc_method,
+            "http_status": self.http_status,
             "retrieval_time_utc": self.retrieval_time_utc,
+            "observation_timestamp": self.observation_timestamp,
             "raw_payload": self.raw_payload,
             "response_sha256": self.response_sha256,
-            "observation": self.observation,
+            "observation": copy.deepcopy(self.observation),
             "transport_type": self.transport_type,
+            "acquisition_method": self.acquisition_method,
+            "cryptographic_signature_verified": self.cryptographic_signature_verified,
             "provider_acquired": True,
+            "_auth_token": self._auth_token,
             "__acquired_observation__": self,
         }
         if self.feed_id:
@@ -1162,21 +1276,38 @@ class ChainlinkRpcAdapter:
         feed_info = TRUSTED_CHAINLINK_FEEDS[feed_addr]
         rpc_url = rpc_endpoint or cls.PUBLIC_RPCS.get(norm_ch, "https://ethereum-rpc.publicnode.com")
         call_transport = transport or _default_http_call
-        transport_type = "MOCKED_TRANSPORT" if transport is not None else "LIVE_RPC"
+        transport_type = "MOCKED_TRANSPORT" if transport is not None else "LIVE_NETWORK_ACQUISITION"
+        acquisition_method = "TEST_MOCKED_TRANSPORT" if transport is not None else "GENUINE_READ_ONLY_RPC"
 
-        # 1. decimals() eth_call (0x313ce567)
-        dec_payload = json.dumps({"jsonrpc": "2.0", "method": "eth_call", "params": [{"to": feed_addr, "data": "0x313ce567"}, "latest"], "id": 1})
+        # 1. eth_chainId RPC call
+        cid_payload = json.dumps({"jsonrpc": "2.0", "method": "eth_chainId", "params": [], "id": 1})
+        st_cid, b_cid = call_transport(rpc_url, cid_payload, {"Content-Type": "application/json"})
+        if st_cid != 200:
+            raise ProviderUnavailableError(f"Chainlink eth_chainId RPC failed with HTTP {st_cid}")
+        r_cid = json.loads(b_cid.decode("utf-8"))
+        if "error" in r_cid or not r_cid.get("result") or r_cid["result"] == "0x":
+            raise ProviderUnavailableError(f"Chainlink eth_chainId RPC call failed: {r_cid}")
+        actual_chain_id = int(r_cid["result"], 16)
+        expected_chain_id = feed_info.get("chain_id", 1)
+        if actual_chain_id != expected_chain_id:
+            raise ProviderUnavailableError(
+                f"Chainlink RPC endpoint chain ID mismatch: got {actual_chain_id}, expected {expected_chain_id} for {norm_ch}"
+            )
+
+        # 2. decimals() eth_call (0x313ce567) - NO SILENT FALLBACK
+        dec_payload = json.dumps({"jsonrpc": "2.0", "method": "eth_call", "params": [{"to": feed_addr, "data": "0x313ce567"}, "latest"], "id": 2})
         status_dec, body_dec = call_transport(rpc_url, dec_payload, {"Content-Type": "application/json"})
         if status_dec != 200:
             raise ProviderUnavailableError(f"Chainlink decimals() RPC failed with HTTP {status_dec}")
         resp_dec = json.loads(body_dec.decode("utf-8"))
         if "error" in resp_dec or not resp_dec.get("result") or resp_dec["result"] == "0x":
-            decimals = feed_info.get("decimals", 8)
-        else:
-            decimals = int(resp_dec["result"], 16)
+            raise ProviderUnavailableError(f"Chainlink decimals() RPC call reverted or returned empty: {resp_dec}")
+        decimals = int(resp_dec["result"], 16)
+        if decimals <= 0 or decimals > 18:
+            raise ValueError(f"Chainlink decimals returned invalid value: {decimals}")
 
-        # 2. latestRoundData() eth_call (0xfeaf968e)
-        round_payload = json.dumps({"jsonrpc": "2.0", "method": "eth_call", "params": [{"to": feed_addr, "data": "0xfeaf968e"}, "latest"], "id": 2})
+        # 3. latestRoundData() eth_call (0xfeaf968e)
+        round_payload = json.dumps({"jsonrpc": "2.0", "method": "eth_call", "params": [{"to": feed_addr, "data": "0xfeaf968e"}, "latest"], "id": 3})
         status_rnd, body_rnd = call_transport(rpc_url, round_payload, {"Content-Type": "application/json"})
         if status_rnd != 200:
             raise ProviderUnavailableError(f"Chainlink latestRoundData() RPC failed with HTTP {status_rnd}")
@@ -1186,23 +1317,34 @@ class ChainlinkRpcAdapter:
 
         if "error" in resp_rnd or not resp_rnd.get("result") or resp_rnd["result"] == "0x":
             # Fallback for proxy architecture: latestAnswer (0x50d25bcd), latestRound (0x668a0f02), latestTimestamp (0x8205bf6a)
-            ans_payload = json.dumps({"jsonrpc": "2.0", "method": "eth_call", "params": [{"to": feed_addr, "data": "0x50d25bcd"}, "latest"], "id": 3})
+            ans_payload = json.dumps({"jsonrpc": "2.0", "method": "eth_call", "params": [{"to": feed_addr, "data": "0x50d25bcd"}, "latest"], "id": 4})
             st_ans, b_ans = call_transport(rpc_url, ans_payload, {"Content-Type": "application/json"})
             if st_ans != 200:
-                raise ProviderUnavailableError(f"Chainlink latestAnswer() RPC failed with HTTP {st_ans}")
+                raise ProviderUnavailableError(f"Chainlink fallback latestAnswer() RPC failed with HTTP {st_ans}")
             r_ans = json.loads(b_ans.decode("utf-8"))
             if "error" in r_ans or not r_ans.get("result") or r_ans["result"] == "0x":
-                raise ProviderUnavailableError(f"Chainlink RPC call reverted on {feed_addr}")
+                raise ProviderUnavailableError(f"Chainlink fallback latestAnswer() RPC reverted or returned empty on {feed_addr}")
             ans_int = int(r_ans["result"], 16)
             answer = ans_int if ans_int < (1 << 255) else ans_int - (1 << 256)
 
-            rnd_call = json.dumps({"jsonrpc": "2.0", "method": "eth_call", "params": [{"to": feed_addr, "data": "0x668a0f02"}, "latest"], "id": 4})
-            _, b_rnd = call_transport(rpc_url, rnd_call, {"Content-Type": "application/json"})
-            round_id = int(json.loads(b_rnd.decode("utf-8")).get("result", "0x1"), 16)
+            rnd_payload = json.dumps({"jsonrpc": "2.0", "method": "eth_call", "params": [{"to": feed_addr, "data": "0x668a0f02"}, "latest"], "id": 5})
+            st_rnd, b_rnd = call_transport(rpc_url, rnd_payload, {"Content-Type": "application/json"})
+            if st_rnd != 200:
+                raise ProviderUnavailableError(f"Chainlink fallback latestRound() RPC failed with HTTP {st_rnd}")
+            r_rnd = json.loads(b_rnd.decode("utf-8"))
+            if "error" in r_rnd or not r_rnd.get("result") or r_rnd["result"] == "0x":
+                raise ProviderUnavailableError(f"Chainlink fallback latestRound() RPC reverted or returned empty on {feed_addr}")
+            round_id = int(r_rnd["result"], 16)
 
-            ts_call = json.dumps({"jsonrpc": "2.0", "method": "eth_call", "params": [{"to": feed_addr, "data": "0x8205bf6a"}, "latest"], "id": 5})
-            _, b_ts = call_transport(rpc_url, ts_call, {"Content-Type": "application/json"})
-            updated_at_ts = int(json.loads(b_ts.decode("utf-8")).get("result", "0x0"), 16)
+            ts_payload = json.dumps({"jsonrpc": "2.0", "method": "eth_call", "params": [{"to": feed_addr, "data": "0x8205bf6a"}, "latest"], "id": 6})
+            st_ts, b_ts = call_transport(rpc_url, ts_payload, {"Content-Type": "application/json"})
+            if st_ts != 200:
+                raise ProviderUnavailableError(f"Chainlink fallback latestTimestamp() RPC failed with HTTP {st_ts}")
+            r_ts = json.loads(b_ts.decode("utf-8"))
+            if "error" in r_ts or not r_ts.get("result") or r_ts["result"] == "0x":
+                raise ProviderUnavailableError(f"Chainlink fallback latestTimestamp() RPC reverted or returned empty on {feed_addr}")
+            updated_at_ts = int(r_ts["result"], 16)
+
             answered_in_round = round_id
             started_at_ts = updated_at_ts
             raw_payload_str = b_ans.decode("utf-8")
@@ -1217,8 +1359,14 @@ class ChainlinkRpcAdapter:
             updated_at_ts = int(hex_data[192:256], 16)
             answered_in_round = int(hex_data[256:320], 16)
 
+        if round_id <= 0:
+            raise ValueError(f"Chainlink round_id must be strictly positive, got {round_id}")
         if answer <= 0:
-            raise ValueError(f"Chainlink returned non-positive answer: {answer}")
+            raise ValueError(f"Chainlink answer must be strictly positive, got {answer}")
+        if answered_in_round < round_id:
+            raise ValueError(f"Chainlink round incomplete: answeredInRound ({answered_in_round}) < roundId ({round_id})")
+        if updated_at_ts <= 0:
+            raise ValueError(f"Chainlink updatedAt timestamp must be strictly positive, got {updated_at_ts}")
 
         price_usd = answer / (10 ** decimals)
         retrieval_stamp = as_of_utc or datetime.now(timezone.utc).isoformat()
@@ -1226,7 +1374,6 @@ class ChainlinkRpcAdapter:
         updated_iso = updated_dt.isoformat().replace("+00:00", "Z")
 
         resp_hash = hashlib.sha256(raw_payload_str.encode("utf-8")).hexdigest()
-        auth_token = _generate_provenance_token("chainlink", retrieval_stamp, resp_hash, rpc_url)
 
         obs_dict = {
             "answer": answer,
@@ -1235,12 +1382,13 @@ class ChainlinkRpcAdapter:
             "answered_in_round": answered_in_round,
             "started_at": started_at_ts,
             "updated_at": updated_iso,
-            "chain_id": feed_info.get("chain_id"),
+            "chain_id": actual_chain_id,
         }
 
-        return AcquiredProviderObservation(
+        return AcquiredProviderObservation._create(
             provider="chainlink",
             chain=norm_ch,
+            chain_id=actual_chain_id,
             quote_asset=feed_info["quote_asset"],
             reference_asset="USD",
             price_usd=price_usd,
@@ -1254,7 +1402,8 @@ class ChainlinkRpcAdapter:
             feed_id=feed_addr,
             valuation_policy="STABLECOIN_ORACLE_VERIFIED" if price_usd <= 1.05 else "CRYPTO_ORACLE_VERIFIED",
             transport_type=transport_type,
-            _auth_token=auth_token,
+            acquisition_method=acquisition_method,
+            observation_timestamp=updated_iso,
         )
 
 
@@ -1274,10 +1423,9 @@ class PythHermesAdapter:
         norm_ch = str(chain).strip().lower()
         fid = str(feed_id or "").strip().lower()
         if not fid:
-            for fid_cand, info in TRUSTED_PYTH_FEEDS.items():
-                qa = info.get("quote_asset", {})
-                if isinstance(qa, dict) and norm_ch in qa and same_address(norm_ch, qa[norm_ch], quote_asset):
-                    fid = fid_cand
+            for f_id, info in TRUSTED_PYTH_FEEDS.items():
+                if norm_ch in info["chains"] and same_address(norm_ch, info["quote_asset"].get(norm_ch, ""), quote_asset):
+                    fid = f_id
                     break
         if not fid or fid not in TRUSTED_PYTH_FEEDS:
             raise ProviderUnavailableError(f"Pyth feed not registered for {quote_asset} on {chain}")
@@ -1286,7 +1434,8 @@ class PythHermesAdapter:
         clean_fid = fid.lower().replace("0x", "")
         url = f"{cls.DEFAULT_HERMES_URL}/v2/updates/price/latest?ids[]={clean_fid}"
         call_transport = transport or _default_http_call
-        transport_type = "MOCKED_TRANSPORT" if transport is not None else "LIVE_HTTP"
+        transport_type = "MOCKED_TRANSPORT" if transport is not None else "LIVE_NETWORK_ACQUISITION"
+        acquisition_method = "TEST_MOCKED_TRANSPORT" if transport is not None else "GENUINE_READ_ONLY_REST"
 
         status_code, body_bytes = call_transport(url, None, {})
         if status_code != 200:
@@ -1295,44 +1444,61 @@ class PythHermesAdapter:
         raw_payload_str = body_bytes.decode("utf-8")
         data = json.loads(raw_payload_str)
         updates = data if isinstance(data, list) else data.get("parsed", [])
-        if not updates:
+        if not updates or not isinstance(updates, list):
             raise ProviderUnavailableError("Pyth Hermes returned empty updates list")
 
-        matched_item = None
+        matching_items = []
         for item in updates:
             item_id = str(item.get("id", "")).lower().replace("0x", "")
+            if not item_id:
+                raise ProviderUnavailableError("Pyth update item missing 'id' field")
             if item_id == clean_fid:
-                matched_item = item
-                break
-        if not matched_item:
-            matched_item = updates[0]
+                matching_items.append(item)
 
-        price_obj = matched_item.get("price", {})
-        raw_price = int(price_obj.get("price", 0))
-        expo = int(price_obj.get("expo", feed_info.get("expo", -8)))
-        publish_time_ts = int(price_obj.get("publish_time", 0))
+        if len(matching_items) == 0:
+            raise ProviderUnavailableError(f"Pyth response missing requested feed ID {clean_fid}")
+        if len(matching_items) > 1:
+            raise ProviderUnavailableError(f"Pyth response contains duplicate entries for feed ID {clean_fid}")
+
+        matched_item = matching_items[0]
+
+        price_obj = matched_item.get("price")
+        if not isinstance(price_obj, dict):
+            raise ProviderUnavailableError("Pyth update missing 'price' object")
+        if "price" not in price_obj or "expo" not in price_obj or "publish_time" not in price_obj:
+            raise ProviderUnavailableError("Pyth update price object missing required fields (price, expo, publish_time)")
+
+        raw_price = int(price_obj["price"])
+        expo = int(price_obj["expo"])
+        publish_time_ts = int(price_obj["publish_time"])
 
         if raw_price <= 0:
             raise ValueError(f"Pyth price must be strictly positive, got {raw_price}")
+        if expo < -18 or expo > 0:
+            raise ValueError(f"Pyth exponent out of valid range [-18, 0]: {expo}")
+        if publish_time_ts <= 0:
+            raise ValueError(f"Pyth publish_time must be positive timestamp, got {publish_time_ts}")
 
         price_usd = raw_price * (10 ** expo)
         retrieval_stamp = as_of_utc or datetime.now(timezone.utc).isoformat()
-        pub_dt = datetime.fromtimestamp(publish_time_ts, tz=timezone.utc) if publish_time_ts else _parse_iso_utc(retrieval_stamp)
+        pub_dt = datetime.fromtimestamp(publish_time_ts, tz=timezone.utc)
         pub_iso = pub_dt.isoformat().replace("+00:00", "Z")
 
         resp_hash = hashlib.sha256(raw_payload_str.encode("utf-8")).hexdigest()
-        auth_token = _generate_provenance_token("pyth", retrieval_stamp, resp_hash, url)
 
         obs_dict = {
             "feed_id": fid,
             "price": raw_price,
             "expo": expo,
             "publish_time": pub_iso,
+            "signature_status": "TLS_TRANSPORT_PROVIDER_DATA_WITHOUT_ON_CHAIN_SIGNATURE_VERIFICATION",
+            "cryptographic_signature_verified": False,
         }
 
-        return AcquiredProviderObservation(
+        return AcquiredProviderObservation._create(
             provider="pyth",
             chain=norm_ch,
+            chain_id=norm_ch,
             quote_asset=quote_asset,
             reference_asset="USD",
             price_usd=price_usd,
@@ -1345,7 +1511,8 @@ class PythHermesAdapter:
             feed_id=fid,
             valuation_policy="STABLECOIN_ORACLE_VERIFIED" if price_usd <= 1.05 else "CRYPTO_ORACLE_VERIFIED",
             transport_type=transport_type,
-            _auth_token=auth_token,
+            acquisition_method=acquisition_method,
+            observation_timestamp=pub_iso,
         )
 
 
@@ -1384,7 +1551,8 @@ class CexTickerAdapter:
         market_info = TRUSTED_CEX_MARKETS[canon_p][m_id]
         url = cls.URL_TEMPLATES[canon_p].format(market_id=m_id)
         call_transport = transport or _default_http_call
-        transport_type = "MOCKED_TRANSPORT" if transport is not None else "LIVE_HTTP"
+        transport_type = "MOCKED_TRANSPORT" if transport is not None else "LIVE_NETWORK_ACQUISITION"
+        acquisition_method = "TEST_MOCKED_TRANSPORT" if transport is not None else "GENUINE_READ_ONLY_REST"
 
         status_code, body_bytes = call_transport(url, None, {})
         if status_code != 200:
@@ -1418,14 +1586,14 @@ class CexTickerAdapter:
             lp = float(mkt_data.get("c", [0])[0])
             bp = float(mkt_data.get("b", [0])[0])
             ap = float(mkt_data.get("a", [0])[0])
-            vol = float(mkt_data.get("v", [0])[0])
+            v_val = mkt_data.get("v", [0, 0])
+            vol = float(v_val[1] if isinstance(v_val, list) and len(v_val) > 1 else (v_val[0] if isinstance(v_val, list) and v_val else 0))
             obs_stamp = retrieval_stamp
 
         if not (bp <= lp <= ap):
             raise ValueError(f"CEX spread violation: requires bid ({bp}) <= last ({lp}) <= ask ({ap})")
 
         resp_hash = hashlib.sha256(raw_payload_str.encode("utf-8")).hexdigest()
-        auth_token = _generate_provenance_token(canon_p, retrieval_stamp, resp_hash, url)
 
         obs_dict = {
             "symbol": m_id,
@@ -1436,9 +1604,10 @@ class CexTickerAdapter:
             "timestamp": obs_stamp,
         }
 
-        return AcquiredProviderObservation(
+        return AcquiredProviderObservation._create(
             provider=canon_p,
             chain=norm_ch,
+            chain_id="CEX_OFF_CHAIN",
             quote_asset=quote_asset,
             reference_asset=quote_curr,
             price_usd=lp,
@@ -1451,7 +1620,8 @@ class CexTickerAdapter:
             market_id=m_id,
             valuation_policy="CEX_MARKET_TICKER_VERIFIED",
             transport_type=transport_type,
-            _auth_token=auth_token,
+            acquisition_method=acquisition_method,
+            observation_timestamp=obs_stamp,
         )
 
 
@@ -1476,18 +1646,87 @@ class UniswapV3TwapAdapter:
     ) -> AcquiredProviderObservation:
         norm_ch = str(chain).strip().lower()
         p_addr = str(pool_address or "").strip().lower()
+        if not p_addr:
+            for addr, info in TRUSTED_UNISWAP_V3_POOLS.items():
+                if info["chain"] == norm_ch and (
+                    same_address(norm_ch, info["token0"], quote_asset) or
+                    same_address(norm_ch, info["token1"], quote_asset)
+                ):
+                    p_addr = addr
+                    break
         if not p_addr or p_addr not in TRUSTED_UNISWAP_V3_POOLS:
             raise ProviderUnavailableError(f"Pool '{p_addr}' not registered in TRUSTED_UNISWAP_V3_POOLS")
 
         pool_info = TRUSTED_UNISWAP_V3_POOLS[p_addr]
         rpc_url = rpc_endpoint or cls.PUBLIC_RPCS.get(norm_ch, "https://ethereum-rpc.publicnode.com")
         call_transport = transport or _default_http_call
-        transport_type = "MOCKED_TRANSPORT" if transport is not None else "LIVE_RPC"
+        transport_type = "MOCKED_TRANSPORT" if transport is not None else "LIVE_NETWORK_ACQUISITION"
+        acquisition_method = "TEST_MOCKED_TRANSPORT" if transport is not None else "GENUINE_READ_ONLY_RPC"
 
-        # observe(uint32[] secondsAgos) ABI encoding: selector 0x88316456
+        # 1. eth_chainId RPC call
+        cid_payload = json.dumps({"jsonrpc": "2.0", "method": "eth_chainId", "params": [], "id": 1})
+        st_cid, b_cid = call_transport(rpc_url, cid_payload, {"Content-Type": "application/json"})
+        if st_cid != 200:
+            raise ProviderUnavailableError(f"Uniswap v3 eth_chainId RPC failed with HTTP {st_cid}")
+        r_cid = json.loads(b_cid.decode("utf-8"))
+        if "error" in r_cid or not r_cid.get("result") or r_cid["result"] == "0x":
+            raise ProviderUnavailableError(f"Uniswap v3 eth_chainId RPC call failed: {r_cid}")
+        actual_chain_id = int(r_cid["result"], 16)
+        expected_chain_id = pool_info.get("chain_id", 1)
+        if actual_chain_id != expected_chain_id:
+            raise ProviderUnavailableError(
+                f"Uniswap v3 RPC endpoint chain ID mismatch: got {actual_chain_id}, expected {expected_chain_id} for {norm_ch}"
+            )
+
+        # 2. token0() eth_call (0x0dfe1681)
+        t0_payload = json.dumps({"jsonrpc": "2.0", "method": "eth_call", "params": [{"to": p_addr, "data": "0x0dfe1681"}, "latest"], "id": 2})
+        st_t0, b_t0 = call_transport(rpc_url, t0_payload, {"Content-Type": "application/json"})
+        if st_t0 != 200:
+            raise ProviderUnavailableError(f"Uniswap v3 token0() RPC failed with HTTP {st_t0}")
+        r_t0 = json.loads(b_t0.decode("utf-8"))
+        if "error" in r_t0 or not r_t0.get("result") or len(r_t0["result"].replace("0x", "")) < 40:
+            raise ProviderUnavailableError(f"Uniswap v3 token0() RPC call failed: {r_t0}")
+        actual_t0 = "0x" + r_t0["result"].lower().replace("0x", "")[-40:]
+        if not same_address(norm_ch, actual_t0, pool_info["token0"]):
+            raise ProviderUnavailableError(
+                f"Uniswap v3 pool token0 mismatch: got {actual_t0}, expected {pool_info['token0']}"
+            )
+
+        # 3. token1() eth_call (0xd21220a7)
+        t1_payload = json.dumps({"jsonrpc": "2.0", "method": "eth_call", "params": [{"to": p_addr, "data": "0xd21220a7"}, "latest"], "id": 3})
+        st_t1, b_t1 = call_transport(rpc_url, t1_payload, {"Content-Type": "application/json"})
+        if st_t1 != 200:
+            raise ProviderUnavailableError(f"Uniswap v3 token1() RPC failed with HTTP {st_t1}")
+        r_t1 = json.loads(b_t1.decode("utf-8"))
+        if "error" in r_t1 or not r_t1.get("result") or len(r_t1["result"].replace("0x", "")) < 40:
+            raise ProviderUnavailableError(f"Uniswap v3 token1() RPC call failed: {r_t1}")
+        actual_t1 = "0x" + r_t1["result"].lower().replace("0x", "")[-40:]
+        if not same_address(norm_ch, actual_t1, pool_info["token1"]):
+            raise ProviderUnavailableError(
+                f"Uniswap v3 pool token1 mismatch: got {actual_t1}, expected {pool_info['token1']}"
+            )
+
+        # 4. fee() eth_call (0xddca3f43)
+        fee_payload = json.dumps({"jsonrpc": "2.0", "method": "eth_call", "params": [{"to": p_addr, "data": "0xddca3f43"}, "latest"], "id": 4})
+        st_fee, b_fee = call_transport(rpc_url, fee_payload, {"Content-Type": "application/json"})
+        if st_fee != 200:
+            raise ProviderUnavailableError(f"Uniswap v3 fee() RPC failed with HTTP {st_fee}")
+        r_fee = json.loads(b_fee.decode("utf-8"))
+        if "error" in r_fee or not r_fee.get("result") or r_fee["result"] == "0x":
+            raise ProviderUnavailableError(f"Uniswap v3 fee() RPC call failed: {r_fee}")
+        actual_fee = int(r_fee["result"], 16)
+        expected_fee = pool_info.get("fee_tier", pool_info.get("fee", 3000))
+        if actual_fee != expected_fee:
+            raise ProviderUnavailableError(
+                f"Uniswap v3 pool fee tier mismatch: got {actual_fee}, expected {expected_fee}"
+            )
+
+        # 5. observe(uint32[] secondsAgos) ABI encoding: selector 0x88316456
         win_int = int(twap_window_seconds)
+        if win_int < 60:
+            raise ValueError(f"Uniswap v3 TWAP window must be >= 60 seconds, got {win_int}")
         data_hex = "0x88316456" + "00" * 31 + "20" + "00" * 31 + "02" + hex(win_int)[2:].zfill(64) + "00" * 32
-        rpc_payload = json.dumps({"jsonrpc": "2.0", "method": "eth_call", "params": [{"to": p_addr, "data": data_hex}, "latest"], "id": 1})
+        rpc_payload = json.dumps({"jsonrpc": "2.0", "method": "eth_call", "params": [{"to": p_addr, "data": data_hex}, "latest"], "id": 5})
 
         status_code, body_bytes = call_transport(rpc_url, rpc_payload, {"Content-Type": "application/json"})
         if status_code != 200:
@@ -1527,18 +1766,22 @@ class UniswapV3TwapAdapter:
 
         retrieval_stamp = as_of_utc or datetime.now(timezone.utc).isoformat()
         resp_hash = hashlib.sha256(raw_payload_str.encode("utf-8")).hexdigest()
-        auth_token = _generate_provenance_token("uniswap_v3_twap", retrieval_stamp, resp_hash, rpc_url)
 
         obs_dict = {
             "twap_window_seconds": win_int,
             "twap_price": twap_price,
             "tick_cumulatives": [tick_cums[0], tick_cums[1]],
             "timestamp": retrieval_stamp,
+            "chain_id": actual_chain_id,
+            "token0": actual_t0,
+            "token1": actual_t1,
+            "fee": actual_fee,
         }
 
-        return AcquiredProviderObservation(
+        return AcquiredProviderObservation._create(
             provider="uniswap_v3_twap",
             chain=norm_ch,
+            chain_id=actual_chain_id,
             quote_asset=quote_asset,
             reference_asset=pool_info.get("intermediate_quote", "USDC"),
             price_usd=twap_price,
@@ -1552,7 +1795,8 @@ class UniswapV3TwapAdapter:
             pool_address=p_addr,
             valuation_policy="ON_CHAIN_TWAP_VERIFIED",
             transport_type=transport_type,
-            _auth_token=auth_token,
+            acquisition_method=acquisition_method,
+            observation_timestamp=retrieval_stamp,
         )
 
 
@@ -1572,7 +1816,8 @@ class DefiLlamaPricesAdapter:
         token_key = f"{norm_ch}:{quote_asset}"
         url = f"{cls.DEFAULT_BASE_URL}/{token_key}"
         call_transport = transport or _default_http_call
-        transport_type = "MOCKED_TRANSPORT" if transport is not None else "LIVE_HTTP"
+        transport_type = "MOCKED_TRANSPORT" if transport is not None else "LIVE_NETWORK_ACQUISITION"
+        acquisition_method = "TEST_MOCKED_TRANSPORT" if transport is not None else "GENUINE_READ_ONLY_REST"
 
         status_code, body_bytes = call_transport(url, None, {})
         if status_code != 200:
@@ -1594,7 +1839,6 @@ class DefiLlamaPricesAdapter:
         obs_stamp = datetime.fromtimestamp(ts, tz=timezone.utc).isoformat().replace("+00:00", "Z") if ts else retrieval_stamp
 
         resp_hash = hashlib.sha256(raw_payload_str.encode("utf-8")).hexdigest()
-        auth_token = _generate_provenance_token("defillama", retrieval_stamp, resp_hash, url)
 
         obs_dict = {
             "price": price_val,
@@ -1603,9 +1847,10 @@ class DefiLlamaPricesAdapter:
             "timestamp": obs_stamp,
         }
 
-        return AcquiredProviderObservation(
+        return AcquiredProviderObservation._create(
             provider="defillama",
             chain=norm_ch,
+            chain_id=norm_ch,
             quote_asset=quote_asset,
             reference_asset="USD",
             price_usd=price_val,
@@ -1618,7 +1863,8 @@ class DefiLlamaPricesAdapter:
             feed_id=token_key,
             valuation_policy="DEX_AGGREGATOR_VERIFIED",
             transport_type=transport_type,
-            _auth_token=auth_token,
+            acquisition_method=acquisition_method,
+            observation_timestamp=obs_stamp,
         )
 
 
@@ -1782,6 +2028,68 @@ def validate_quote_usd_conversion(
         return False, "INVALID_QUOTE_CONVERSION_PRICE", None, {
             "reason": f"quote-asset USD conversion price must be positive and finite, got {raw_price!r}"
         }
+
+    # Immediate Provenance & Tampering Integrity Verification
+    actual_obs = conversion.get("__acquired_observation__") if isinstance(conversion, dict) else (
+        conversion if isinstance(conversion, AcquiredProviderObservation) else None
+    )
+    if actual_obs is not None:
+        if getattr(actual_obs, "is_caller_created", False):
+            return False, "CALLER_CREATED_OBSERVATION_OBJECT", None, {
+                "reason": "Caller-created AcquiredProviderObservation objects are rejected; must be acquired via genuine adapter"
+            }
+        if actual_obs.raw_payload:
+            calc_sha = hashlib.sha256(actual_obs.raw_payload.encode("utf-8")).hexdigest()
+            if actual_obs.response_sha256.lower() != calc_sha.lower():
+                return False, "PAYLOAD_HASH_MISMATCH", None, {
+                    "reason": f"observation raw_payload hash ({calc_sha}) does not match response_sha256 ({actual_obs.response_sha256})"
+                }
+        if not _verify_provenance_token(actual_obs):
+            return False, "INVALID_PROVENANCE_SIGNATURE", None, {
+                "reason": "observation HMAC signature verification failed; observation data was tampered or mutated"
+            }
+        # Check dictionary mutations vs actual_obs
+        if abs(clean_price - actual_obs.price_usd) > 1e-6:
+            return False, "OBSERVATION_MUTATION_DETECTED", None, {
+                "reason": f"conversion dict price ({clean_price}) does not match authenticated observation ({actual_obs.price_usd})"
+            }
+        conv_chain_raw = conversion.get("chain")
+        if conv_chain_raw and str(conv_chain_raw).strip().lower() != actual_obs.chain.lower():
+            return False, "OBSERVATION_MUTATION_DETECTED", None, {
+                "reason": f"conversion dict chain ({conv_chain_raw}) does not match authenticated observation ({actual_obs.chain})"
+            }
+        for q_key in ("quote_asset", "token_address", "contract_address"):
+            if q_key in conversion and conversion[q_key]:
+                q_val = str(conversion[q_key]).strip()
+                if not same_address(actual_obs.chain, q_val, actual_obs.quote_asset) and q_val.lower() != actual_obs.quote_asset.lower():
+                    return False, "OBSERVATION_MUTATION_DETECTED", None, {
+                        "reason": f"conversion dict {q_key} does not match authenticated observation"
+                    }
+        if "observation" in conversion and isinstance(conversion["observation"], dict) and actual_obs.observation:
+            if conversion["observation"] != actual_obs.observation:
+                return False, "OBSERVATION_MUTATION_DETECTED", None, {
+                    "reason": "conversion dict observation payload does not match authenticated observation"
+                }
+        if "raw_payload" in conversion and str(conversion["raw_payload"]) != actual_obs.raw_payload:
+            return False, "OBSERVATION_MUTATION_DETECTED", None, {
+                "reason": "conversion dict raw_payload does not match authenticated observation"
+            }
+        if "response_sha256" in conversion and str(conversion["response_sha256"]).lower() != actual_obs.response_sha256.lower():
+            return False, "OBSERVATION_MUTATION_DETECTED", None, {
+                "reason": "conversion dict response_sha256 does not match authenticated observation"
+            }
+        for id_key in ("feed_address", "feed_id", "market_id", "pool_address"):
+            if id_key in conversion and conversion[id_key]:
+                id_val = str(conversion[id_key]).strip()
+                if actual_obs.provider_identifier and not same_address(actual_obs.chain, id_val, actual_obs.provider_identifier) and id_val.lower() != actual_obs.provider_identifier.lower():
+                    return False, "OBSERVATION_MUTATION_DETECTED", None, {
+                        "reason": f"conversion dict {id_key} ({id_val}) does not match authenticated observation ({actual_obs.provider_identifier})"
+                    }
+    else:
+        if isinstance(conversion, dict) and conversion.get("_auth_token"):
+            return False, "INVALID_PROVENANCE_SIGNATURE", None, {
+                "reason": "dictionary contains unverified _auth_token without genuine AcquiredProviderObservation instance"
+            }
 
     # 2. Outer timestamp freshness validation
     stamp = conversion.get("timestamp_utc") or conversion.get("timestamp") or conversion.get("as_of_utc")
@@ -2564,15 +2872,86 @@ def validate_quote_usd_conversion(
         chained_details_dict = ch_details
 
     # Provenance verification: authenticated via genuine adapter HMAC signature
-    actual_obs = conversion.get("__acquired_observation__") if isinstance(conversion, dict) else conversion
-    provenance_verified = _verify_provenance_token(actual_obs)
+    actual_obs = conversion.get("__acquired_observation__") if isinstance(conversion, dict) else (
+        conversion if isinstance(conversion, AcquiredProviderObservation) else None
+    )
+
+    provenance_verified = False
+    transport_type_detected = "UNSPECIFIED"
+    verif_status = "STRUCTURALLY_CONSISTENT_UNVERIFIED_PROVENANCE"
+
+    if actual_obs is not None:
+        if getattr(actual_obs, "is_caller_created", False):
+            return False, "CALLER_CREATED_OBSERVATION_OBJECT", None, {
+                "reason": "Caller-created AcquiredProviderObservation objects are rejected; must be acquired via genuine adapter"
+            }
+
+        # Check raw payload sha256
+        if actual_obs.raw_payload:
+            calc_sha = hashlib.sha256(actual_obs.raw_payload.encode("utf-8")).hexdigest()
+            if actual_obs.response_sha256.lower() != calc_sha.lower():
+                return False, "PAYLOAD_HASH_MISMATCH", None, {
+                    "reason": f"observation raw_payload hash ({calc_sha}) does not match response_sha256 ({actual_obs.response_sha256})"
+                }
+
+        # Verify HMAC signature over full canonical payload
+        if not _verify_provenance_token(actual_obs):
+            return False, "INVALID_PROVENANCE_SIGNATURE", None, {
+                "reason": "observation HMAC signature verification failed; observation data was tampered or mutated"
+            }
+
+        # Check for mutation between conversion dict and authenticated actual_obs
+        if abs(clean_price - actual_obs.price_usd) > 1e-6:
+            return False, "OBSERVATION_MUTATION_DETECTED", None, {
+                "reason": f"conversion dict price ({clean_price}) does not match authenticated observation ({actual_obs.price_usd})"
+            }
+        if norm_chain != actual_obs.chain:
+            return False, "OBSERVATION_MUTATION_DETECTED", None, {
+                "reason": f"conversion dict chain ({norm_chain}) does not match authenticated observation ({actual_obs.chain})"
+            }
+        if not same_address(norm_chain, conv_asset_str, actual_obs.quote_asset) and conv_asset_str.lower() != actual_obs.quote_asset.lower():
+            return False, "OBSERVATION_MUTATION_DETECTED", None, {
+                "reason": f"conversion dict quote_asset ({conv_asset_str}) does not match authenticated observation ({actual_obs.quote_asset})"
+            }
+        if prov_str and actual_obs.provider_identifier and not same_address(norm_chain, prov_str, actual_obs.provider_identifier) and prov_str.lower() != actual_obs.provider_identifier.lower():
+            return False, "OBSERVATION_MUTATION_DETECTED", None, {
+                "reason": f"conversion dict identifier ({prov_str}) does not match authenticated observation ({actual_obs.provider_identifier})"
+            }
+        if isinstance(conversion, dict) and "observation" in conversion and isinstance(conversion["observation"], dict) and actual_obs.observation:
+            if conversion["observation"] != actual_obs.observation:
+                return False, "OBSERVATION_MUTATION_DETECTED", None, {
+                    "reason": "conversion dict observation payload does not match authenticated observation"
+                }
+        if isinstance(conversion, dict) and "response_sha256" in conversion and str(conversion["response_sha256"]).lower() != actual_obs.response_sha256.lower():
+            return False, "OBSERVATION_MUTATION_DETECTED", None, {
+                "reason": "conversion dict response_sha256 does not match authenticated observation"
+            }
+        if isinstance(conversion, dict) and "raw_payload" in conversion and str(conversion["raw_payload"]) != actual_obs.raw_payload:
+            return False, "OBSERVATION_MUTATION_DETECTED", None, {
+                "reason": "conversion dict raw_payload does not match authenticated observation"
+            }
+
+        transport_type_detected = actual_obs.transport_type
+        provenance_verified = True
+        if actual_obs.transport_type == "MOCKED_TRANSPORT":
+            verif_status = "TEST_MOCKED_OBSERVATION_VALIDATED"
+        else:
+            verif_status = "PROVIDER_RESPONSE_ACQUIRED_AND_VALIDATED"
+    else:
+        if isinstance(conversion, dict) and conversion.get("_auth_token"):
+            return False, "INVALID_PROVENANCE_SIGNATURE", None, {
+                "reason": "dictionary contains unverified _auth_token without genuine AcquiredProviderObservation instance"
+            }
 
     # If chained conversion, verify intermediate leg was also acquired and validated
     if provenance_verified and requires_chained:
         if chained_details_dict and not chained_details_dict.get("provider_acquired", False):
             provenance_verified = False
+            verif_status = "STRUCTURALLY_CONSISTENT_UNVERIFIED_PROVENANCE"
+        elif chained_details_dict and chained_details_dict.get("transport_type") == "MOCKED_TRANSPORT":
+            verif_status = "TEST_MOCKED_OBSERVATION_VALIDATED"
+            transport_type_detected = "MOCKED_TRANSPORT"
 
-    verif_status = "PROVIDER_RESPONSE_ACQUIRED_AND_VALIDATED" if provenance_verified else "STRUCTURALLY_CONSISTENT_UNVERIFIED_PROVENANCE"
     verif_method = (
         f"AUTHENTICATED_{canonical_provider.upper()}_ACQUISITION_VERIFIED"
         if provenance_verified else
@@ -2593,8 +2972,10 @@ def validate_quote_usd_conversion(
         "age_seconds": round(age, 1) if age is not None else None,
         "verification_method": verif_method,
         "provider_acquired": provenance_verified,
+        "transport_type": transport_type_detected,
         "conversion_status": verif_status,
-        "cryptographic_authenticity_verified": False,
+        "cryptographic_authenticity_verified": getattr(actual_obs, "cryptographic_signature_verified", False) if actual_obs else False,
+        "__acquired_observation__": actual_obs,
     }
 
 
@@ -3298,6 +3679,7 @@ def simulate_multi_size(
         }
 
     effective_quote_usd_price = 1.0
+    conv_details = None
     if conv_data:
         ok_conv, conv_status, conv_price, conv_details = validate_quote_usd_conversion(
             conv_data,
@@ -3306,7 +3688,7 @@ def simulate_multi_size(
             as_of_utc=as_of_utc,
             max_conversion_age_seconds=max_conversion_age_seconds,
         )
-        if not ok_conv or conv_status not in {"PROVIDER_RESPONSE_ACQUIRED_AND_VALIDATED", "CONVERSION_VERIFIED"}:
+        if not ok_conv or conv_status not in {"PROVIDER_RESPONSE_ACQUIRED_AND_VALIDATED", "TEST_MOCKED_OBSERVATION_VALIDATED", "CONVERSION_VERIFIED"}:
             size_evaluations = {}
             for s in clean_sizes:
                 size_key = f"${int(s) if s.is_integer() else s}"
@@ -3323,6 +3705,7 @@ def simulate_multi_size(
                     "sell": {"status": "UNAVAILABLE", "reason": conv_details.get("reason")},
                     "estimated_round_trip_cost_pct": None,
                     "execution_adjusted_return_pct": None,
+                    "quote_conversion": conv_details,
                 }
             return {
                 "schema": "crypto-prebreakout.multi-size-execution-simulation.v1",
@@ -3334,6 +3717,7 @@ def simulate_multi_size(
                 "gas_usd": gas_usd,
                 "target_upside_pct": target_upside_pct,
                 "size_evaluations": size_evaluations,
+                "quote_conversion": conv_details,
                 "research_disclaimer": "Read-only simulation. Evaluates hypothetical size-dependent price impact and execution drag.",
             }
         effective_quote_usd_price = conv_price
@@ -3541,6 +3925,11 @@ def simulate_multi_size(
                     "INVALID_DEX_AGGREGATOR_PAYLOAD",
                     "CONFLICTING_PROVIDER_EVIDENCE",
                     "FABRICATED_PROVIDER_RESPONSE",
+                    "OBSERVATION_MUTATION_DETECTED",
+                    "PAYLOAD_HASH_MISMATCH",
+                    "CALLER_CREATED_OBSERVATION_OBJECT",
+                    "INVALID_PROVENANCE_SIGNATURE",
+                    "TEST_MOCKED_OBSERVATION_VALIDATED",
                     "UNVERIFIED_PROVIDER_OBSERVATION",
                     "STRUCTURALLY_CONSISTENT_UNVERIFIED_PROVENANCE",
                     "PROVIDER_DATA_UNAVAILABLE",
@@ -3770,6 +4159,11 @@ def simulate_multi_size(
                     "INVALID_DEX_AGGREGATOR_PAYLOAD",
                     "CONFLICTING_PROVIDER_EVIDENCE",
                     "FABRICATED_PROVIDER_RESPONSE",
+                    "OBSERVATION_MUTATION_DETECTED",
+                    "PAYLOAD_HASH_MISMATCH",
+                    "CALLER_CREATED_OBSERVATION_OBJECT",
+                    "INVALID_PROVENANCE_SIGNATURE",
+                    "TEST_MOCKED_OBSERVATION_VALIDATED",
                     "UNVERIFIED_PROVIDER_OBSERVATION",
                     "STRUCTURALLY_CONSISTENT_UNVERIFIED_PROVENANCE",
                     "PROVIDER_DATA_UNAVAILABLE",
@@ -4016,6 +4410,7 @@ def simulate_multi_size(
         "gas_usd": gas_usd,
         "target_upside_pct": target_upside_pct,
         "size_evaluations": size_evaluations,
+        "quote_conversion": conv_details,
         "research_disclaimer": (
             "Read-only simulation. Evaluates hypothetical size-dependent price impact and execution drag. "
             "Displayed liquidity is subject to cancellation, front-running, and MEV sandwich attacks."
