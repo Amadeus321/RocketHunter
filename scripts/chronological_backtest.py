@@ -23,6 +23,11 @@ from typing import Any
 BACKTEST_VERSION = "4.30.0"
 MANDATORY_TARGET_PCT = 40.0
 
+try:
+    from scripts.address_identity import validate_and_build_identity
+except ImportError:
+    from address_identity import validate_and_build_identity
+
 
 def _parse_utc(val: Any) -> dt.datetime | None:
     if not isinstance(val, str) or not val:
@@ -50,8 +55,19 @@ class ChronologicalBacktestEvaluator:
     """Evaluates predictive models using chronological walk-forward out-of-sample windows."""
 
     def __init__(self, records: list[dict[str, Any]], *, config_fingerprint: str = "default"):
-        self.records = records
+        self.records = records or []
         self.config_fingerprint = config_fingerprint
+        self.diagnostics: dict[str, Any] = {
+            "total_historical_records": len(self.records),
+            "valid_exact_identity_records": 0,
+            "missing_identity_records": 0,
+            "missing_identity_by_reason": collections.Counter(),
+            "conflicting_identity_records": 0,
+            "duplicate_records": 0,
+            "successfully_matched_outcomes": 0,
+            "unresolved_outcomes": 0,
+            "rejected_records": [],
+        }
 
     @classmethod
     def from_jsonl_partitions(cls, directory: Path, pattern: str = "*.jsonl.gz") -> "ChronologicalBacktestEvaluator":
@@ -99,62 +115,146 @@ class ChronologicalBacktestEvaluator:
         return evaluator
 
     def prepare_chronological_dataset(self) -> list[dict[str, Any]]:
-        """Filter ambiguous identities, validate timestamps, and sort chronologically."""
+        """Filter ambiguous identities, validate timestamps, and sort chronologically.
+
+        Strictly enforces:
+        - Exact DEX market identity: chain + token mint/contract + pool address (all mandatory).
+        - Distinct CEX market identity: exchange + market_type + trading_pair.
+        - Rejection of missing chain, missing token, or missing pool address.
+        - Detection and reporting of conflicting token or pool representations.
+        - Preservation of frozen detection-time information.
+        - Deduplication to prevent inflating the sample count.
+        - Recording of all rejected candidates in diagnostics for full auditability.
+        """
         valid = []
+        seen_keys: set[tuple[str, str]] = set()
+
         for r in self.records:
+            if not isinstance(r, dict):
+                self.diagnostics["missing_identity_records"] += 1
+                self.diagnostics["missing_identity_by_reason"]["NOT_A_DICTIONARY"] += 1
+                self.diagnostics["rejected_records"].append({"record": r, "reason": "NOT_A_DICTIONARY"})
+                continue
+
             # Extract timestamp
             t_str = r.get("snapshot_utc") or r.get("forecast_utc") or r.get("retrieved_utc")
             t = _parse_utc(t_str)
             if t is None:
+                self.diagnostics["missing_identity_records"] += 1
+                self.diagnostics["missing_identity_by_reason"]["INVALID_OR_MISSING_TIMESTAMP"] += 1
+                self.diagnostics["rejected_records"].append({"record": r, "reason": "INVALID_OR_MISSING_TIMESTAMP"})
                 continue
 
-            # Identify market key
-            chain = r.get("chain") or (r.get("normalized_record", {}) if isinstance(r.get("normalized_record"), dict) else {}).get("chain")
-            token = (
-                r.get("contract_address") or r.get("token_mint") or
-                (r.get("normalized_record", {}) if isinstance(r.get("normalized_record"), dict) else {}).get("token_contract")
-            )
-            pool = (
-                r.get("pool_address") or r.get("pair_address") or
-                (r.get("normalized_record", {}) if isinstance(r.get("normalized_record"), dict) else {}).get("pool_address")
-            )
-            if not chain or not token:
-                continue  # Ambiguous identity excluded
+            # Validate exact market identity
+            id_res = validate_and_build_identity(r)
+            if not id_res.get("is_valid"):
+                reason = id_res.get("rejection_reason") or "INVALID_IDENTITY"
+                if "CONFLICTING" in reason:
+                    self.diagnostics["conflicting_identity_records"] += 1
+                else:
+                    self.diagnostics["missing_identity_records"] += 1
+                self.diagnostics["missing_identity_by_reason"][reason] += 1
+                self.diagnostics["rejected_records"].append({
+                    "record": r,
+                    "reason": reason,
+                    "details": id_res,
+                })
+                continue
 
+            canon_key = id_res["canonical_identity"]
+            m_type = id_res["market_type"]
+
+            # Validate price at detection time
             price = _clean_num(
-                r.get("price_usd") or r.get("final_price_usd") or
+                r.get("price_usd") or r.get("final_price_usd") or r.get("entry_price") or
                 (r.get("normalized_record", {}) if isinstance(r.get("normalized_record"), dict) else {}).get("price_at_detection_usd")
             )
             if price is None or price <= 0:
+                self.diagnostics["missing_identity_by_reason"]["INVALID_OR_NONPOSITIVE_PRICE"] += 1
+                self.diagnostics["rejected_records"].append({"record": r, "reason": "INVALID_OR_NONPOSITIVE_PRICE"})
                 continue
 
+            # Deduplication: prevent identical observation from inflating sample count
+            dedup_key = (canon_key, str(t_str))
+            if dedup_key in seen_keys:
+                self.diagnostics["duplicate_records"] += 1
+                self.diagnostics["rejected_records"].append({
+                    "record": r,
+                    "reason": "DUPLICATE_OBSERVATION",
+                    "key": f"{canon_key}@{t_str}",
+                })
+                continue
+            seen_keys.add(dedup_key)
+
+            # Preserve immutable detection-time fields
+            rec_id = r.get("snapshot_id") or r.get("forecast_id") or hashlib.sha256(f"{canon_key}:{t_str}".encode()).hexdigest()
+            tp_price = _clean_num(
+                r.get("target_price") or r.get("take_profit_price") or r.get("tp_price") or
+                (r.get("normalized_record", {}) if isinstance(r.get("normalized_record"), dict) else {}).get("target_price")
+            )
+            tp_pct = _clean_num(r.get("technical_tp_pct") or r.get("target_upside_pct") or r.get("tp_pct"))
+            if tp_pct is None and tp_price is not None and price > 0:
+                tp_pct = round(((tp_price / price) - 1.0) * 100.0, 4)
+
+            score_val = _clean_num(
+                r.get("early_breakout_score") or r.get("rank_score") or
+                (r.get("normalized_record", {}) if isinstance(r.get("normalized_record"), dict) else {}).get("signal_score_and_components", {}).get("early_breakout_score")
+            ) or 0.0
+
+            liq_val = _clean_num(
+                r.get("liquidity_usd") or
+                (r.get("normalized_record", {}) if isinstance(r.get("normalized_record"), dict) else {}).get("liquidity_usd")
+            ) or 0.0
+
+            vol_val = _clean_num(
+                r.get("volume_usd") or r.get("volume_24h_usd") or
+                (r.get("normalized_record", {}) if isinstance(r.get("normalized_record"), dict) else {}).get("volume_24h_usd")
+            ) or 0.0
+
+            age_val = _clean_num(
+                r.get("age_hours") or
+                (r.get("normalized_record", {}) if isinstance(r.get("normalized_record"), dict) else {}).get("pool_age_hours")
+            )
+
             valid.append({
-                "record_id": r.get("snapshot_id") or r.get("forecast_id") or hashlib.sha256(f"{chain}:{token}:{t_str}".encode()).hexdigest(),
+                "record_id": rec_id,
                 "timestamp": t,
                 "timestamp_utc": t_str,
-                "chain": str(chain).lower(),
-                "token": str(token),
-                "pool": str(pool) if pool else None,
-                "market_key": f"{chain}:{token}:{pool}" if pool else f"{chain}:{token}",
+                "discovery_timestamp_utc": t_str,
+                "market_type": m_type,
+                "chain": id_res.get("chain"),
+                "token": id_res.get("token"),
+                "pool": id_res.get("pool"),
+                "exchange": id_res.get("exchange"),
+                "pair": id_res.get("pair"),
+                "market_key": canon_key,
+                "exact_identity": canon_key,
                 "detection_price": price,
-                "score": _clean_num(
-                    r.get("early_breakout_score") or r.get("rank_score") or
-                    (r.get("normalized_record", {}) if isinstance(r.get("normalized_record"), dict) else {}).get("signal_score_and_components", {}).get("early_breakout_score")
-                ) or 0.0,
-                "liquidity_usd": _clean_num(
-                    r.get("liquidity_usd") or
-                    (r.get("normalized_record", {}) if isinstance(r.get("normalized_record"), dict) else {}).get("liquidity_usd")
-                ) or 0.0,
-                "age_hours": _clean_num(
-                    r.get("age_hours") or
-                    (r.get("normalized_record", {}) if isinstance(r.get("normalized_record"), dict) else {}).get("pool_age_hours")
-                ),
+                "entry_price": price,
+                "technical_tp_price": tp_price,
+                "technical_tp_pct": tp_pct,
+                "scanner_version": str(r.get("scanner_version") or r.get("version") or BACKTEST_VERSION),
+                "config_fingerprint": str(r.get("config_fingerprint") or self.config_fingerprint),
+                "score": score_val,
+                "score_components": r.get("score_components") or (r.get("normalized_record", {}) if isinstance(r.get("normalized_record"), dict) else {}).get("signal_score_and_components") or {},
+                "liquidity_usd": liq_val,
+                "volume_usd": vol_val,
+                "volume_24h_usd": vol_val,
+                "token_age_hours": age_val,
+                "age_hours": age_val,
+                "security_evidence": r.get("security_evidence") or r.get("security_status") or r.get("quality_gate") or {},
+                "discovery_source": r.get("source") or r.get("discovery_source") or r.get("venue") or "unknown",
+                "provider_timestamps": {
+                    "retrieved_utc": r.get("retrieved_utc"),
+                    "data_timestamp_utc": r.get("data_timestamp_utc"),
+                },
                 "is_rejected": r.get("is_rejected_candidate", False),
                 "raw_record": r,
             })
 
         # Sort strictly chronologically
         valid.sort(key=lambda item: item["timestamp"])
+        self.diagnostics["valid_exact_identity_records"] = len(valid)
         return valid
 
     def evaluate_walk_forward(
@@ -175,6 +275,16 @@ class ChronologicalBacktestEvaluator:
                 "message": "No valid chronological observation records found.",
                 "total_records": len(self.records),
                 "windows_evaluated": 0,
+                "diagnostics": {
+                    "total_historical_records": self.diagnostics.get("total_historical_records", len(self.records)),
+                    "valid_exact_identity_records": 0,
+                    "missing_identity_records": self.diagnostics.get("missing_identity_records", 0),
+                    "missing_identity_by_reason": dict(self.diagnostics.get("missing_identity_by_reason", {})),
+                    "conflicting_identity_records": self.diagnostics.get("conflicting_identity_records", 0),
+                    "duplicate_records": self.diagnostics.get("duplicate_records", 0),
+                    "successfully_matched_outcomes": 0,
+                    "unresolved_outcomes": 0,
+                },
             }
 
         start_time = dataset[0]["timestamp"]
@@ -290,6 +400,16 @@ class ChronologicalBacktestEvaluator:
             "naive_baseline_comparison": baseline_metrics,
             "performance_by_chain": by_chain,
             "performance_by_liquidity_tier": by_liquidity,
+            "diagnostics": {
+                "total_historical_records": self.diagnostics.get("total_historical_records", len(self.records)),
+                "valid_exact_identity_records": len(dataset),
+                "missing_identity_records": self.diagnostics.get("missing_identity_records", 0),
+                "missing_identity_by_reason": dict(self.diagnostics.get("missing_identity_by_reason", {})),
+                "conflicting_identity_records": self.diagnostics.get("conflicting_identity_records", 0),
+                "duplicate_records": self.diagnostics.get("duplicate_records", 0),
+                "successfully_matched_outcomes": self.diagnostics.get("successfully_matched_outcomes", 0),
+                "unresolved_outcomes": self.diagnostics.get("unresolved_outcomes", 0),
+            },
             "scientific_integrity_note": (
                 "Zero synthetic labels permitted. Incomplete or unresolved observation windows are "
                 "strictly counted and excluded from performance percentage denominators."
@@ -301,15 +421,36 @@ class ChronologicalBacktestEvaluator:
 
         Never estimates MFE, MAE, TP attainment, or touch times from change_24h_pct.
         Unresolved or incomplete records are marked is_evaluated=False and excluded from performance rates.
+        Enforces exact market identity matching: different pools or tokens cannot share outcomes.
         """
         # 1. Lookup match
         if lookup and item["record_id"] in lookup:
             rec = lookup[item["record_id"]]
+            rec_id = rec.get("exact_identity") or rec.get("market_key")
+            # If outcome has an exact identity, it must match the forecast's exact identity
+            if rec_id and rec_id != item["market_key"]:
+                self.diagnostics["conflicting_identity_records"] += 1
+                self.diagnostics["unresolved_outcomes"] += 1
+                return {
+                    "outcome_classification": "CONFLICTING_IDENTITY_REJECTED",
+                    "target_reached": None,
+                    "mfe_pct": None,
+                    "mae_pct": None,
+                    "hours_to_target": None,
+                    "is_evaluated": False,
+                    "resolution_reason": f"IDENTITY_MISMATCH: forecast={item['market_key']} outcome={rec_id}",
+                    "execution_status": "EXECUTION_UNVERIFIED",
+                }
+
             status = rec.get("outcome_classification") or ("TARGET_REACHED" if rec.get("target_reached") else "UNRESOLVED")
             mfe = _clean_num(rec.get("mfe_pct"))
             mae = _clean_num(rec.get("mae_pct"))
             touch_time = _clean_num(rec.get("hours_to_target") or rec.get("first_touch_hours"))
             is_eval = status in {"TARGET_REACHED", "TARGET_NOT_REACHED"} and mfe is not None
+            if is_eval:
+                self.diagnostics["successfully_matched_outcomes"] += 1
+            else:
+                self.diagnostics["unresolved_outcomes"] += 1
             return {
                 "outcome_classification": status,
                 "target_reached": rec.get("target_reached") if is_eval else None,
@@ -331,6 +472,7 @@ class ChronologicalBacktestEvaluator:
         # Exact verified candle trace: only consider evaluated if verified status and real MFE are present
         if outcome_status in {"TARGET_REACHED", "TARGET_NOT_REACHED"} and mfe_pct is not None:
             hit_tp = bool(outcome_status == "TARGET_REACHED" or mfe_pct >= MANDATORY_TARGET_PCT)
+            self.diagnostics["successfully_matched_outcomes"] += 1
             return {
                 "outcome_classification": outcome_status,
                 "target_reached": hit_tp,
@@ -345,6 +487,7 @@ class ChronologicalBacktestEvaluator:
         # 3. If exact-identity verified 24h outcome is unavailable, classify as INCOMPLETE / UNRESOLVED
         censored = bool(raw.get("censored") or outcome_status in {"UNKNOWN_DUE_TO_GAP", "PRICE_SOURCE_CONFLICT", "EXPIRED"})
         classification = outcome_status or ("CENSORED" if censored else "INCOMPLETE_OBSERVATION")
+        self.diagnostics["unresolved_outcomes"] += 1
         return {
             "outcome_classification": classification,
             "target_reached": None,

@@ -37,15 +37,21 @@ class TestChronologicalBacktest:
 
     def test_ambiguous_identities_are_excluded(self):
         records = [
-            {"snapshot_utc": "2026-11-01T12:00:00Z", "chain": None, "contract_address": "TokenA", "price_usd": 1.0},
-            {"snapshot_utc": "2026-11-01T12:00:00Z", "chain": "solana", "contract_address": "", "price_usd": 1.0},
-            {"snapshot_utc": "2026-11-01T12:00:00Z", "chain": "solana", "contract_address": "TokenValid", "price_usd": None},
-            {"snapshot_utc": "2026-11-01T12:00:00Z", "chain": "solana", "contract_address": "TokenValid", "price_usd": 1.0},
+            {"snapshot_utc": "2026-11-01T12:00:00Z", "chain": None, "contract_address": "TokenA", "pool_address": "PoolA", "price_usd": 1.0},
+            {"snapshot_utc": "2026-11-01T12:00:00Z", "chain": "solana", "contract_address": "", "pool_address": "PoolA", "price_usd": 1.0},
+            {"snapshot_utc": "2026-11-01T12:00:00Z", "chain": "solana", "contract_address": "TokenValid", "pool_address": "PoolValid", "price_usd": None},
+            {"snapshot_utc": "2026-11-01T12:00:00Z", "chain": "solana", "contract_address": "TokenValid", "price_usd": 1.0},  # Missing pool address!
+            {"snapshot_utc": "2026-11-01T12:00:00Z", "chain": "solana", "contract_address": "TokenValid", "pool_address": "PoolValid", "price_usd": 1.0},  # Valid exact identity
         ]
         evaluator = ChronologicalBacktestEvaluator(records)
         dataset = evaluator.prepare_chronological_dataset()
         assert len(dataset) == 1
         assert dataset[0]["token"] == "TokenValid"
+        assert dataset[0]["pool"] == "PoolValid"
+        assert dataset[0]["market_key"] == "dex:solana:TokenValid:PoolValid"
+        assert evaluator.diagnostics["missing_identity_records"] == 3
+        assert evaluator.diagnostics["missing_identity_by_reason"]["MISSING_POOL"] == 1
+        assert len(evaluator.diagnostics["rejected_records"]) == 4
 
     def test_walk_forward_evaluation_and_metrics_calculation(self):
         base_time = dt.datetime(2026, 11, 1, 0, 0, tzinfo=dt.timezone.utc)
@@ -159,3 +165,168 @@ class TestChronologicalBacktest:
         assert metrics["status"] == "NO_EVALUATED_RECORDS"
         assert metrics["evaluated_records_count"] == 0
         assert metrics["tp40_rate_pct"] is None
+
+    def test_two_pools_trading_same_token_cannot_share_outcomes(self):
+        """Regression 1: Two pools for the same token must maintain independent identities and cannot share outcomes."""
+        evaluator = ChronologicalBacktestEvaluator([])
+        item_pool_a = {
+            "record_id": "rec_pool_a",
+            "market_key": "dex:solana:TokenX:PoolA",
+            "exact_identity": "dex:solana:TokenX:PoolA",
+            "timestamp_utc": "2026-11-01T12:00:00Z",
+            "detection_price": 1.0,
+            "raw_record": {},
+        }
+        item_pool_b = {
+            "record_id": "rec_pool_b",
+            "market_key": "dex:solana:TokenX:PoolB",
+            "exact_identity": "dex:solana:TokenX:PoolB",
+            "timestamp_utc": "2026-11-01T12:00:00Z",
+            "detection_price": 0.8,
+            "raw_record": {},
+        }
+
+        # Lookup contains outcome for Pool A only
+        outcome_lookup = {
+            "rec_pool_a": {
+                "exact_identity": "dex:solana:TokenX:PoolA",
+                "outcome_classification": "TARGET_REACHED",
+                "target_reached": True,
+                "mfe_pct": 55.0,
+            },
+            # If an attempt is made to join Pool B with Pool A's outcome, it must be rejected!
+            "rec_pool_b": {
+                "exact_identity": "dex:solana:TokenX:PoolA",  # Wrong pool!
+                "outcome_classification": "TARGET_REACHED",
+                "target_reached": True,
+                "mfe_pct": 55.0,
+            },
+        }
+
+        res_a = evaluator._resolve_outcome(item_pool_a, outcome_lookup)
+        assert res_a["is_evaluated"] is True
+        assert res_a["target_reached"] is True
+
+        res_b = evaluator._resolve_outcome(item_pool_b, outcome_lookup)
+        assert res_b["is_evaluated"] is False
+        assert res_b["outcome_classification"] == "CONFLICTING_IDENTITY_REJECTED"
+        assert "IDENTITY_MISMATCH" in res_b["resolution_reason"]
+
+    def test_two_tokens_with_same_symbol_cannot_share_outcomes(self):
+        """Regression 2: Two different tokens with the same symbol (e.g. PEPE) have different contracts and cannot share outcomes."""
+        records = [
+            {"snapshot_utc": "2026-11-01T12:00:00Z", "chain": "solana", "symbol": "PEPE", "contract_address": "MintRealPEPE", "pool_address": "Pool1", "price_usd": 1.0},
+            {"snapshot_utc": "2026-11-01T12:00:00Z", "chain": "solana", "symbol": "PEPE", "contract_address": "MintFakePEPE", "pool_address": "Pool2", "price_usd": 0.5},
+        ]
+        evaluator = ChronologicalBacktestEvaluator(records)
+        dataset = evaluator.prepare_chronological_dataset()
+        assert len(dataset) == 2
+        assert dataset[0]["market_key"] != dataset[1]["market_key"]
+        assert dataset[0]["token"] == "MintRealPEPE"
+        assert dataset[1]["token"] == "MintFakePEPE"
+
+    def test_same_token_on_two_chains_cannot_share_outcomes(self):
+        """Regression 3: The same token deployed across different chains maintains distinct identities."""
+        records = [
+            {"snapshot_utc": "2026-11-01T12:00:00Z", "chain": "ethereum", "contract_address": "0x1111111111111111111111111111111111111111", "pool_address": "0xaaaabbbbccccddddeeeeffff0000111122223333", "price_usd": 1.0},
+            {"snapshot_utc": "2026-11-01T12:00:00Z", "chain": "base", "contract_address": "0x1111111111111111111111111111111111111111", "pool_address": "0xaaaabbbbccccddddeeeeffff0000111122223333", "price_usd": 1.0},
+        ]
+        evaluator = ChronologicalBacktestEvaluator(records)
+        dataset = evaluator.prepare_chronological_dataset()
+        assert len(dataset) == 2
+        assert dataset[0]["market_key"].startswith("dex:ethereum:")
+        assert dataset[1]["market_key"].startswith("dex:base:")
+        assert dataset[0]["market_key"] != dataset[1]["market_key"]
+
+    def test_missing_pool_addresses_cannot_enter_dex_performance_denominators(self):
+        """Regression 4: Records missing a DEX pool address are strictly excluded from dataset and cannot enter denominators."""
+        records = [
+            # Missing pool address
+            {"snapshot_utc": "2026-11-01T12:00:00Z", "chain": "solana", "contract_address": "MintNoPool", "price_usd": 1.0, "mfe_pct": 50.0},
+            # Valid exact identity
+            {"snapshot_utc": "2026-11-01T12:00:00Z", "chain": "solana", "contract_address": "MintWithPool", "pool_address": "PoolX", "price_usd": 1.0, "mfe_pct": 50.0, "outcome_classification": "TARGET_REACHED"},
+        ]
+        evaluator = ChronologicalBacktestEvaluator(records)
+        dataset = evaluator.prepare_chronological_dataset()
+        assert len(dataset) == 1
+        assert dataset[0]["token"] == "MintWithPool"
+        assert evaluator.diagnostics["missing_identity_records"] == 1
+        assert evaluator.diagnostics["missing_identity_by_reason"]["MISSING_POOL"] == 1
+
+    def test_duplicate_observations_do_not_inflate_sample_count(self):
+        """Regression 5: Duplicate observations for the same market key and timestamp are deduplicated."""
+        records = [
+            {"snapshot_utc": "2026-11-01T12:00:00Z", "chain": "solana", "contract_address": "MintA", "pool_address": "PoolA", "price_usd": 1.0},
+            {"snapshot_utc": "2026-11-01T12:00:00Z", "chain": "solana", "contract_address": "MintA", "pool_address": "PoolA", "price_usd": 1.0},  # Duplicate!
+            {"snapshot_utc": "2026-11-02T12:00:00Z", "chain": "solana", "contract_address": "MintA", "pool_address": "PoolA", "price_usd": 1.1},  # Different timestamp: valid
+        ]
+        evaluator = ChronologicalBacktestEvaluator(records)
+        dataset = evaluator.prepare_chronological_dataset()
+        assert len(dataset) == 2
+        assert evaluator.diagnostics["duplicate_records"] == 1
+
+    def test_future_information_cannot_overwrite_detection_time_features(self):
+        """Regression 6: Resolving outcomes preserves frozen detection-time features (price, score, timestamp)."""
+        evaluator = ChronologicalBacktestEvaluator([])
+        item = {
+            "record_id": "rec_future_test",
+            "market_key": "dex:solana:MintFrozen:PoolFrozen",
+            "timestamp_utc": "2026-11-01T12:00:00Z",
+            "detection_price": 1.0,
+            "score": 88.0,
+            "raw_record": {
+                "outcome_classification": "TARGET_REACHED",
+                "mfe_pct": 65.0,
+                "price_usd_at_outcome": 2.5,  # Future price!
+            },
+        }
+        outcome = evaluator._resolve_outcome(item, lookup=None)
+        # Outcome is resolved
+        assert outcome["is_evaluated"] is True
+        assert outcome["target_reached"] is True
+        # Detection time values on item remain unaltered
+        assert item["detection_price"] == 1.0
+        assert item["score"] == 88.0
+        assert item["timestamp_utc"] == "2026-11-01T12:00:00Z"
+
+    def test_incomplete_outcomes_remain_incomplete(self):
+        """Regression 7: Incomplete, gap, or expired outcomes remain strictly unresolved and un-evaluated."""
+        evaluator = ChronologicalBacktestEvaluator([])
+        item = {
+            "record_id": "rec_incomplete",
+            "market_key": "dex:solana:MintInc:PoolInc",
+            "timestamp_utc": "2026-11-01T12:00:00Z",
+            "detection_price": 1.0,
+            "raw_record": {
+                "outcome_classification": "UNKNOWN_DUE_TO_GAP",
+                "mfe_pct": 50.0,  # Even if an unverified MFE is claimed during a gap, must remain incomplete!
+            },
+        }
+        outcome = evaluator._resolve_outcome(item, lookup=None)
+        assert outcome["is_evaluated"] is False
+        assert outcome["target_reached"] is None
+        assert outcome["mfe_pct"] is None
+        assert outcome["outcome_classification"] == "UNKNOWN_DUE_TO_GAP"
+        assert outcome["resolution_reason"] == "UNRESOLVED_INCOMPLETE_OR_CENSORED"
+
+    def test_conflicting_identities_detected_and_reported_in_diagnostics(self):
+        """Regression 8: Conflicting token representations (e.g. mismatch between top-level and normalized_record) are rejected."""
+        records = [
+            {
+                "snapshot_utc": "2026-11-01T12:00:00Z",
+                "chain": "solana",
+                "contract_address": "MintA",
+                "pool_address": "Pool1",
+                "price_usd": 1.0,
+                "normalized_record": {
+                    "chain": "solana",
+                    "token_contract": "MintB",  # Conflicting token!
+                    "pool_address": "Pool1",
+                },
+            }
+        ]
+        evaluator = ChronologicalBacktestEvaluator(records)
+        dataset = evaluator.prepare_chronological_dataset()
+        assert len(dataset) == 0
+        assert evaluator.diagnostics["conflicting_identity_records"] == 1
+        assert evaluator.diagnostics["missing_identity_by_reason"]["CONFLICTING_TOKEN_IDENTITY"] == 1
