@@ -15,7 +15,7 @@ from __future__ import annotations
 import math
 from typing import Any
 
-EXPECTED_RETURN_MODEL_VERSION = "4.29.0"
+EXPECTED_RETURN_MODEL_VERSION = "4.30.0"
 MANDATORY_MIN_TP_PCT = 40.00
 
 

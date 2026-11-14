@@ -1,6 +1,8 @@
 name: Full DEX-first crypto rocket scan
 
 on:
+  schedule:
+    - cron: '0 4 * * *'
   push:
     branches: [main]
   pull_request:
@@ -111,7 +113,8 @@ jobs:
           PY
       - name: Run all deterministic tests and CLI smoke checks
         run: |
-          python -m unittest discover -s tests -p 'test_*.py' -v
+          pip install pytest pytest-subtests
+          python -m pytest tests/ -v
           python -m compileall -q scripts tests
           python scripts/rocket_hunt.py --help >/dev/null
           python scripts/run_full_scan.py --help >/dev/null
@@ -122,7 +125,7 @@ jobs:
           python -m scripts.v418_fast_refresh --no-network --outdir /tmp/v418-fast-test --memory-dir /tmp/v418-fast-memory --run-id ci-smoke
 
   scan:
-    if: github.event_name != 'pull_request'
+    if: github.event_name == 'workflow_dispatch' || github.event_name == 'schedule'
     needs: validate
     runs-on: ubuntu-24.04
     timeout-minutes: 180

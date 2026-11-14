@@ -14,6 +14,8 @@ RocketHunter.exe
 
 # Local data & run caches
 rocket-hunter-data/
+rocket-hunter-data-v430-backup/
+*-backup*/
 rocket-runs/
 _task_tmp/
 .pytest_cache/

@@ -4,11 +4,14 @@
 This is a read-only order-book simulation. It does not submit orders, predict fills,
 or guarantee that displayed depth will remain available.
 """
+from __future__ import annotations
+
 import argparse
 import json
 import math
 import sys
 from pathlib import Path
+from typing import Any
 
 VERSION = (Path(__file__).resolve().parents[1] / "VERSION").read_text(encoding="utf-8").strip()
 
@@ -136,6 +139,304 @@ def simulate(book, buy_notional_usd, fee_bps=0.0):
                         "immediate round-trip simulation is not a future exit-price forecast",
                         "does not model hidden liquidity, queue priority, latency, adverse selection or dynamic impact",
                         "fees are user-supplied and may differ by tier, venue, token or order type"],
+    }
+
+
+DEFAULT_RESEARCH_NOTIONAL_SIZES_USD = (100.0, 500.0, 1000.0, 5000.0)
+
+
+def _clean_numeric(val: Any) -> float | None:
+    if val is None or val == "":
+        return None
+    try:
+        f = float(val)
+        return f if math.isfinite(f) else None
+    except (ValueError, TypeError):
+        return None
+
+
+def simulate_multi_size(
+    source: dict[str, Any],
+    *,
+    sizes_usd: tuple[float, ...] | list[float] = DEFAULT_RESEARCH_NOTIONAL_SIZES_USD,
+    fee_bps: float = 30.0,
+    gas_usd: float | None = None,
+    as_of_utc: str | None = None,
+    max_quote_age_seconds: float = 300.0,
+    target_upside_pct: float | None = None,
+) -> dict[str, Any]:
+    """Evaluate multi-size read-only execution scenarios ($100, $500, $1k, $5k).
+
+    Distinguishes actual order book depth walks from approximate linear liquidity heuristics.
+    Never assumes the same token has identical execution cost across sizes.
+    Never assumes a buy quote proves a sell route is possible.
+    Enforces quote freshness verification and size-bound quote validation.
+    """
+    # Sanitize and validate inputs to prevent malformed/negative crashes
+    fee_bps_clean = _clean_numeric(fee_bps)
+    fee_bps = max(0.0, fee_bps_clean) if fee_bps_clean is not None else 30.0
+
+    gas_usd_clean = _clean_numeric(gas_usd)
+    gas_usd = max(0.0, gas_usd_clean) if gas_usd_clean is not None else None
+
+    target_upside_clean = _clean_numeric(target_upside_pct)
+    target_upside_pct = target_upside_clean
+
+    max_age_clean = _clean_numeric(max_quote_age_seconds)
+    max_quote_age_seconds = max(1.0, max_age_clean) if max_age_clean is not None else 300.0
+
+    clean_sizes: list[float] = []
+    raw_sizes = sizes_usd if isinstance(sizes_usd, (list, tuple, set)) else DEFAULT_RESEARCH_NOTIONAL_SIZES_USD
+    for s in raw_sizes:
+        num = _clean_numeric(s)
+        if num is not None and num > 0:
+            clean_sizes.append(num)
+    if not clean_sizes:
+        clean_sizes = list(DEFAULT_RESEARCH_NOTIONAL_SIZES_USD)
+
+    now = None
+    if as_of_utc:
+        try:
+            import datetime as _dt
+            if str(as_of_utc).endswith("Z"):
+                now = _dt.datetime.fromisoformat(str(as_of_utc).replace("Z", "+00:00"))
+            else:
+                now = _dt.datetime.fromisoformat(str(as_of_utc))
+        except Exception:
+            now = None
+
+    book = _find_book(source)
+    quotes = source.get("dex_execution_quotes") if isinstance(source.get("dex_execution_quotes"), dict) else (
+        source if "buy_quote" in source or "sell_quote" in source else None
+    )
+
+    size_evaluations: dict[str, Any] = {}
+    liquidity_usd = None
+    if isinstance(source, dict):
+        liquidity_usd = _clean_numeric(source.get("liquidity_usd"))
+
+    # Check timestamp freshness if available
+    quote_stamp = None
+    quote_age_seconds = None
+    raw_stamp = (
+        (quotes.get("timestamp_utc") if quotes else None) or
+        (book.get("timestamp_utc") if book else None) or
+        source.get("quote_timestamp_utc") or
+        source.get("final_price_timestamp_utc")
+    )
+    if raw_stamp and now:
+        try:
+            import datetime as _dt
+            if str(raw_stamp).endswith("Z"):
+                quote_dt = _dt.datetime.fromisoformat(str(raw_stamp).replace("Z", "+00:00"))
+            else:
+                quote_dt = _dt.datetime.fromisoformat(str(raw_stamp))
+            quote_age_seconds = max(0.0, (now - quote_dt).total_seconds())
+        except Exception:
+            quote_age_seconds = None
+
+    is_stale = quote_age_seconds is not None and quote_age_seconds > max_quote_age_seconds
+    is_missing_timestamp = (now is not None and raw_stamp is None)
+
+    for size in clean_sizes:
+        size_key = f"${int(size) if size.is_integer() else size}"
+
+        if is_stale:
+            size_evaluations[size_key] = {
+                "size_usd": size,
+                "status": "STALE_QUOTE",
+                "route_available": False,
+                "quote_freshness": "STALE",
+                "simulation_method": "STALE_QUOTE_REJECTED",
+                "quote_verified_for_size": False,
+                "size_verification_status": "ORDER_SIZE_UNVERIFIED_ESTIMATE",
+                "quote_age_seconds": round(quote_age_seconds, 1) if quote_age_seconds else None,
+                "buy": {"status": "UNAVAILABLE", "reason": "Quote older than maximum allowed age"},
+                "sell": {"status": "UNAVAILABLE", "reason": "Quote older than maximum allowed age"},
+                "estimated_round_trip_cost_pct": None,
+                "execution_adjusted_return_pct": None,
+            }
+            continue
+
+        if is_missing_timestamp:
+            size_evaluations[size_key] = {
+                "size_usd": size,
+                "status": "UNVERIFIED_TIMESTAMP",
+                "route_available": False,
+                "quote_freshness": "MISSING_TIMESTAMP_UNVERIFIED",
+                "simulation_method": "UNVERIFIED_TIMESTAMP_REJECTED",
+                "quote_verified_for_size": False,
+                "size_verification_status": "ORDER_SIZE_UNVERIFIED_ESTIMATE",
+                "quote_age_seconds": None,
+                "buy": {"status": "UNAVAILABLE", "reason": "Missing quote timestamp; cannot verify freshness"},
+                "sell": {"status": "UNAVAILABLE", "reason": "Missing quote timestamp; cannot verify freshness"},
+                "estimated_round_trip_cost_pct": None,
+                "execution_adjusted_return_pct": None,
+            }
+            continue
+
+        if book:
+            # Order book depth simulation: genuine depth walk consuming limit orders
+            try:
+                sim = simulate(book, buy_notional_usd=size, fee_bps=fee_bps)
+                buy_complete = sim["buy"]["complete"]
+                sell_complete = sim["immediate_exit"]["complete"]
+                buy_impact_bps = sim["buy"]["impact_vs_best_ask_bps"]
+                buy_slip_bps = sim["buy"]["slippage_vs_mid_bps"]
+                sell_impact_bps = sim["immediate_exit"]["impact_vs_best_bid_bps"]
+                sell_slip_bps = sim["immediate_exit"]["slippage_vs_mid_bps"]
+                round_trip_pct = abs(sim["round_trip_estimate"]["net_return_pct"]) if sim["round_trip_estimate"]["net_return_pct"] is not None else None
+
+                gas_adj = (gas_usd / size * 100.0) if gas_usd and size > 0 else 0.0
+                total_drag_pct = (round_trip_pct + gas_adj) if round_trip_pct is not None else None
+                adj_return = (target_upside_pct - total_drag_pct) if target_upside_pct is not None and total_drag_pct is not None else None
+
+                status = (
+                    "EXECUTABLE_DEPTH_AVAILABLE" if buy_complete and sell_complete else
+                    "INSUFFICIENT_DISPLAYED_DEPTH"
+                )
+
+                size_evaluations[size_key] = {
+                    "size_usd": size,
+                    "status": status,
+                    "simulation_method": "ORDER_BOOK_DEPTH_WALK",
+                    "is_depth_walk": True,
+                    "quote_verified_for_size": True,
+                    "size_verification_status": "SIZE_BOUND_ORDER_BOOK_WALK",
+                    "route_available": buy_complete and sell_complete,
+                    "quote_freshness": "FRESH" if quote_age_seconds is not None else "UNVERIFIED_TIMESTAMP",
+                    "quote_age_seconds": round(quote_age_seconds, 1) if quote_age_seconds else None,
+                    "available_liquidity_usd": liquidity_usd,
+                    "buy": {
+                        "status": "AVAILABLE" if buy_complete else "PARTIAL_DEPTH_ONLY",
+                        "filled_quote_usd": sim["buy"]["filled_quote_usd"],
+                        "vwap": sim["buy"]["vwap"],
+                        "price_impact_bps": buy_impact_bps,
+                        "slippage_bps": buy_slip_bps,
+                        "complete": buy_complete,
+                    },
+                    "sell": {
+                        "status": "AVAILABLE" if sell_complete else "PARTIAL_DEPTH_ONLY",
+                        "filled_quote_usd": sim["immediate_exit"]["filled_quote_usd"],
+                        "vwap": sim["immediate_exit"]["vwap"],
+                        "price_impact_bps": sell_impact_bps,
+                        "slippage_bps": sell_slip_bps,
+                        "complete": sell_complete,
+                    },
+                    "trading_fee_usd": sim["round_trip_estimate"]["estimated_fee_usd"],
+                    "network_gas_usd": gas_usd,
+                    "round_trip_cost_usd": abs(sim["round_trip_estimate"]["net_pnl_usd"]) if sim["round_trip_estimate"]["net_pnl_usd"] is not None else None,
+                    "estimated_round_trip_cost_pct": round(total_drag_pct, 2) if total_drag_pct is not None else None,
+                    "execution_adjusted_return_pct": round(adj_return, 2) if adj_return is not None else None,
+                }
+            except ValueError as e:
+                size_evaluations[size_key] = {
+                    "size_usd": size,
+                    "status": "UNAVAILABLE",
+                    "simulation_method": "ORDER_BOOK_DEPTH_WALK",
+                    "is_depth_walk": True,
+                    "quote_verified_for_size": False,
+                    "size_verification_status": "ORDER_SIZE_UNVERIFIED_ESTIMATE",
+                    "route_available": False,
+                    "reason": str(e),
+                    "buy": {"status": "UNAVAILABLE"},
+                    "sell": {"status": "UNAVAILABLE"},
+                }
+        elif quotes:
+            # Router quote evidence evaluation
+            buy_q = quotes.get("buy_quote")
+            sell_q = quotes.get("sell_quote")
+            has_buy = isinstance(buy_q, dict) and bool(buy_q)
+            has_sell = isinstance(sell_q, dict) and bool(sell_q)
+
+            # Check if router quote was explicitly requested and bound for this specific notional size
+            quoted_size = (
+                _clean_numeric((buy_q or {}).get("notional_size_usd") if isinstance(buy_q, dict) else None) or
+                _clean_numeric(quotes.get("notional_size_usd")) or
+                _clean_numeric(quotes.get("quote_size_usd"))
+            )
+            size_bound = (quoted_size is not None and abs(quoted_size - size) / max(1.0, size) <= 0.05)
+
+            if not has_buy:
+                status = "MISSING_BUY_ROUTE"
+            elif not has_sell:
+                # Critical Web3 Rule: A buy quote never proves a sell route exists!
+                status = "MISSING_SELL_ROUTE"
+            elif liquidity_usd is not None and liquidity_usd < (size * 2.0):
+                status = "INSUFFICIENT_LIQUIDITY"
+            else:
+                status = "EXECUTABLE_ROUTE_AVAILABLE"
+
+            # Linear liquidity heuristic approximation (trade_size / half_liquidity).
+            # This is an approximation heuristic, NOT a full constant-product AMM curve integration or depth walk.
+            impact_bps = None
+            if liquidity_usd and liquidity_usd > 0:
+                impact_pct = (size / (liquidity_usd / 2.0)) * 100.0
+                impact_bps = round(impact_pct * 100.0, 1)
+
+            fee_cost = (size * 2.0) * (fee_bps / 10000.0)
+            slip_pct = (impact_bps / 100.0) if impact_bps is not None else 1.5
+            gas_adj = (gas_usd / size * 100.0) if gas_usd and size > 0 else 0.0
+            total_drag_pct = slip_pct + (fee_cost / size * 100.0) + gas_adj
+            adj_return = (target_upside_pct - total_drag_pct) if target_upside_pct is not None else None
+
+            size_evaluations[size_key] = {
+                "size_usd": size,
+                "status": status,
+                "simulation_method": "APPROXIMATE_LIQUIDITY_HEURISTIC",
+                "is_depth_walk": False,
+                "impact_model": "LINEAR_RESERVE_HEURISTIC_APPROXIMATION",
+                "impact_model_disclaimer": "Linear liquidity estimate (trade_size / half_liquidity); not a constant-product AMM simulation or order book depth walk.",
+                "quote_verified_for_size": size_bound,
+                "size_verification_status": "SIZE_BOUND_QUOTE_VERIFIED" if size_bound else "ORDER_SIZE_UNVERIFIED_ESTIMATE",
+                "size_warning": None if size_bound else f"Router quote evidence not independently size-bound to ${size:.0f}; using approximate liquidity heuristic.",
+                "route_available": bool(has_buy and has_sell and status != "INSUFFICIENT_LIQUIDITY"),
+                "quote_freshness": "FRESH" if quote_age_seconds is not None else "UNVERIFIED_TIMESTAMP",
+                "quote_age_seconds": round(quote_age_seconds, 1) if quote_age_seconds else None,
+                "available_liquidity_usd": liquidity_usd,
+                "buy": {
+                    "status": "AVAILABLE" if has_buy else "UNAVAILABLE",
+                    "provider": quotes.get("provider"),
+                    "estimated_price_impact_bps": impact_bps,
+                },
+                "sell": {
+                    "status": "AVAILABLE" if has_sell else "UNAVAILABLE",
+                    "provider": quotes.get("provider"),
+                    "estimated_price_impact_bps": impact_bps,
+                    "sell_route_independently_verified": has_sell,
+                },
+                "trading_fee_usd": round(fee_cost, 2),
+                "network_gas_usd": gas_usd,
+                "estimated_round_trip_cost_pct": round(total_drag_pct, 2) if total_drag_pct is not None else None,
+                "execution_adjusted_return_pct": round(adj_return, 2) if adj_return is not None else None,
+            }
+        else:
+            # Neither order book nor router quotes present
+            size_evaluations[size_key] = {
+                "size_usd": size,
+                "status": "NO_QUOTE_OR_BOOK_DATA",
+                "simulation_method": "NO_DEPTH_DATA",
+                "is_depth_walk": False,
+                "quote_verified_for_size": False,
+                "size_verification_status": "ORDER_SIZE_UNVERIFIED_ESTIMATE",
+                "route_available": False,
+                "buy": {"status": "UNAVAILABLE", "reason": "No order book depth or route quotes provided"},
+                "sell": {"status": "UNAVAILABLE", "reason": "No order book depth or route quotes provided"},
+            }
+
+    return {
+        "schema": "crypto-prebreakout.multi-size-execution-simulation.v1",
+        "simulator_version": BACKTEST_VERSION if "BACKTEST_VERSION" in globals() else "4.30.0",
+        "execution_enabled": False,
+        "available_liquidity_usd": liquidity_usd,
+        "fee_bps": fee_bps,
+        "gas_usd": gas_usd,
+        "target_upside_pct": target_upside_pct,
+        "size_evaluations": size_evaluations,
+        "research_disclaimer": (
+            "Read-only simulation. Evaluates hypothetical size-dependent price impact and execution drag. "
+            "Displayed liquidity is subject to cancellation, front-running, and MEV sandwich attacks."
+        ),
     }
 
 

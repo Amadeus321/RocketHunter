@@ -552,7 +552,24 @@ def _solana_security(report, summary, retrieved_utc):
             freeze_authority = _present_value(mint, *freeze_keys)
     token_program = _field(token, "tokenProgram", "token_program") or _field(mint, "tokenProgram", "token_program") or _field(report, "tokenProgram", "token_program") or _field(summary, "tokenProgram", "token_program")
     mutable = _field(token_meta, "mutable", "isMutable", "is_mutable")
-    critical = [x for x in risks if _risk_is_critical(x)]
+    # Check Token-2022 extensions
+    token_extensions = _as_dict(_field(report, "tokenExtensions", "token_extensions", "extensions"))
+    has_transfer_fee = bool(_field(token_extensions, "transferFee", "transfer_fee", "fee"))
+    has_permanent_delegate = bool(_field(token_extensions, "permanentDelegate", "permanent_delegate"))
+    has_transfer_hook = bool(_field(token_extensions, "transferHook", "transfer_hook"))
+    has_confidential_transfers = bool(_field(token_extensions, "confidentialTransfers", "confidential_transfers"))
+    default_account_state = str(_field(token_extensions, "defaultAccountState", "default_account_state") or "").lower()
+    is_default_frozen = "frozen" in default_account_state
+
+    extension_risks = []
+    if has_permanent_delegate:
+        extension_risks.append({"name": "PermanentDelegateExtension", "level": "danger", "description": "Token has active permanent delegate able to seize/transfer funds"})
+    if has_transfer_hook:
+        extension_risks.append({"name": "TransferHookExtension", "level": "danger", "description": "Token uses external transfer hook capable of blocking sales"})
+    if is_default_frozen:
+        extension_risks.append({"name": "DefaultFrozenAccountExtension", "level": "danger", "description": "Token accounts frozen by default"})
+
+    critical = [x for x in risks if _risk_is_critical(x)] + extension_risks
     mint_present = ("mintAuthority" in token or "mint_authority" in token or
                     "mintAuthority" in report or "mint_authority" in report or
                     "mintAuthority" in mint or "mint_authority" in mint)
@@ -575,14 +592,23 @@ def _solana_security(report, summary, retrieved_utc):
             "freeze_authority": freeze_authority,
             "freeze_authority_present": freeze_present,
             "token_program": token_program,
+            "token_extensions": {
+                "has_transfer_fee": has_transfer_fee,
+                "has_permanent_delegate": has_permanent_delegate,
+                "has_transfer_hook": has_transfer_hook,
+                "has_confidential_transfers": has_confidential_transfers,
+                "is_default_frozen": is_default_frozen,
+                "token_extensions_verification_method": "RUGCHECK_REPORT_PARSED",
+                "direct_rpc_mint_deserialization": False,
+            },
             "metadata_mutable": mutable,
             "metadata_mutability_present": mutable_present,
             "risks_field_present": risks_present,
-            "risk_count": len(risks),
+            "risk_count": len(risks) + len(extension_risks),
             "critical_risks": critical,
             "risk_names": [
                 str(_field(x, "name", "risk", "description", "title") or "UNNAMED_RISK")
-                for x in risks if isinstance(x, dict)
+                for x in (risks + extension_risks) if isinstance(x, dict)
             ],
         },
     }
@@ -763,7 +789,22 @@ def _evm_pool_identity(row, timeout=8):
 def _evm_lp_lock_share(pool, chain, timeout=8):
     total, total_log = _eth_call(pool, "0x18160ddd", chain, timeout)
     if total is None or total <= 0:
-        return {"status": "UNVERIFIED", "reason": "Pool did not expose a standard ERC-20 LP totalSupply()"}
+        # Check if the pool is a concentrated-liquidity pool (e.g. Uniswap V3 slot0() selector: 0x3850c7bd)
+        slot0_val, _ = _eth_call(pool, "0x3850c7bd", chain, timeout)
+        if slot0_val is not None:
+            return {
+                "status": "UNVERIFIED",
+                "lp_model": "CONCENTRATED_LIQUIDITY_NFT",
+                "is_concentrated_liquidity": True,
+                "nft_position_ownership_audited": False,
+                "reason": "Uniswap V3 / concentrated liquidity pool detected; liquidity positions are non-fungible ERC-721 NFTs. Conventional ERC-20 LP token burn check is not applicable. Full NFT position manager ownership/lock tracing is not implemented; UNKNOWN must remain UNVERIFIED.",
+            }
+        return {
+            "status": "UNVERIFIED",
+            "lp_model": "UNKNOWN_POOL_MODEL",
+            "is_concentrated_liquidity": False,
+            "reason": "Pool did not expose a standard ERC-20 LP totalSupply(). UNKNOWN cannot become PASS.",
+        }
     dead_address_balance = 0
     burn_balances = []
     for address in EVM_BURN_ADDRESSES:

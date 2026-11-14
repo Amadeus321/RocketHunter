@@ -20,6 +20,8 @@ from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Any, Iterable
 
+from scripts.address_identity import validate_and_build_identity
+
 PIPELINE_VERSION = "4.18.1"
 CORE_RUNTIME_VERSION = "4.15.3"
 EARLY_BREAKOUT_SIGNAL_VERSION = "v4.25-early-breakout.v1"
@@ -119,8 +121,12 @@ def _canonical_address(chain: str, address: Any) -> str:
     return value
 
 
-def market_key(row: dict[str, Any]) -> str | None:
-    """Version-2 stable DEX identity: chain + token/mint + pool/pair."""
+def legacy_pipe_market_key(row: dict[str, Any]) -> str | None:
+    """Explicitly labelled legacy v4.18 pipe-separated market key.
+
+    Preserved only for backward-compatibility with historical pre-v4.30 memory partitions.
+    Never compare silently with canonical colon-separated identities.
+    """
     market_type = str(row.get("market_type") or row.get("type") or "unknown").strip().lower()
     is_dex = is_dex_pool(row) or market_type in {"dex_token", "dex_pool"}
     if is_dex:
@@ -137,23 +143,19 @@ def market_key(row: dict[str, Any]) -> str | None:
         if not chain or not contract or not pool:
             return None
         return f"dex|{chain}|token:{contract}|pool:{pool}"
+    return None
 
-    # Preserve the prior CEX/catalogue behavior.
-    identity = str(row.get("identity") or "").strip().lower()
-    provider_or_venue = str(row.get("venue") or (
-        row.get("source") if market_type in {"cex_spot", "cex_perp", "spot", "perpetual"} else ""
-    ) or "").strip().lower()
-    quote = str(row.get("quote_symbol") or "").strip().lower()
-    if identity and (row.get("contract_address") or row.get("address") or provider_or_venue):
-        return "|".join((identity, "", provider_or_venue, quote))
-    chain = str(row.get("chain") or "").strip().lower()
-    contract = str(row.get("contract_address") or row.get("address") or "").strip().lower()
-    if chain and contract:
-        return "|".join((chain, contract, "", provider_or_venue, quote, market_type))
-    catalogue_id = str(row.get("id") or "").strip().lower()
-    source = str(row.get("source") or "").strip().lower()
-    if catalogue_id and source:
-        return f"catalogue|{source}|{catalogue_id}"
+
+def market_key(row: dict[str, Any]) -> str | None:
+    """Canonical market identity builder delegating to shared address_identity module.
+
+    Emits single canonical format across RocketHunter:
+    - DEX: dex:<chain>:<token>:<pool>
+    - CEX: cex:<exchange>:<market_type>:<trading_pair>
+    """
+    res = validate_and_build_identity(row)
+    if res.get("is_valid"):
+        return res.get("canonical_identity")
     return None
 
 def add_flag(row: dict[str, Any], flag: str) -> None:
@@ -589,6 +591,49 @@ def process_snapshot(main_path: Path, forward_path: Path | None, outdir: Path, m
     seen_ids = {r.get("forecast_id") for r in existing_current}
     append = [r for r in forecasts if r["forecast_id"] not in seen_ids]
     append_jsonl_gz(forecast_path, append)
+
+    prospective_diagnostics: dict[str, Any] = {
+        "status": "NOT_EXECUTED",
+        "snapshots_created": 0,
+        "snapshots_appended": 0,
+        "duplicate_count": 0,
+        "error": None,
+    }
+    try:
+        try:
+            from scripts.prospective_opportunity_dataset import ProspectiveOpportunityDataset
+        except ImportError:
+            from prospective_opportunity_dataset import ProspectiveOpportunityDataset
+
+        prospective_snapshots = [
+            ProspectiveOpportunityDataset.create_snapshot(
+                candidate=v,
+                run_id=str(run_id),
+                scanner_version=str(provenance.get("scanner_version") or PIPELINE_VERSION),
+                configuration_fingerprint=str(provenance.get("configuration_fingerprint") or "default"),
+                qualification_status=str(v.get("opportunity_status") or v.get("entry_decision") or "DISCOVERY_LEAD"),
+                rejection_reasons=v.get("qualification_blockers") or v.get("actionable_blockers") or [],
+                snapshot_time=snapshot,
+            )
+            for k, v in sorted(rows.items())
+        ]
+        prospective_diagnostics["snapshots_created"] = len(prospective_snapshots)
+        append_details: dict[str, Any] = {}
+        partition_path = ProspectiveOpportunityDataset.append_snapshots(
+            memory_dir,
+            prospective_snapshots,
+            partition_date=f"{snapshot:%Y%m%d}",
+            details_out=append_details,
+        )
+        prospective_diagnostics["snapshots_appended"] = append_details.get("appended_count", len(prospective_snapshots))
+        prospective_diagnostics["duplicate_count"] = append_details.get("duplicate_count", 0)
+        prospective_diagnostics["partition_path"] = str(partition_path)
+        prospective_diagnostics["status"] = "SUCCESS"
+    except Exception as exc:
+        prospective_diagnostics["status"] = "FAILED"
+        prospective_diagnostics["error"] = f"{type(exc).__name__}: {exc}"
+        sys.stderr.write(f"[WARNING] Prospective opportunity snapshot capture or persistence failed: {type(exc).__name__}: {exc}\n")
+
     grading = grade_outcomes(memory_dir, snapshot, rows, run_id)
 
     summary = {
@@ -600,6 +645,7 @@ def process_snapshot(main_path: Path, forward_path: Path | None, outdir: Path, m
         "retained_report_rows_deduplicated": len(rows),
         "reported_source_unique_asset_rows": (main.get("coverage") or {}).get("unique_asset_rows"),
         "forecast_snapshots_new": len(append),
+        "prospective_dataset": prospective_diagnostics,
         "return_window_counts": {
             status: sum(1 for row in rows.values() if row.get("return_window_status") == status)
             for status in ("INSUFFICIENT_24H_HISTORY", "UNKNOWN_POOL_AGE_NOT_COMPARABLE", "SOURCE_REPORTED_24H_POOL_AGE_GE_24H", "EXCHANGE_OR_AGGREGATOR_24H_FIELD")

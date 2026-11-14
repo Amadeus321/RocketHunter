@@ -60,7 +60,7 @@ def num(value):
 def get_json(url, timeout=10):
     req = urllib.request.Request(url, headers={
         "Accept": "application/json;version=20230203",
-        "User-Agent": "crypto-prebreakout-forward-24h/4.29.0 (read-only research)"
+        "User-Agent": "crypto-prebreakout-forward-24h/4.30.0 (read-only research)"
     })
     with urllib.request.urlopen(req, timeout=timeout) as response:
         return json.loads(response.read().decode("utf-8")), utc_now()

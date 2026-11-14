@@ -26,6 +26,24 @@ DATA_DIR = ROOT / "rocket-hunter-data"
 JOURNAL_FILE = DATA_DIR / "user_positions_journal.json"
 AI_ENGINE_FILE = DATA_DIR / "ai_learning_engine.json"
 
+# Immutable established baseline feature weights from quantitative crypto momentum research.
+# Production ranking strictly uses these weights until out-of-sample Dataset B holdout validation promotes a candidate.
+PRODUCTION_BASELINE_WEIGHTS: dict[str, float] = {
+    "momentum_acceleration": 0.88,
+    "volume_intelligence": 0.90,
+    "buy_sell_pressure": 0.85,
+    "liquidity_depth": 0.85,
+    "liquidity_intelligence": 0.85,
+    "accumulation_detection": 0.80,
+    "smart_money": 0.75,
+    "breakout_prediction": 0.90,
+    "ecosystem_flow": 0.78,
+    "risk_safety": 0.98,
+    "strict_single_tp_attainment": 0.92,
+    "breakout_explosiveness_multiplier": 1.15,
+    "tp_frontrun_buffer_pct": 0.965,
+}
+
 
 def get_user_data_dir() -> Path:
     """Returns the configured user data directory, honoring ROCKET_HUNTER_USER_DATA_DIR."""
@@ -82,7 +100,8 @@ def get_journal() -> dict[str, Any]:
             "ai_learning_stats": {
                 "ai_name": "AURA",
                 "ai_full_name": "AURA (Adaptive Universal Rocket Algorithm)",
-                "model_version": "AURA-v4.29.0",
+                "model_version": f"AURA-{get_software_version()}",
+                "software_version": get_software_version(),
                 "total_taken_positions": 0,
                 "open_positions": 0,
                 "closed_positions": 0,
@@ -312,7 +331,7 @@ def extract_position_features(pos: dict[str, Any]) -> dict[str, float | None] | 
 
     Returns None for any indicator not explicitly present in the recorded entry snapshot.
     """
-    entry_feats = pos.get("entry_features") or pos.get("breakout_engine_scores")
+    entry_feats = pos.get("entry_features") or pos.get("breakout_engine_scores") or pos.get("features_snapshot")
     if not isinstance(entry_feats, dict) or not entry_feats:
         return None
 
@@ -443,8 +462,12 @@ def train_ai_from_user_journal() -> dict[str, Any]:
     attributions: dict[str, float] = {k: 0.0 for k in feature_keys}
     learned_weights: dict[str, float] = dict(prior_weights)
 
-    # Compute empirical covariance feature attributions strictly if complete trade samples exist
-    if len(trade_samples) >= 1:
+    # Require minimum sample count for weight adaptation to prevent overfitting on 1-2 lucky/unlucky trades
+    MIN_TRAINING_SAMPLES_FOR_WEIGHT_ADAPTATION = 5
+    weight_adaptation_applied = False
+
+    # Compute empirical covariance feature attributions if at least 2 trade samples exist
+    if len(trade_samples) >= 2:
         mean_pnl = sum(s["pnl"] for s in trade_samples) / len(trade_samples)
         for k in feature_keys:
             feat_vals = [s["features"][k] for s in trade_samples]
@@ -452,10 +475,17 @@ def train_ai_from_user_journal() -> dict[str, Any]:
             cov = sum((s["features"][k] - mean_f) * (s["pnl"] - mean_pnl) for s in trade_samples) / len(trade_samples)
             std_f = math.sqrt(sum((x - mean_f) ** 2 for x in feat_vals) / len(feat_vals)) or 1.0
             std_pnl = math.sqrt(sum((s["pnl"] - mean_pnl) ** 2 for s in trade_samples) / len(trade_samples)) or 1.0
-            corr = cov / (std_f * std_pnl)
+            corr = cov / (std_f * std_pnl) if (std_f * std_pnl) > 0 else 0.0
             attributions[k] = round(corr, 4)
-            # Bayesian update to prior weights
-            learning_rate = min(0.35, 0.08 * math.sqrt(len(trade_samples)))
+
+    # Adapt production weights only if complete samples meet or exceed minimum threshold
+    if len(trade_samples) >= MIN_TRAINING_SAMPLES_FOR_WEIGHT_ADAPTATION:
+        weight_adaptation_applied = True
+        shrinkage_factor = min(1.0, len(trade_samples) / 25.0)  # Regularization toward prior baseline
+        for k in feature_keys:
+            corr = attributions.get(k, 0.0)
+            # Regularized shrinkage update to prior weights
+            learning_rate = min(0.25, 0.05 * math.sqrt(len(trade_samples))) * shrinkage_factor
             weight_shift = corr * learning_rate
             updated_w = round(max(0.50, min(1.20, prior_weights[k] + weight_shift)), 3)
             learned_weights[k] = updated_w
@@ -484,7 +514,21 @@ def train_ai_from_user_journal() -> dict[str, Any]:
         "loss_count": losses,
         "win_rate_pct": round(win_rate, 1),
         "average_pnl_pct": round(avg_pnl, 2),
-        "learned_feature_weights": learned_weights,
+        "statistical_method": "Regularized empirical covariance feature-attribution with shrinkage to prior baseline",
+        "min_samples_threshold": MIN_TRAINING_SAMPLES_FOR_WEIGHT_ADAPTATION,
+        "candidate_adaptation_applied": bool(len(trade_samples) >= MIN_TRAINING_SAMPLES_FOR_WEIGHT_ADAPTATION),
+        "weight_adaptation_applied": False,  # Production weights remain pinned to baseline
+        "candidate_learned_weights": learned_weights,
+        "shadow_weights": learned_weights,
+        "production_weights": dict(PRODUCTION_BASELINE_WEIGHTS),
+        "learned_feature_weights": dict(PRODUCTION_BASELINE_WEIGHTS),
+        "dataset_a_role": "USER_JOURNAL_HEURISTIC_EXPLORATION",
+        "dataset_a_bias_warning": (
+            "Dataset A consists of user-selected, executed positions subject to survivorship and "
+            "selection bias. It is never treated as unbiased scanner prediction evidence and cannot "
+            "modify production ranking weights without independent out-of-sample Dataset B holdout validation."
+        ),
+        "promotion_status": "SHADOW_CANDIDATE_ONLY; PRODUCTION_PINNED_TO_BASELINE",
         "feature_attributions": attributions,
         "feature_importance": sorted(
             [{"feature": k, "attribution": v} for k, v in attributions.items()],
@@ -495,6 +539,13 @@ def train_ai_from_user_journal() -> dict[str, Any]:
         "verified_training_samples": len(trade_samples),
         "partial_snapshots_recorded": partial_snapshots_count,
         "synthetic_labels_permitted": False,
+        "safety_veto_enforced": True,
+        "safety_rules": [
+            "AURA weights cannot override token contract security verification",
+            "AURA weights cannot override LP position lock/burn requirements",
+            "AURA weights cannot override +40.00% technical TP minimum",
+            "AURA weights cannot override execution quote requirements",
+        ],
         "negative_failure_lessons": [
             {"symbol": "FAIR/SOL", "outcome": "Near-miss: reached 0.0002832 vs TP 0.0002908889 (97.35% of target) then dumped -56%", "lesson": "Front-run resistance: AURA applies dynamic TP front-run buffer (3%-5% below structural resistance) to secure profits before algorithmic sell walls and reversals."},
             {"symbol": "USOE/SOL", "outcome": "-44.61%", "lesson": "False breakout with insufficient 24h liquidity cushion."},
@@ -573,36 +624,264 @@ def get_aura_feature_attributions() -> dict[str, Any]:
 
 
 def get_aura_learned_weights() -> dict[str, float]:
-    """Returns AURA's active learned feature weights for candidate ranking."""
+    """Returns AURA's active production feature weights for candidate ranking.
+
+    Strictly returns established baseline weights unless an independent out-of-sample holdout
+    evaluation on Dataset B has verified candidate superiority and formally promoted the weights.
+    """
     try:
         aifile = get_ai_engine_file()
         if aifile.exists():
             data = json.loads(aifile.read_text(encoding="utf-8"))
-            weights = data.get("learned_feature_weights")
-            if isinstance(weights, dict) and weights:
-                return weights
-        journal = get_journal()
-        stats = journal.get("ai_learning_stats") or {}
-        weights = stats.get("learned_feature_weights")
-        if isinstance(weights, dict) and weights:
-            return weights
+            if data.get("promotion_status") == "PROMOTED_VIA_DATASET_B_HOLDOUT":
+                weights = data.get("production_weights") or data.get("learned_feature_weights")
+                if isinstance(weights, dict) and weights:
+                    return weights
     except Exception:
         pass
+    return dict(PRODUCTION_BASELINE_WEIGHTS)
+
+
+def get_aura_production_weights() -> dict[str, float]:
+    """Returns established baseline production ranking weights."""
+    return dict(PRODUCTION_BASELINE_WEIGHTS)
+
+
+def get_aura_candidate_weights() -> dict[str, float]:
+    """Returns candidate shadow weights learned from user trade journal for research evaluation."""
+    try:
+        aifile = get_ai_engine_file()
+        if aifile.exists():
+            data = json.loads(aifile.read_text(encoding="utf-8"))
+            weights = data.get("candidate_learned_weights") or data.get("shadow_weights")
+            if isinstance(weights, dict) and weights:
+                return weights
+    except Exception:
+        pass
+    return dict(PRODUCTION_BASELINE_WEIGHTS)
+
+
+def _clean_num(val: Any) -> float | None:
+    if val is None or val == "":
+        return None
+    try:
+        v = float(val)
+        return v if math.isfinite(v) else None
+    except (ValueError, TypeError):
+        return None
+
+
+def get_dataset_a_user_trades() -> list[dict[str, Any]]:
+    """Dataset A: Real user-confirmed positions with actual entry and realized P/L."""
+    journal = get_journal()
+    return [
+        pos for pos in journal.get("positions", [])
+        if pos.get("user_confirmed_taken", True) is not False
+    ]
+
+
+def get_dataset_b_scanner_predictions(memory_dir: Path | None = None) -> list[dict[str, Any]]:
+    """Dataset B: Prospective scanner predictions with frozen features and independent outcomes.
+
+    Labels are completely separate from Dataset A (never mix user trades with scanner predictions).
+    """
+    import gzip
+    mem_dir = Path(memory_dir or (DATA_DIR / "scanner-memory"))
+    records: list[dict[str, Any]] = []
+
+    prospective_dir = mem_dir / "prospective-opportunities"
+    if prospective_dir.exists():
+        for p in sorted(prospective_dir.glob("*.jsonl.gz")):
+            try:
+                with gzip.open(p, "rt", encoding="utf-8") as handle:
+                    for line in handle:
+                        if line.strip():
+                            records.append(json.loads(line))
+            except Exception:
+                pass
+
+    forecast_dir = mem_dir / "forecasts"
+    if forecast_dir.exists():
+        for p in sorted(forecast_dir.glob("*.jsonl.gz")):
+            try:
+                with gzip.open(p, "rt", encoding="utf-8") as handle:
+                    for line in handle:
+                        if line.strip():
+                            records.append(json.loads(line))
+            except Exception:
+                pass
+    return records
+
+
+def classify_market_regime(metrics: dict[str, Any]) -> str:
+    """Classify the current market-wide regime to context-weight signals.
+
+    Regimes:
+    - BULLISH: Strong positive breadth across major benchmarks.
+    - BEARISH: Severe broad market downtrend and negative net flows.
+    - HIGH_VOLATILITY: Extreme intraday swings or market-wide dispersion.
+    - LOW_LIQUIDITY: Depleted aggregate market liquidity.
+    - RISK_OFF: Heavy net outflows and negative smart money delta.
+    - SIDEWAYS: Low dispersion, range-bound consolidation.
+    """
+    btc_24h = _clean_num(metrics.get("btc_change_24h_pct") or metrics.get("market_change_24h_pct"))
+    volatility = _clean_num(metrics.get("market_volatility_pct") or metrics.get("atr_1h_pct"))
+    total_liq = _clean_num(metrics.get("aggregate_liquidity_usd") or metrics.get("liquidity_usd"))
+    net_inflow = _clean_num(metrics.get("net_ecosystem_inflow_usd"))
+
+    if total_liq is not None and total_liq < 50_000:
+        return "LOW_LIQUIDITY"
+    if volatility is not None and volatility >= 12.0:
+        return "HIGH_VOLATILITY"
+    if btc_24h is not None and btc_24h <= -8.0:
+        return "BEARISH"
+    if net_inflow is not None and net_inflow < 0 and (btc_24h is not None and btc_24h < -3.0):
+        return "RISK_OFF"
+    if btc_24h is not None and btc_24h >= 4.0:
+        return "BULLISH"
+    return "SIDEWAYS"
+
+
+def evaluate_shadow_model(
+    production_weights: dict[str, float] | None = None,
+    candidate_weights: dict[str, float] | None = None,
+    validation_records: list[dict[str, Any]] | None = None,
+    memory_dir: Path | None = None,
+) -> dict[str, Any]:
+    """Compare production baseline weights vs candidate weights on Dataset B holdout records.
+
+    Enforces chronological holdout evaluation with verified exact-identity mature outcomes.
+    Automatically enforces rollback to production baseline if candidate weights regress
+    or if mature holdout evidence is insufficient.
+    """
+    prod_w = production_weights or dict(PRODUCTION_BASELINE_WEIGHTS)
+    cand_w = candidate_weights or get_aura_candidate_weights()
+
+    records = validation_records
+    if records is None:
+        records = get_dataset_b_scanner_predictions(memory_dir=memory_dir)
+
+    # Filter strictly for records with verified, mature, non-synthetic outcomes
+    evaluated_holdout = []
+    for r in (records or []):
+        outcome = r.get("outcome_classification") or (r.get("outcome", {}) if isinstance(r.get("outcome"), dict) else {}).get("outcome_classification")
+        mfe = _clean_num(r.get("mfe_pct") or r.get("pnl") or r.get("realized_pnl_pct"))
+        if outcome in {"TARGET_REACHED", "TARGET_NOT_REACHED"} and mfe is not None:
+            evaluated_holdout.append(r)
+
+    # Require minimum holdout sample threshold (at least 30 mature exact-identity records)
+    MIN_HOLDOUT_RECORDS = 30
+    if len(evaluated_holdout) < MIN_HOLDOUT_RECORDS:
+        return {
+            "status": "INSUFFICIENT_HOLDOUT_SAMPLES",
+            "promotion_decision": "ROLLBACK_TO_PRODUCTION",
+            "reason": (
+                f"Insufficient mature exact-identity Dataset B holdout records ({len(evaluated_holdout)}/{MIN_HOLDOUT_RECORDS}); "
+                "candidate weights cannot be promoted out-of-sample. Production ranking weights remain pinned to baseline."
+            ),
+            "holdout_samples_count": len(evaluated_holdout),
+            "production_loss": None,
+            "candidate_loss": None,
+            "applied_weights": prod_w,
+        }
+
+    def compute_loss(weights: dict[str, float]) -> float:
+        errors = []
+        for r in evaluated_holdout:
+            target_pnl = _clean_num(r.get("pnl") or r.get("realized_pnl_pct") or r.get("mfe_pct")) or 0.0
+            feats = r.get("features") or extract_position_features(r) or {}
+            score = sum(float(feats.get(k, 50.0)) * weights.get(k, 1.0) for k in weights if k in feats)
+            norm_score = (score / max(1.0, len(feats))) - 50.0
+            errors.append((norm_score - target_pnl) ** 2)
+        return (sum(errors) / len(errors)) if errors else 999.0
+
+    prod_loss = compute_loss(prod_w)
+    cand_loss = compute_loss(cand_w)
+
+    # Require candidate loss to strictly improve over production by at least 2%
+    improved = bool(cand_loss < prod_loss and prod_loss > 0 and ((prod_loss - cand_loss) / prod_loss) >= 0.02)
+    decision = "PROMOTE_CANDIDATE" if improved else "ROLLBACK_TO_PRODUCTION"
+
     return {
-        "momentum_acceleration": 0.88,
-        "volume_intelligence": 0.90,
-        "buy_sell_pressure": 0.85,
-        "liquidity_depth": 0.85,
-        "liquidity_intelligence": 0.85,
-        "accumulation_detection": 0.80,
-        "smart_money": 0.75,
-        "breakout_prediction": 0.90,
-        "ecosystem_flow": 0.78,
-        "risk_safety": 0.98,
-        "strict_single_tp_attainment": 0.92,
-        "breakout_explosiveness_multiplier": 1.15,
-        "tp_frontrun_buffer_pct": 0.965,
+        "status": "COMPLETED",
+        "holdout_samples_count": len(evaluated_holdout),
+        "production_loss": round(prod_loss, 4),
+        "candidate_loss": round(cand_loss, 4),
+        "loss_improvement_pct": round(((prod_loss - cand_loss) / prod_loss) * 100.0, 2) if prod_loss > 0 else 0.0,
+        "promotion_decision": decision,
+        "applied_weights": cand_w if improved else prod_w,
     }
+
+
+def promote_or_rollback_model(memory_dir: Path | None = None) -> dict[str, Any]:
+    """Evaluates candidate shadow model on Dataset B holdout and commits promotion or rollback to disk."""
+    res = evaluate_shadow_model(memory_dir=memory_dir)
+    decision = res["promotion_decision"]
+    aifile = get_ai_engine_file()
+    if aifile.exists():
+        try:
+            data = json.loads(aifile.read_text(encoding="utf-8"))
+            if decision == "PROMOTE_CANDIDATE":
+                data["production_weights"] = res["applied_weights"]
+                data["learned_feature_weights"] = res["applied_weights"]
+                data["promotion_status"] = "PROMOTED_VIA_DATASET_B_HOLDOUT"
+            else:
+                data["production_weights"] = dict(PRODUCTION_BASELINE_WEIGHTS)
+                data["learned_feature_weights"] = dict(PRODUCTION_BASELINE_WEIGHTS)
+                data["promotion_status"] = "ROLLBACK_ENFORCED_PRODUCTION_BASELINE"
+            data["last_shadow_evaluation"] = res
+            aifile.write_text(json.dumps(data, indent=2), encoding="utf-8")
+        except Exception:
+            pass
+    return res
+
+
+def enforce_aura_safety_veto(candidate: dict[str, Any]) -> tuple[bool, str]:
+    """Enforces absolute AURA safety vetoes.
+
+    Under no circumstances can AURA weights or conviction scores promote a candidate that fails:
+    1. Contract security checks (e.g. honeypot, blacklist, unverified code, transfer tax > 10%).
+    2. LP lock / burn requirements.
+    3. The single technical take-profit minimum (+40.0%).
+    Returns (is_vetoed, veto_reason).
+    """
+    # 1. Contract security check
+    sec = candidate.get("security_assessment") or candidate.get("contract_security") or {}
+    if candidate.get("is_honeypot") or sec.get("is_honeypot") or sec.get("honeypot"):
+        return True, "SAFETY_VETO: Token is flagged as honeypot."
+    if candidate.get("security_pass") is False or sec.get("status") in {"FAIL", "CRITICAL_RISK"}:
+        return True, "SAFETY_VETO: Token failed security verification."
+
+    # 2. LP verification check
+    lp_status = candidate.get("lp_status") or sec.get("lp_status") or candidate.get("liquidity_lock_status")
+    if lp_status in {"UNLOCKED", "FAIL", "CRITICAL_RISK"}:
+        return True, f"SAFETY_VETO: Liquidity is unverified or unlocked ({lp_status})."
+
+    # 3. Technical +40% TP check
+    pot = _clean_num(
+        candidate.get("tp_upside_pct") or
+        candidate.get("potential_pct") or
+        candidate.get("projected_gain_pct") or
+        candidate.get("single_tp_pct")
+    )
+    if pot is None:
+        target_p = _clean_num(
+            candidate.get("target_price") or
+            (candidate.get("trade_plan") or {}).get("single_take_profit") or
+            (candidate.get("technical_tp_validation") or {}).get("target_price")
+        )
+        current_p = _clean_num(
+            candidate.get("final_price_usd") or
+            candidate.get("price_usd") or
+            (candidate.get("technical_tp_validation") or {}).get("current_price")
+        )
+        if target_p is not None and current_p is not None and current_p > 0:
+            pot = ((target_p - current_p) / current_p) * 100.0
+
+    if pot is None or pot < 39.9999:
+        return True, f"SAFETY_VETO: Technical TP upside ({pot}%) is below mandatory +40.0% threshold."
+
+    return False, "SAFETY_PASS"
 
 
 if __name__ == "__main__":

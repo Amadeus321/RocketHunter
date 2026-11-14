@@ -194,8 +194,9 @@ class TestUserTradeLearning(unittest.TestCase):
         self.assertEqual(rebuild["status"], "OK")
 
         prov = utl.get_aura_provenance()
-        self.assertTrue(prov["aura_version"].startswith("AURA-v4.29.0"))
-        self.assertEqual(prov["software_version"], "v4.29.0")
+        sw_ver = utl.get_software_version()
+        self.assertTrue(prov["aura_version"].startswith(f"AURA-{sw_ver}"))
+        self.assertEqual(prov["software_version"], sw_ver)
         self.assertNotEqual(prov["model_sha256"], "UNAVAILABLE")
 
 

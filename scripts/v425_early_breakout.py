@@ -21,7 +21,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
-VERSION = "4.29.0"
+VERSION = "4.30.0"
 EARLY_BREAKOUT_SIGNAL_VERSION = "v4.25-early-breakout.v1"
 EARLY_BREAKOUT_MODEL_ID = "v4.25-early-breakout"
 API_ROOT = "https://api.dexpaprika.com"
@@ -213,6 +213,50 @@ def _reserve_request(memory: Path, family: str) -> tuple[bool, int]:
         return True, len(ledger["requests"])
 
 
+def _get_shared_cooldown(shared_dir: Path) -> float:
+    """Return remaining cooldown seconds if an active provider backoff is in effect across processes."""
+    cooldown_path = shared_dir / ".dexpaprika-cooldown.json"
+    if not cooldown_path.exists():
+        return 0.0
+    try:
+        from scripts.file_lock import locked_file
+    except ImportError:
+        from file_lock import locked_file
+    try:
+        with locked_file(cooldown_path.with_suffix(".lock")):
+            data = json.loads(cooldown_path.read_text(encoding="utf-8"))
+            until = float(data.get("cooldown_until_epoch", 0.0))
+            now = time.time()
+            remaining = max(0.0, until - now)
+            return remaining
+    except Exception:
+        return 0.0
+
+
+def _set_shared_cooldown(shared_dir: Path, retry_seconds: float) -> float:
+    """Record persistent shared provider cooldown across query families and concurrent scanner processes."""
+    cooldown_path = shared_dir / ".dexpaprika-cooldown.json"
+    shared_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        from scripts.file_lock import locked_file
+    except ImportError:
+        from file_lock import locked_file
+    enforced_seconds = max(15.0, float(retry_seconds))
+    now = time.time()
+    cooldown_until = now + enforced_seconds
+    data = {
+        "cooldown_until_epoch": cooldown_until,
+        "cooldown_until_utc": datetime.fromtimestamp(cooldown_until, tz=timezone.utc).isoformat(),
+        "cooldown_duration_seconds": enforced_seconds,
+        "triggered_at_utc": datetime.fromtimestamp(now, tz=timezone.utc).isoformat(),
+    }
+    with locked_file(cooldown_path.with_suffix(".lock")):
+        temp = cooldown_path.with_suffix(".tmp")
+        temp.write_text(json.dumps(data, indent=2), encoding="utf-8")
+        temp.replace(cooldown_path)
+    return enforced_seconds
+
+
 def _store_quota_headers(memory: Path, headers: dict[str, str]) -> None:
     remaining = _num(headers.get("x-credits-remaining"))
     if remaining is None:
@@ -245,6 +289,14 @@ class DexPaprikaClient:
 
     def get(self, path: str, params: dict[str, Any] | None = None,
             family: str = "unspecified") -> tuple[Any, dict[str, str], str | None]:
+        shared = Path(os.environ.get("ROCKET_HUNTER_SHARED_MEMORY_DIR") or self.memory).resolve()
+        remaining_cooldown = _get_shared_cooldown(shared)
+        if remaining_cooldown > 0.0:
+            return None, {}, (
+                f"HTTP 429 provider cooldown active across processes "
+                f"({remaining_cooldown:.1f}s remaining after previous rate limit)"
+            )
+
         allowed, reserved = _reserve_request(self.memory, family)
         if not allowed:
             return None, {}, "scanner rolling request ceiling reached (%s/%s)" % (
@@ -253,7 +305,6 @@ class DexPaprikaClient:
             from scripts.file_lock import shared_rate_limit
         except ImportError:
             from file_lock import shared_rate_limit
-        shared = Path(os.environ.get("ROCKET_HUNTER_SHARED_MEMORY_DIR") or self.memory).resolve()
         shared_rate_limit(shared / ".dexpaprika-request-rate.json", self.interval)
         wait = self.interval - (time.monotonic() - self.last_request)
         if self.last_request and wait > 0:
@@ -280,6 +331,19 @@ class DexPaprikaClient:
                 detail = ""
             headers = {str(k).lower(): str(v) for k, v in exc.headers.items()} if exc.headers else {}
             _store_quota_headers(self.memory, headers)
+            if exc.code == 429:
+                retry_after_raw = headers.get("retry-after")
+                # Do not interpret Retry-After: 0 as unrestricted permission to immediately repeat
+                try:
+                    retry_seconds = float(retry_after_raw.strip()) if retry_after_raw else 30.0
+                    if retry_seconds <= 0.0:
+                        retry_seconds = 15.0  # Enforce minimum 15s backoff
+                    else:
+                        retry_seconds = max(15.0, retry_seconds)
+                except (ValueError, TypeError):
+                    retry_seconds = 30.0
+                _set_shared_cooldown(shared, retry_seconds)
+                return None, headers, "HTTP 429 Rate limited (Retry-After: %ss backoff enforced across processes): %s" % (retry_seconds, detail)
             return None, headers, "HTTP %s %s" % (exc.code, detail)
         except Exception as exc:
             return None, {}, "%s: %s" % (type(exc).__name__, exc)
@@ -508,8 +572,16 @@ def score_candidate(row: dict[str, Any]) -> dict[str, Any]:
         tier = "EARLY_DISCOVERY_OR_WEAK_SIGNAL"
 
     # Evaluate 9 independent signal engines and 24h expected return model
+    signal_engine_executed = False
+    expected_return_engine_executed = False
+    engine_failure_module = None
+    engine_exception_category = None
+    engine_failure_diagnostic = None
+    engine_result_status = "SUCCESS"
+    expected_return_status = "SUCCESS"
     engines_res = {}
     expected_res = {}
+
     try:
         try:
             from scripts.breakout_signal_engines import BreakoutSignalEngines
@@ -517,11 +589,62 @@ def score_candidate(row: dict[str, Any]) -> dict[str, Any]:
         except ImportError:
             from breakout_signal_engines import BreakoutSignalEngines
             from expected_return_engine import ExpectedReturnEngine
+    except Exception as exc:
+        engine_failure_module = "import"
+        engine_exception_category = type(exc).__name__
+        engine_failure_diagnostic = f"Engine module import failed: {type(exc).__name__}"
+        engine_result_status = "SOFTWARE_FAILURE"
+        expected_return_status = "SOFTWARE_FAILURE"
 
-        engines_res = BreakoutSignalEngines.evaluate_all_engines(row)
-        expected_res = ExpectedReturnEngine.estimate_outcomes(row, engines_res)
-    except Exception:
-        pass
+    if engine_failure_module is None:
+        try:
+            engines_res = BreakoutSignalEngines.evaluate_all_engines(row)
+            signal_engine_executed = True
+            if engines_res.get("breakout_evidence_eligible"):
+                engine_result_status = "SUCCESS"
+            else:
+                engine_result_status = "DATA_UNAVAILABLE"
+        except Exception as exc:
+            signal_engine_executed = False
+            engine_failure_module = "breakout_signal_engines"
+            engine_exception_category = type(exc).__name__
+            engine_failure_diagnostic = f"BreakoutSignalEngines failed: {type(exc).__name__}"
+            engine_result_status = "SOFTWARE_FAILURE"
+            engines_res = {
+                "breakout_confluence_score": None,
+                "engine_scores": {},
+                "acceleration_signals": {},
+                "engine_evidence_status": {},
+                "evidence_coverage_pct": 0.0,
+                "breakout_evidence_eligible": False,
+                "evidence_status": "SOFTWARE_FAILURE",
+            }
+
+        try:
+            expected_res = ExpectedReturnEngine.estimate_outcomes(row, engines_res)
+            expected_return_engine_executed = True
+            expected_return_status = expected_res.get("forecast_status", "SUCCESS")
+        except Exception as exc:
+            expected_return_engine_executed = False
+            if engine_failure_module is None:
+                engine_failure_module = "expected_return_engine"
+                engine_exception_category = type(exc).__name__
+                engine_failure_diagnostic = f"ExpectedReturnEngine failed: {type(exc).__name__}"
+            expected_return_status = "SOFTWARE_FAILURE"
+            expected_res = {
+                "probability_tp_hit_24h_pct": None,
+                "expected_net_24h_return_pct": None,
+                "potential_mfe_24h_pct": None,
+                "potential_mae_24h_pct": None,
+                "estimated_hours_to_target": None,
+                "reversal_risk_score": None,
+                "realistic_opportunity_rank": None,
+                "forecast_status": "SOFTWARE_FAILURE",
+            }
+
+    if engine_failure_module is not None:
+        risks.append("SOFTWARE_ERROR_SIGNAL_ENGINES_INCOMPLETE")
+        risks.append("UNVERIFIED_DUE_TO_ENGINE_FAILURE")
 
     return {
         "score": score,
@@ -533,6 +656,13 @@ def score_candidate(row: dict[str, Any]) -> dict[str, Any]:
         "buy_pressure_pct": round(buy_share, 2) if buy_share is not None else None,
         "volume_to_liquidity": round(turnover, 3) if turnover is not None else None,
         "intraday_volume_acceleration_ratio": round(volume_acceleration_ratio, 3) if volume_acceleration_ratio is not None else None,
+        "signal_engine_executed": signal_engine_executed,
+        "expected_return_engine_executed": expected_return_engine_executed,
+        "engine_failure_module": engine_failure_module,
+        "engine_exception_category": engine_exception_category,
+        "engine_failure_diagnostic": engine_failure_diagnostic,
+        "engine_result_status": engine_result_status,
+        "expected_return_status": expected_return_status,
         "breakout_confluence_score": engines_res.get("breakout_confluence_score"),
         "breakout_engine_scores": engines_res.get("engine_scores", {}),
         "breakout_acceleration_signals": engines_res.get("acceleration_signals", {}),
@@ -679,6 +809,13 @@ def _normalize_pool(row: dict[str, Any], family: str, rank: int,
         "estimated_hours_to_target": score.get("estimated_hours_to_target"),
         "reversal_risk_score": score.get("reversal_risk_score"),
         "realistic_opportunity_rank": score.get("realistic_opportunity_rank"),
+        "signal_engine_executed": score.get("signal_engine_executed"),
+        "expected_return_engine_executed": score.get("expected_return_engine_executed"),
+        "engine_failure_module": score.get("engine_failure_module"),
+        "engine_exception_category": score.get("engine_exception_category"),
+        "engine_failure_diagnostic": score.get("engine_failure_diagnostic"),
+        "engine_result_status": score.get("engine_result_status"),
+        "expected_return_status": score.get("expected_return_status"),
     })
     return record
 
@@ -693,44 +830,59 @@ def _collect_dexpaprika(hunter: Any, mod: Any) -> dict[str, Any]:
     errors = []
     requests = []
     total_added = 0
+    pages_retrieved = 0
+    records_discovered = 0
     for family, filters in POOL_QUERIES:
-        params = {"limit": MAX_SEARCH_ROWS, "detailed": "true"}
-        params.update(filters)
-        path = "/pools/search"
-        payload, headers, error = client.get(path, params=params, family=family)
-        status = "OK" if isinstance(payload, dict) and isinstance(payload.get("results"), list) else "FAILED"
-        rows = payload.get("results") if isinstance(payload, dict) else []
-        if not isinstance(rows, list):
-            rows = []
-        added = 0
-        for rank, item in enumerate(rows, 1):
-            if not isinstance(item, dict):
-                continue
-            record = _normalize_pool(item, family, rank, base_record_fn)
-            if record is None:
-                continue
-            hunter.candidates.append(record)
-            added += 1
-        total_added += added
-        family_counts[family] = added
-        if error:
-            errors.append({"family": family, "error": error})
-        requests.append({
-            "family": family, "status": status, "rows_received": len(rows),
-            "records_added": added, "has_next_page": bool(payload.get("has_next_page")) if isinstance(payload, dict) else False,
-            "api_plan_header": headers.get("x-api-plan"),
-        })
+        family_added = 0
+        family_page = 1
+        has_next = True
+        while has_next and family_page <= 2 and client.request_count < SCANNER_ROLLING_REQUEST_CEILING:
+            params = {"limit": MAX_SEARCH_ROWS, "detailed": "true"}
+            params.update(filters)
+            if family_page > 1:
+                params["page"] = family_page
+            path = "/pools/search"
+            payload, headers, error = client.get(path, params=params, family=family)
+            pages_retrieved += 1
+            status = "OK" if isinstance(payload, dict) and isinstance(payload.get("results"), list) else "FAILED"
+            rows = payload.get("results") if isinstance(payload, dict) else []
+            if not isinstance(rows, list):
+                rows = []
+            records_discovered += len(rows)
+            added = 0
+            for rank, item in enumerate(rows, 1):
+                if not isinstance(item, dict):
+                    continue
+                record = _normalize_pool(item, family, (family_page - 1) * MAX_SEARCH_ROWS + rank, base_record_fn)
+                if record is None:
+                    continue
+                hunter.candidates.append(record)
+                added += 1
+            family_added += added
+            total_added += added
+            has_next = bool(payload.get("has_next_page")) if isinstance(payload, dict) else False
+            requests.append({
+                "family": family, "page": family_page, "status": status, "rows_received": len(rows),
+                "records_added": added, "has_next_page": has_next,
+                "api_plan_header": headers.get("x-api-plan"),
+            })
+            if error:
+                errors.append({"family": family, "page": family_page, "error": error})
+                break  # Stop paginating this family on error
+            family_page += 1
+
+        family_counts[family] = family_added
         _record_status(
-            hunter, "dexpaprika_%s" % family, status, API_ROOT + path,
-            len(rows), error,
+            hunter, "dexpaprika_%s" % family, "OK" if family_added > 0 else "EMPTY_OR_FAILED", API_ROOT + "/pools/search",
+            family_added, errors[-1]["error"] if errors and errors[-1]["family"] == family else None,
             extra={
-                "records_added": added,
+                "records_added": family_added,
+                "pages_retrieved": family_page - 1,
                 "sort_order": filters.get("order_by"),
                 "all_networks_query": True,
-                "first_page_only": True,
-                "has_next_page": bool(payload.get("has_next_page")) if isinstance(payload, dict) else False,
+                "has_next_page": has_next,
                 "provider_network_registry_count": len(networks),
-                "api_plan_header": headers.get("x-api-plan"),
+                "api_plan_header": headers.get("x-api-plan") if "headers" in locals() else None,
             },
         )
     return {
@@ -738,18 +890,24 @@ def _collect_dexpaprika(hunter: Any, mod: Any) -> dict[str, Any]:
         "provider": "DexPaprika keyless public REST API",
         "api_key_required": False,
         "api_plan": "keyless_free_only",
+        "coverage_status": "PARTIAL",
         "registry_available": registry_meta.get("registry_available", False),
         "registry_cached": registry_meta.get("registry_cached", False),
         "network_count": len(networks),
         "network_ids": [item["id"] for item in networks],
-        "provider_scope": "Provider-documented 36-chain DEX dataset; cross-network global pool searches without a chains filter. Six independent first-page rankings cover 5m, 1h, 6h, 24h momentum, 24h volume and pools created in the last 24h.",
-        "coverage_boundary": "Each endpoint returns at most the first 100 rows, with no cursor pagination in this keyless integration. This is a broad ranked sample, not a complete pool census.",
+        "provider_scope": "Provider-documented 36-chain DEX dataset; cross-network global pool searches without a chains filter. Six independent rankings cover 5m, 1h, 6h, 24h momentum, 24h volume and pools created in the last 24h.",
+        "coverage_boundary": "Endpoint returns ranked sampled pages up to provider quota limits; this is a broad ranked research sample, never an exhaustive census of all Web3 assets.",
         "family_counts": family_counts,
         "requests": requests,
+        "pages_retrieved": pages_retrieved,
+        "records_discovered": records_discovered,
+        "records_rejected": max(0, records_discovered - total_added),
+        "rate_limit_failures": len([e for e in errors if "429" in str(e.get("error", ""))]),
         "request_count_this_run": client.request_count,
         "rolling_request_ceiling": SCANNER_ROLLING_REQUEST_CEILING,
         "estimated_rolling_requests_reserved": len(_rolling_ledger(memory)["requests"]),
         "records_added": total_added,
+        "work_left_for_future_rotations": any(r.get("has_next_page") for r in requests),
         "errors": errors,
         "registry_meta": registry_meta,
     }
@@ -1163,6 +1321,13 @@ def _fallback_market_mover_candidates(report: dict[str, Any], limit: int = 500) 
                 incoming["estimated_hours_to_target"] = signal.get("estimated_hours_to_target")
                 incoming["reversal_risk_score"] = signal.get("reversal_risk_score")
                 incoming["realistic_opportunity_rank"] = signal.get("realistic_opportunity_rank")
+                incoming["signal_engine_executed"] = signal.get("signal_engine_executed")
+                incoming["expected_return_engine_executed"] = signal.get("expected_return_engine_executed")
+                incoming["engine_failure_module"] = signal.get("engine_failure_module")
+                incoming["engine_exception_category"] = signal.get("engine_exception_category")
+                incoming["engine_failure_diagnostic"] = signal.get("engine_failure_diagnostic")
+                incoming["engine_result_status"] = signal.get("engine_result_status")
+                incoming["expected_return_status"] = signal.get("expected_return_status")
             if existing is None:
                 by_market[key] = incoming
                 continue
@@ -1682,7 +1847,16 @@ def qualify_final_actionable_candidates(candidates: list[dict[str, Any]], now: d
             reference_drift_pct is not None and max_reference_drift is not None and
             reference_drift_pct <= max_reference_drift
         )
+        software_failure = (
+            candidate.get("signal_engine_executed") is False or
+            candidate.get("expected_return_engine_executed") is False or
+            candidate.get("engine_result_status") == "SOFTWARE_FAILURE" or
+            candidate.get("expected_return_status") == "SOFTWARE_FAILURE" or
+            "SOFTWARE_ERROR_SIGNAL_ENGINES_INCOMPLETE" in (candidate.get("early_breakout_risk_flags") or []) or
+            "SOFTWARE_ERROR_SIGNAL_ENGINES_INCOMPLETE" in (candidate.get("risk_flags") or [])
+        )
         complete = (
+            not software_failure and
             str(candidate.get("market_type") or "").lower() == "dex_pool" and
             candidate.get("final_price_verified") is True and reference is not None and reference > 0 and
             age_seconds is not None and 0 <= age_seconds <= 300 and
@@ -1706,6 +1880,20 @@ def qualify_final_actionable_candidates(candidates: list[dict[str, Any]], now: d
             upside is not None and upside >= 40.0
         )
         blockers = []
+        if software_failure:
+            blockers.append("signal engine software execution failed or threw an exception")
+        try:
+            from scripts.user_trade_learning import enforce_aura_safety_veto
+        except ImportError:
+            try:
+                from user_trade_learning import enforce_aura_safety_veto
+            except ImportError:
+                enforce_aura_safety_veto = None
+        if enforce_aura_safety_veto:
+            is_vetoed, veto_reason = enforce_aura_safety_veto(candidate)
+            if is_vetoed:
+                blockers.append(veto_reason)
+                complete = False
         if str(candidate.get("market_type") or "").lower() != "dex_pool":
             blockers.append("only exact-identity DEX pools can enter the qualified lane")
         if not observed_target:

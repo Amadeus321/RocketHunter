@@ -626,9 +626,46 @@ def _forecast_path_label(forecast: dict[str, Any], bars: dict[dt.datetime, dict[
 
     if not present:
         counters["forecasts_without_elapsed_valid_bars"] += 1
+        summary["outcome_classification"] = "INCOMPLETE_OBSERVATION"
+        summary["execution_status"] = "EXECUTION_UNVERIFIED"
+        summary["entry_reference_price_usd"] = baseline
+        summary["entry_timestamp_utc"] = snapshot.isoformat().replace("+00:00", "Z")
+        summary["tp40_target_price_usd"] = round(baseline * 1.40, 8)
+        summary["mfe_pct"] = None
+        summary["mae_pct"] = None
+        summary["first_observed_tp40_touch_utc"] = None
         return summary, None
     ordered = [present[key] for key in sorted(present)]
     worst_low = min(bar["low"] for bar in ordered)
+    highest_high = max(bar["high"] for bar in ordered)
+    mfe_pct = round((highest_high / baseline - 1.0) * 100.0, 4)
+    mae_pct = round((worst_low / baseline - 1.0) * 100.0, 4)
+    tp40_level = baseline * 1.40
+    tp40_hit_bars = [bar for bar in ordered if bar["high"] >= tp40_level]
+    tp40_first_touch_utc = (
+        min(tp40_hit_bars, key=lambda bar: bar["time_open"])["time_open"].isoformat().replace("+00:00", "Z")
+        if tp40_hit_bars else None
+    )
+
+    if any(opened in expected for opened in conflicts):
+        outcome_classification = "PRICE_SOURCE_CONFLICT"
+    elif gaps:
+        outcome_classification = "UNKNOWN_DUE_TO_GAP"
+    elif not complete:
+        outcome_classification = "INCOMPLETE_OBSERVATION"
+    elif tp40_hit_bars:
+        outcome_classification = "TARGET_REACHED"
+    else:
+        outcome_classification = "TARGET_NOT_REACHED"
+
+    summary["outcome_classification"] = outcome_classification
+    summary["execution_status"] = "EXECUTION_UNVERIFIED"
+    summary["entry_reference_price_usd"] = baseline
+    summary["entry_timestamp_utc"] = snapshot.isoformat().replace("+00:00", "Z")
+    summary["tp40_target_price_usd"] = round(tp40_level, 8)
+    summary["mfe_pct"] = mfe_pct
+    summary["mae_pct"] = mae_pct
+    summary["first_observed_tp40_touch_utc"] = tp40_first_touch_utc
     summary["hourly_adverse_movement"] = {
         "worst_bar_low_return_pct": (worst_low / baseline - 1) * 100,
         "worst_bar_low_utc": min(ordered, key=lambda bar: bar["low"])["time_open"].isoformat().replace("+00:00", "Z"),

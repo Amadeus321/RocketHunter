@@ -638,6 +638,19 @@ def refresh_and_filter_candidates(
             c["trade_plan"]["single_take_profit"] = target
             c["trade_plan"]["tp_upside_pct"] = round(potential, 2)
 
+        # Strict safety veto check: AURA conviction cannot override safety failures
+        try:
+            from scripts.user_trade_learning import enforce_aura_safety_veto
+        except ImportError:
+            try:
+                from user_trade_learning import enforce_aura_safety_veto
+            except ImportError:
+                enforce_aura_safety_veto = None
+        if enforce_aura_safety_veto:
+            is_vetoed, veto_reason = enforce_aura_safety_veto(c)
+            if is_vetoed:
+                continue
+
         valid_candidates.append(c)
 
     try:
