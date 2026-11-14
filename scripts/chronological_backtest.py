@@ -178,43 +178,134 @@ def normalize_trace_provider(raw_prov: Any) -> str | None:
     return PROVIDER_ALIASES.get(cleaned)
 
 
+def parse_and_validate_url(url_val: Any) -> tuple[bool, str | None, str]:
+    """Strictly parse and validate an HTTPS URL for request_url and source_ref.
+
+    Requirements:
+    - Must be a non-empty string.
+    - Scheme must be strictly 'https'. Rejects HTTP, FTP, protocol-relative ('//...'), and missing scheme.
+    - Parsed using urllib.parse.urlparse() with parsed .hostname extracted.
+    - Credentials (username, password, '@' in authority) are rejected.
+    - Invalid ports (non-numeric, negative, out of 1-65535 range, or malformed) are rejected.
+    - Missing hostnames, malformed authorities, and deceptive hostnames are rejected.
+    - No manual colon splitting.
+
+    Returns (is_valid, hostname, diagnostic_reason).
+    """
+    if url_val is None or not isinstance(url_val, str):
+        return False, None, "MISSING_URL"
+    s = url_val.strip()
+    if not s:
+        return False, None, "MISSING_URL"
+
+    # Reject protocol-relative URLs
+    if s.startswith("//"):
+        return False, None, "PROTOCOL_RELATIVE_URL_DISALLOWED"
+
+    # Must contain explicit scheme separator
+    if "://" not in s:
+        return False, None, "MISSING_SCHEME"
+
+    try:
+        parsed = urlparse(s)
+    except Exception as exc:
+        return False, None, f"MALFORMED_URL: {exc}"
+
+    scheme = (parsed.scheme or "").lower()
+    if scheme != "https":
+        if scheme == "http":
+            return False, None, "UNSUPPORTED_SCHEME_HTTP"
+        if scheme == "ftp":
+            return False, None, "UNSUPPORTED_SCHEME_FTP"
+        return False, None, f"INVALID_SCHEME_{scheme.upper()}"
+
+    # Check for credentials in authority
+    if parsed.username is not None or parsed.password is not None or "@" in (parsed.netloc or ""):
+        return False, None, "CREDENTIALS_DISALLOWED"
+
+    # Check for invalid port
+    try:
+        port = parsed.port
+        if port is not None and not (1 <= port <= 65535):
+            return False, None, "INVALID_PORT"
+    except ValueError:
+        return False, None, "INVALID_PORT"
+
+    # Extract parsed.hostname (in lowercase)
+    hostname = parsed.hostname
+    if not hostname or not isinstance(hostname, str) or not hostname.strip():
+        return False, None, "MISSING_HOSTNAME"
+
+    hostname = hostname.strip().lower()
+
+    # Reject malformed authority or deceptive characters
+    if any(c in hostname for c in (" ", "\t", "\r", "\n", "\\", "/", "?", "#", "@", ":")):
+        return False, None, "MALFORMED_AUTHORITY"
+
+    if hostname.startswith(".") or hostname.endswith(".") or ".." in hostname:
+        return False, None, "MALFORMED_HOSTNAME"
+
+    labels = hostname.split(".")
+    if len(labels) < 2:
+        return False, None, "INVALID_HOSTNAME"
+
+    for lbl in labels:
+        if not lbl or len(lbl) > 63 or lbl.startswith("-") or lbl.endswith("-"):
+            return False, None, "MALFORMED_HOSTNAME"
+        if not all(c.isalnum() or c == "-" for c in lbl):
+            return False, None, "MALFORMED_HOSTNAME"
+
+    return True, hostname, "OK"
+
+
 def extract_source_domain(source_ref: Any) -> str | None:
-    """Extract lowercase network hostname/domain from a source reference or URL."""
+    """Extract and validate lowercase network hostname/domain from a source reference or URL.
+
+    Strictly requires HTTPS for URLs, rejects credentials, invalid ports, and deceptive hostnames.
+    """
     if not source_ref or not isinstance(source_ref, str):
         return None
     s = source_ref.strip()
     if not s:
         return None
-    try:
-        if "://" in s:
-            parsed = urlparse(s)
-            host = parsed.netloc.lower()
-        else:
-            host = s.split("/")[0].lower()
-        if ":" in host:
-            host = host.split(":")[0]
-        if "." in host and " " not in host and len(host) >= 4:
-            return host
+
+    # If it represents a URL (contains scheme or starts with //)
+    if "://" in s or s.startswith("//"):
+        is_valid, host, _ = parse_and_validate_url(s)
+        return host if is_valid else None
+
+    # If it is a bare domain, validate hostname format strictly without colon splitting
+    if "@" in s or ":" in s or "/" in s or "\\" in s or " " in s:
         return None
-    except Exception:
+    labels = s.lower().split(".")
+    if len(labels) < 2:
         return None
+    for lbl in labels:
+        if not lbl or len(lbl) > 63 or lbl.startswith("-") or lbl.endswith("-"):
+            return None
+        if not all(c.isalnum() or c == "-" for c in lbl):
+            return None
+    return s.lower()
 
 
 def validate_provider_source_domain(provider: str, domain: str) -> tuple[bool, str]:
-    """Verify that domain matches provider allowlist and detect provider/domain mismatch.
+    """Verify that complete hostname matches provider allowlist and detect provider/domain mismatch.
 
+    Validates complete hostname against provider allowlist without manual colon splitting.
     Returns (is_valid, status_code).
     """
+    if not provider or not domain:
+        return False, "UNAPPROVED_SOURCE_DOMAIN"
+
+    dom = domain.strip().lower()
     allowed_domains = PROVIDER_DOMAIN_ALLOWLIST.get(provider, set())
-    is_match = any(domain == allowed or domain.endswith("." + allowed) for allowed in allowed_domains)
-    if is_match:
+    if dom in allowed_domains:
         return True, "OK"
 
     # Check if domain belongs to another recognized provider
     for other_prov, other_domains in PROVIDER_DOMAIN_ALLOWLIST.items():
-        if other_prov != provider:
-            if any(domain == allowed or domain.endswith("." + allowed) for allowed in other_domains):
-                return False, "PROVIDER_DOMAIN_MISMATCH"
+        if other_prov != provider and dom in other_domains:
+            return False, "PROVIDER_DOMAIN_MISMATCH"
 
     return False, "UNAPPROVED_SOURCE_DOMAIN"
 
@@ -1515,8 +1606,8 @@ class ChronologicalBacktestEvaluator:
             }, None
 
         resp_url = raw_req_url.strip()
-        req_domain = extract_source_domain(resp_url)
-        if not req_domain:
+        is_url_valid, req_domain, url_diag = parse_and_validate_url(resp_url)
+        if not is_url_valid or not req_domain:
             self.diagnostics["unresolved_outcomes"] += 1
             return False, {
                 "outcome_classification": "INVALID_RESPONSE_REQUEST_URL",
@@ -1526,7 +1617,7 @@ class ChronologicalBacktestEvaluator:
                 "mae_pct": None,
                 "hours_to_target": None,
                 "is_evaluated": False,
-                "resolution_reason": f"INVALID_RESPONSE_REQUEST_URL: cannot extract valid hostname/domain from request_url '{resp_url}'",
+                "resolution_reason": f"INVALID_RESPONSE_REQUEST_URL: {url_diag} in request_url '{resp_url}'",
                 "execution_status": exec_status,
                 "execution_net_return_pct": None,
             }, None

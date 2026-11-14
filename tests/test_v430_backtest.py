@@ -2914,3 +2914,395 @@ class TestChronologicalBacktest:
         assert audit["response_retrieval_utc"] == (t + dt.timedelta(hours=24, minutes=5)).isoformat()
         assert audit["content_hash_verified"] is True
         assert audit["response_reconciliation_verified"] is True
+
+    # --- PHASE 1 FINAL HARDENED URL TESTS (Regressions 96-103) ---
+
+    def test_http_request_url_rejected(self):
+        """Regression 96: Captured response with plain HTTP request_url is rejected."""
+        evaluator = ChronologicalBacktestEvaluator([])
+        t = dt.datetime(2026, 11, 1, 12, 0, tzinfo=dt.timezone.utc)
+        trace = make_valid_trace(
+            "dex:solana:TokenX:PoolA",
+            t,
+            duration_hours=24.0,
+            mfe_pct=45.0,
+            touch_hours=2.0,
+            response_request_url="http://api.geckoterminal.com/api/v2/networks/solana/pools/PoolA/ohlcv/hour",
+        )
+        item = {
+            "record_id": "rec_http_req_url",
+            "market_key": "dex:solana:TokenX:PoolA",
+            "timestamp": t,
+            "timestamp_utc": "2026-11-01T12:00:00Z",
+            "detection_price": 1.0,
+            "raw_record": {
+                "chain": "solana",
+                "contract_address": "TokenX",
+                "pool_address": "PoolA",
+                "outcome_classification": "TARGET_REACHED",
+                "mfe_pct": 45.0,
+                "hours_to_target": 2.0,
+                "candle_trace": trace,
+            },
+        }
+        res = evaluator._resolve_outcome(item, lookup=None)
+        assert res["is_evaluated"] is False
+        assert res["outcome_classification"] == "INVALID_RESPONSE_REQUEST_URL"
+        assert "UNSUPPORTED_SCHEME_HTTP" in res["resolution_reason"]
+
+    def test_ftp_request_url_rejected(self):
+        """Regression 97: Captured response with FTP request_url is rejected."""
+        evaluator = ChronologicalBacktestEvaluator([])
+        t = dt.datetime(2026, 11, 1, 12, 0, tzinfo=dt.timezone.utc)
+        trace = make_valid_trace(
+            "dex:solana:TokenX:PoolA",
+            t,
+            duration_hours=24.0,
+            mfe_pct=45.0,
+            touch_hours=2.0,
+            response_request_url="ftp://api.geckoterminal.com/api/v2/networks/solana/pools/PoolA/ohlcv/hour",
+        )
+        item = {
+            "record_id": "rec_ftp_req_url",
+            "market_key": "dex:solana:TokenX:PoolA",
+            "timestamp": t,
+            "timestamp_utc": "2026-11-01T12:00:00Z",
+            "detection_price": 1.0,
+            "raw_record": {
+                "chain": "solana",
+                "contract_address": "TokenX",
+                "pool_address": "PoolA",
+                "outcome_classification": "TARGET_REACHED",
+                "mfe_pct": 45.0,
+                "hours_to_target": 2.0,
+                "candle_trace": trace,
+            },
+        }
+        res = evaluator._resolve_outcome(item, lookup=None)
+        assert res["is_evaluated"] is False
+        assert res["outcome_classification"] == "INVALID_RESPONSE_REQUEST_URL"
+        assert "UNSUPPORTED_SCHEME_FTP" in res["resolution_reason"]
+
+    def test_missing_scheme_request_url_rejected(self):
+        """Regression 98: Captured response with scheme-less or protocol-relative request_url is rejected."""
+        evaluator = ChronologicalBacktestEvaluator([])
+        t = dt.datetime(2026, 11, 1, 12, 0, tzinfo=dt.timezone.utc)
+
+        # No scheme at all
+        trace1 = make_valid_trace(
+            "dex:solana:TokenX:PoolA",
+            t,
+            duration_hours=24.0,
+            mfe_pct=45.0,
+            touch_hours=2.0,
+            response_request_url="api.geckoterminal.com/api/v2/networks/solana/pools/PoolA/ohlcv/hour",
+        )
+        item1 = {
+            "record_id": "rec_no_scheme",
+            "market_key": "dex:solana:TokenX:PoolA",
+            "timestamp": t,
+            "timestamp_utc": "2026-11-01T12:00:00Z",
+            "detection_price": 1.0,
+            "raw_record": {
+                "chain": "solana",
+                "contract_address": "TokenX",
+                "pool_address": "PoolA",
+                "outcome_classification": "TARGET_REACHED",
+                "mfe_pct": 45.0,
+                "hours_to_target": 2.0,
+                "candle_trace": trace1,
+            },
+        }
+        res1 = evaluator._resolve_outcome(item1, lookup=None)
+        assert res1["is_evaluated"] is False
+        assert res1["outcome_classification"] == "INVALID_RESPONSE_REQUEST_URL"
+        assert "MISSING_SCHEME" in res1["resolution_reason"]
+
+        # Protocol-relative URL
+        trace2 = make_valid_trace(
+            "dex:solana:TokenX:PoolA",
+            t,
+            duration_hours=24.0,
+            mfe_pct=45.0,
+            touch_hours=2.0,
+            response_request_url="//api.geckoterminal.com/api/v2/networks/solana/pools/PoolA/ohlcv/hour",
+        )
+        item2 = {
+            "record_id": "rec_proto_rel",
+            "market_key": "dex:solana:TokenX:PoolA",
+            "timestamp": t,
+            "timestamp_utc": "2026-11-01T12:00:00Z",
+            "detection_price": 1.0,
+            "raw_record": {
+                "chain": "solana",
+                "contract_address": "TokenX",
+                "pool_address": "PoolA",
+                "outcome_classification": "TARGET_REACHED",
+                "mfe_pct": 45.0,
+                "hours_to_target": 2.0,
+                "candle_trace": trace2,
+            },
+        }
+        res2 = evaluator._resolve_outcome(item2, lookup=None)
+        assert res2["is_evaluated"] is False
+        assert res2["outcome_classification"] == "INVALID_RESPONSE_REQUEST_URL"
+        assert "PROTOCOL_RELATIVE_URL" in res2["resolution_reason"]
+
+    def test_url_with_credentials_rejected(self):
+        """Regression 99: Captured response request_url with username/password credentials is rejected."""
+        evaluator = ChronologicalBacktestEvaluator([])
+        t = dt.datetime(2026, 11, 1, 12, 0, tzinfo=dt.timezone.utc)
+        trace = make_valid_trace(
+            "dex:solana:TokenX:PoolA",
+            t,
+            duration_hours=24.0,
+            mfe_pct=45.0,
+            touch_hours=2.0,
+            response_request_url="https://admin:secret123@api.geckoterminal.com/api/v2/networks/solana/pools/PoolA/ohlcv/hour",
+        )
+        item = {
+            "record_id": "rec_creds_req_url",
+            "market_key": "dex:solana:TokenX:PoolA",
+            "timestamp": t,
+            "timestamp_utc": "2026-11-01T12:00:00Z",
+            "detection_price": 1.0,
+            "raw_record": {
+                "chain": "solana",
+                "contract_address": "TokenX",
+                "pool_address": "PoolA",
+                "outcome_classification": "TARGET_REACHED",
+                "mfe_pct": 45.0,
+                "hours_to_target": 2.0,
+                "candle_trace": trace,
+            },
+        }
+        res = evaluator._resolve_outcome(item, lookup=None)
+        assert res["is_evaluated"] is False
+        assert res["outcome_classification"] == "INVALID_RESPONSE_REQUEST_URL"
+        assert "CREDENTIALS_DISALLOWED" in res["resolution_reason"]
+
+    def test_invalid_port_rejected(self):
+        """Regression 100: Captured response request_url with invalid port (out-of-range or non-numeric) is rejected."""
+        evaluator = ChronologicalBacktestEvaluator([])
+        t = dt.datetime(2026, 11, 1, 12, 0, tzinfo=dt.timezone.utc)
+
+        # Port out of valid 1-65535 range
+        trace1 = make_valid_trace(
+            "dex:solana:TokenX:PoolA",
+            t,
+            duration_hours=24.0,
+            mfe_pct=45.0,
+            touch_hours=2.0,
+            response_request_url="https://api.geckoterminal.com:99999/api/v2/networks/solana/pools/PoolA/ohlcv/hour",
+        )
+        item1 = {
+            "record_id": "rec_bad_port_num",
+            "market_key": "dex:solana:TokenX:PoolA",
+            "timestamp": t,
+            "timestamp_utc": "2026-11-01T12:00:00Z",
+            "detection_price": 1.0,
+            "raw_record": {
+                "chain": "solana",
+                "contract_address": "TokenX",
+                "pool_address": "PoolA",
+                "outcome_classification": "TARGET_REACHED",
+                "mfe_pct": 45.0,
+                "hours_to_target": 2.0,
+                "candle_trace": trace1,
+            },
+        }
+        res1 = evaluator._resolve_outcome(item1, lookup=None)
+        assert res1["is_evaluated"] is False
+        assert res1["outcome_classification"] == "INVALID_RESPONSE_REQUEST_URL"
+        assert "INVALID_PORT" in res1["resolution_reason"]
+
+        # Non-numeric port
+        trace2 = make_valid_trace(
+            "dex:solana:TokenX:PoolA",
+            t,
+            duration_hours=24.0,
+            mfe_pct=45.0,
+            touch_hours=2.0,
+            response_request_url="https://api.geckoterminal.com:bad_port/api/v2/networks/solana/pools/PoolA/ohlcv/hour",
+        )
+        item2 = {
+            "record_id": "rec_bad_port_alpha",
+            "market_key": "dex:solana:TokenX:PoolA",
+            "timestamp": t,
+            "timestamp_utc": "2026-11-01T12:00:00Z",
+            "detection_price": 1.0,
+            "raw_record": {
+                "chain": "solana",
+                "contract_address": "TokenX",
+                "pool_address": "PoolA",
+                "outcome_classification": "TARGET_REACHED",
+                "mfe_pct": 45.0,
+                "hours_to_target": 2.0,
+                "candle_trace": trace2,
+            },
+        }
+        res2 = evaluator._resolve_outcome(item2, lookup=None)
+        assert res2["is_evaluated"] is False
+        assert res2["outcome_classification"] == "INVALID_RESPONSE_REQUEST_URL"
+        assert "INVALID_PORT" in res2["resolution_reason"]
+
+    def test_malformed_authority_and_deceptive_hostname_rejected(self):
+        """Regression 101: Deceptive hostnames, authority confusion, and malformed hostnames are rejected."""
+        evaluator = ChronologicalBacktestEvaluator([])
+        t = dt.datetime(2026, 11, 1, 12, 0, tzinfo=dt.timezone.utc)
+
+        # Deceptive userinfo confusion: https://api.geckoterminal.com@attacker.com/...
+        trace1 = make_valid_trace(
+            "dex:solana:TokenX:PoolA",
+            t,
+            duration_hours=24.0,
+            mfe_pct=45.0,
+            touch_hours=2.0,
+            response_request_url="https://api.geckoterminal.com@attacker.com/api/v2/pools",
+        )
+        item1 = {
+            "record_id": "rec_deceptive_userinfo",
+            "market_key": "dex:solana:TokenX:PoolA",
+            "timestamp": t,
+            "timestamp_utc": "2026-11-01T12:00:00Z",
+            "detection_price": 1.0,
+            "raw_record": {
+                "chain": "solana",
+                "contract_address": "TokenX",
+                "pool_address": "PoolA",
+                "outcome_classification": "TARGET_REACHED",
+                "mfe_pct": 45.0,
+                "hours_to_target": 2.0,
+                "candle_trace": trace1,
+            },
+        }
+        res1 = evaluator._resolve_outcome(item1, lookup=None)
+        assert res1["is_evaluated"] is False
+        assert res1["outcome_classification"] in ("INVALID_RESPONSE_REQUEST_URL", "RESPONSE_URL_PROVIDER_MISMATCH")
+
+        # Deceptive subdomain suffix: api.geckoterminal.com.attacker.com
+        trace2 = make_valid_trace(
+            "dex:solana:TokenX:PoolA",
+            t,
+            duration_hours=24.0,
+            mfe_pct=45.0,
+            touch_hours=2.0,
+            response_request_url="https://api.geckoterminal.com.attacker.com/api/v2/pools",
+        )
+        item2 = {
+            "record_id": "rec_deceptive_subdomain",
+            "market_key": "dex:solana:TokenX:PoolA",
+            "timestamp": t,
+            "timestamp_utc": "2026-11-01T12:00:00Z",
+            "detection_price": 1.0,
+            "raw_record": {
+                "chain": "solana",
+                "contract_address": "TokenX",
+                "pool_address": "PoolA",
+                "outcome_classification": "TARGET_REACHED",
+                "mfe_pct": 45.0,
+                "hours_to_target": 2.0,
+                "candle_trace": trace2,
+            },
+        }
+        res2 = evaluator._resolve_outcome(item2, lookup=None)
+        assert res2["is_evaluated"] is False
+        assert res2["outcome_classification"] in ("INVALID_RESPONSE_REQUEST_URL", "RESPONSE_URL_PROVIDER_MISMATCH")
+
+    def test_valid_https_provider_url_accepted(self):
+        """Regression 102: Valid HTTPS provider request URL parses cleanly and is accepted."""
+        evaluator = ChronologicalBacktestEvaluator([])
+        t = dt.datetime(2026, 11, 1, 12, 0, tzinfo=dt.timezone.utc)
+        trace = make_valid_trace(
+            "dex:solana:TokenX:PoolA",
+            t,
+            duration_hours=24.0,
+            mfe_pct=45.0,
+            touch_hours=2.0,
+            provenance="geckoterminal",
+            source_ref="https://api.geckoterminal.com/api/v2/networks/solana/pools/PoolA/ohlcv/hour",
+            response_request_url="https://api.geckoterminal.com/api/v2/networks/solana/pools/PoolA/ohlcv/hour",
+        )
+        item = {
+            "record_id": "rec_valid_https_url",
+            "market_key": "dex:solana:TokenX:PoolA",
+            "timestamp": t,
+            "timestamp_utc": "2026-11-01T12:00:00Z",
+            "detection_price": 1.0,
+            "raw_record": {
+                "chain": "solana",
+                "contract_address": "TokenX",
+                "pool_address": "PoolA",
+                "outcome_classification": "TARGET_REACHED",
+                "mfe_pct": 45.0,
+                "hours_to_target": 2.0,
+                "candle_trace": trace,
+            },
+        }
+        res = evaluator._resolve_outcome(item, lookup=None)
+        assert res["is_evaluated"] is True
+        assert res["target_reached"] is True
+        assert res["evidence_audit"]["request_url"] == "https://api.geckoterminal.com/api/v2/networks/solana/pools/PoolA/ohlcv/hour"
+
+    def test_source_ref_strict_url_validation_rejected_if_http_or_creds(self):
+        """Regression 103: source_ref with plain HTTP or credentials is rejected as UNAPPROVED_SOURCE_DOMAIN."""
+        evaluator = ChronologicalBacktestEvaluator([])
+        t = dt.datetime(2026, 11, 1, 12, 0, tzinfo=dt.timezone.utc)
+
+        # HTTP source_ref
+        trace1 = make_valid_trace(
+            "dex:solana:TokenX:PoolA",
+            t,
+            duration_hours=24.0,
+            mfe_pct=45.0,
+            touch_hours=2.0,
+            source_ref="http://api.geckoterminal.com/api/v2/networks/solana/pools/PoolA/ohlcv/hour",
+        )
+        item1 = {
+            "record_id": "rec_http_source_ref",
+            "market_key": "dex:solana:TokenX:PoolA",
+            "timestamp": t,
+            "timestamp_utc": "2026-11-01T12:00:00Z",
+            "detection_price": 1.0,
+            "raw_record": {
+                "chain": "solana",
+                "contract_address": "TokenX",
+                "pool_address": "PoolA",
+                "outcome_classification": "TARGET_REACHED",
+                "mfe_pct": 45.0,
+                "hours_to_target": 2.0,
+                "candle_trace": trace1,
+            },
+        }
+        res1 = evaluator._resolve_outcome(item1, lookup=None)
+        assert res1["is_evaluated"] is False
+        assert res1["outcome_classification"] == "UNAPPROVED_SOURCE_DOMAIN"
+
+        # source_ref with credentials
+        trace2 = make_valid_trace(
+            "dex:solana:TokenX:PoolA",
+            t,
+            duration_hours=24.0,
+            mfe_pct=45.0,
+            touch_hours=2.0,
+            source_ref="https://user:pass@api.geckoterminal.com/api/v2/networks/solana/pools/PoolA/ohlcv/hour",
+        )
+        item2 = {
+            "record_id": "rec_creds_source_ref",
+            "market_key": "dex:solana:TokenX:PoolA",
+            "timestamp": t,
+            "timestamp_utc": "2026-11-01T12:00:00Z",
+            "detection_price": 1.0,
+            "raw_record": {
+                "chain": "solana",
+                "contract_address": "TokenX",
+                "pool_address": "PoolA",
+                "outcome_classification": "TARGET_REACHED",
+                "mfe_pct": 45.0,
+                "hours_to_target": 2.0,
+                "candle_trace": trace2,
+            },
+        }
+        res2 = evaluator._resolve_outcome(item2, lookup=None)
+        assert res2["is_evaluated"] is False
+        assert res2["outcome_classification"] == "UNAPPROVED_SOURCE_DOMAIN"
