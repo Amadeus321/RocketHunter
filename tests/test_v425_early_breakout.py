@@ -1,4 +1,5 @@
 """Regression tests for v4.25.0 free early-breakout and 24h peak tracking."""
+import hashlib
 import json
 import tempfile
 import unittest
@@ -781,10 +782,18 @@ class FinalActionableGateTests(unittest.TestCase):
                 "provider": "chainlink",
                 "feed_address": "0x8fa59a53f040d12d26f03bc9920373707c3c4004",
                 "valuation_policy": "STABLECOIN_ORACLE_VERIFIED",
+                "provider_acquired": True,
+                "request_url": "https://rpc.ethereum.chainlink.org/v1/0x8fa59a53f040d12d26f03bc9920373707c3c4004/latestRoundData",
+                "rpc_method": "eth_call:latestRoundData()",
+                "retrieval_time_utc": now_iso,
+                "raw_payload": '{"roundId":1,"answer":100000000,"startedAt":1794571200,"updatedAt":1794571200,"answeredInRound":1}',
+                "response_sha256": hashlib.sha256('{"roundId":1,"answer":100000000,"startedAt":1794571200,"updatedAt":1794571200,"answeredInRound":1}'.encode("utf-8")).hexdigest(),
                 "observation": {
                     "answer": 100000000,
                     "decimals": 8,
                     "round_id": 1,
+                    "answered_in_round": 1,
+                    "chain_id": 1,
                     "updated_at": now_iso,
                 },
             },
