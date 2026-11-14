@@ -1020,6 +1020,7 @@ def validate_observation_timestamp_freshness(
 
 _PROVENANCE_SECRET = secrets.token_bytes(32)
 _ADAPTER_FACTORY_SECRET = object()
+_OMITTED_SIGNATURE_VERIFIED = object()
 
 
 def _canonical_observation_payload(
@@ -1043,58 +1044,72 @@ def _canonical_observation_payload(
     transport_type: str,
     acquisition_method: str,
     request_url: str | None = None,
-    cryptographic_signature_verified: bool = False,
+    cryptographic_signature_verified: Any = _OMITTED_SIGNATURE_VERIFIED,
     feed_id: str | None = None,
     market_id: str | None = None,
     pool_address: str | None = None,
 ) -> bytes:
-    # 1. Exact finite numeric price representation without rounding
+    # 1. Exact finite numeric price representation without rounding (reject bool, str, None, <= 0, inf, nan)
     if price_usd is None or isinstance(price_usd, bool) or not isinstance(price_usd, (int, float)):
         raise ValueError(f"price_usd must be a non-null numeric float or int, got {price_usd!r}")
     val_price = float(price_usd)
     if not math.isfinite(val_price) or val_price <= 0.0:
         raise ValueError(f"price_usd must be positive and finite, got {price_usd!r}")
 
-    # 2. Strict HTTP status code validation (reject 0, None, < 100, > 599)
+    # 2. Strict HTTP status code validation (reject bool, float, None, < 100, > 599)
     if http_status is None or isinstance(http_status, bool) or not isinstance(http_status, int):
         raise ValueError(f"http_status must be a valid integer status code, got {http_status!r}")
     if http_status < 100 or http_status > 599:
         raise ValueError(f"http_status must be in the range [100, 599], got {http_status!r}")
     val_http_status = int(http_status)
 
-    # 3. Strict boolean validation for cryptographic_signature_verified (reject None, int, str, float)
-    if cryptographic_signature_verified is None or not isinstance(cryptographic_signature_verified, bool):
+    # 3. Explicit signature-verification boolean validation (reject omitted sentinel, None, int, str, float)
+    if cryptographic_signature_verified is _OMITTED_SIGNATURE_VERIFIED:
+        raise ValueError("cryptographic_signature_verified is required and cannot be omitted")
+    if not isinstance(cryptographic_signature_verified, bool):
         raise ValueError(
-            f"cryptographic_signature_verified must be a strict Python bool (True or False), got {cryptographic_signature_verified!r}"
+            f"cryptographic_signature_verified must be an explicit Python bool (True or False), got {cryptographic_signature_verified!r}"
         )
 
-    # 3. Explicit None and empty handling for required fields
-    if acquisition_method is None or not str(acquisition_method).strip():
-        raise ValueError("acquisition_method must not be None or empty")
-    if chain is None or not str(chain).strip():
-        raise ValueError("chain must not be None or empty")
-    if chain_id is None or not str(chain_id).strip():
-        raise ValueError("chain_id must not be None or empty")
-    if feed_or_pool_id is None or not str(feed_or_pool_id).strip():
-        raise ValueError("feed_or_pool_id must not be None or empty")
-    if observation_timestamp is None or not str(observation_timestamp).strip():
-        raise ValueError("observation_timestamp must not be None or empty")
-    if provider is None or not str(provider).strip():
-        raise ValueError("provider must not be None or empty")
-    if provider_identifier is None or not str(provider_identifier).strip():
-        raise ValueError("provider_identifier must not be None or empty")
-    if quote_asset is None or not str(quote_asset).strip():
-        raise ValueError("quote_asset must not be None or empty")
-    if reference_asset is None or not str(reference_asset).strip():
-        raise ValueError("reference_asset must not be None or empty")
-    if retrieval_timestamp_utc is None or not str(retrieval_timestamp_utc).strip():
-        raise ValueError("retrieval_timestamp_utc must not be None or empty")
-    if transport_type is None or not str(transport_type).strip():
-        raise ValueError("transport_type must not be None or empty")
-    if valuation_policy is None or not str(valuation_policy).strip():
-        raise ValueError("valuation_policy must not be None or empty")
+    # 4. Strict validation of required string fields (reject bool, int, float, list, dict, None, empty)
+    required_str_fields = {
+        "acquisition_method": acquisition_method,
+        "chain": chain,
+        "feed_or_pool_id": feed_or_pool_id,
+        "observation_timestamp": observation_timestamp,
+        "provider": provider,
+        "provider_identifier": provider_identifier,
+        "quote_asset": quote_asset,
+        "reference_asset": reference_asset,
+        "retrieval_timestamp_utc": retrieval_timestamp_utc,
+        "transport_type": transport_type,
+        "valuation_policy": valuation_policy,
+    }
+    for field_name, field_val in required_str_fields.items():
+        if not isinstance(field_val, str) or not field_val.strip():
+            raise ValueError(f"{field_name} must be a non-empty string, got {field_val!r}")
 
-    # 4. Deterministic observation data handling
+    # 5. Strict validation of chain_id (int or str, reject bool, None, floats, collections)
+    if chain_id is None or isinstance(chain_id, bool) or not isinstance(chain_id, (int, str)):
+        raise ValueError(f"chain_id must be an int or str, got {chain_id!r}")
+    if isinstance(chain_id, str) and not chain_id.strip():
+        raise ValueError("chain_id must not be empty")
+
+    # 6. Strict validation of optional string fields (str or None, reject bool, int, float, collections)
+    optional_str_fields = {
+        "feed_id": feed_id,
+        "market_id": market_id,
+        "pool_address": pool_address,
+        "raw_payload": raw_payload,
+        "request_url": request_url,
+        "response_sha256": response_sha256,
+        "rpc_method": rpc_method,
+    }
+    for opt_name, opt_val in optional_str_fields.items():
+        if opt_val is not None and not isinstance(opt_val, str):
+            raise ValueError(f"{opt_name} must be a string or None, got {opt_val!r}")
+
+    # 7. Deterministic observation data handling (dict or None)
     if observation is None:
         val_observation = {}
     elif isinstance(observation, dict):
@@ -1524,6 +1539,7 @@ class ChainlinkRpcAdapter:
             transport_type=transport_type,
             acquisition_method=acquisition_method,
             observation_timestamp=updated_iso,
+            cryptographic_signature_verified=False,
         )
 
 
@@ -1633,6 +1649,7 @@ class PythHermesAdapter:
             transport_type=transport_type,
             acquisition_method=acquisition_method,
             observation_timestamp=pub_iso,
+            cryptographic_signature_verified=False,
         )
 
 
@@ -1742,6 +1759,7 @@ class CexTickerAdapter:
             transport_type=transport_type,
             acquisition_method=acquisition_method,
             observation_timestamp=obs_stamp,
+            cryptographic_signature_verified=False,
         )
 
 
@@ -1917,6 +1935,7 @@ class UniswapV3TwapAdapter:
             transport_type=transport_type,
             acquisition_method=acquisition_method,
             observation_timestamp=retrieval_stamp,
+            cryptographic_signature_verified=False,
         )
 
 
@@ -1985,6 +2004,7 @@ class DefiLlamaPricesAdapter:
             transport_type=transport_type,
             acquisition_method=acquisition_method,
             observation_timestamp=obs_stamp,
+            cryptographic_signature_verified=False,
         )
 
 

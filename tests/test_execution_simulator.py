@@ -4937,6 +4937,7 @@ class ProductionGateHardeningTests(ProvenanceIntegrityAdversarialTests):
             response_sha256="e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
             transport_type="LIVE_NETWORK_ACQUISITION",
             acquisition_method="GENUINE_READ_ONLY_RPC",
+            cryptographic_signature_verified=False,
         )
         parsed = json.loads(canonical.decode("utf-8"))
         self.assertEqual(parsed["price_usd"], small_price)
@@ -5034,6 +5035,7 @@ class ProductionGateHardeningTests(ProvenanceIntegrityAdversarialTests):
             acquisition_method="CHAINLINK_RPC_LATEST_ROUND_DATA",
             request_url="https://ethereum-rpc.publicnode.com",
             feed_id="0x8fa59a53f040d12d26f03bc9920373707c3c4004",
+            cryptographic_signature_verified=False,
         )
         base_token = _generate_provenance_token(base_canonical)
 
@@ -5058,6 +5060,7 @@ class ProductionGateHardeningTests(ProvenanceIntegrityAdversarialTests):
             acquisition_method="CHAINLINK_RPC_LATEST_ROUND_DATA",
             request_url="https://ethereum-rpc.publicnode.com",
             feed_id="0x8fa59a53f040d12d26f03bc9920373707c3c4004",
+            cryptographic_signature_verified=False,
         )
         self.assertNotEqual(base_canonical, mutated_pid_canonical)
         self.assertNotEqual(base_token, _generate_provenance_token(mutated_pid_canonical))
@@ -5083,6 +5086,7 @@ class ProductionGateHardeningTests(ProvenanceIntegrityAdversarialTests):
             acquisition_method="CHAINLINK_RPC_LATEST_ROUND_DATA",
             request_url="https://ethereum-rpc.publicnode.com",
             feed_id="0x8fa59a53f040d12d26f03bc9920373707c3c4004",
+            cryptographic_signature_verified=False,
         )
         self.assertNotEqual(base_canonical, mutated_fpid_canonical)
         self.assertNotEqual(base_token, _generate_provenance_token(mutated_fpid_canonical))
@@ -5139,6 +5143,7 @@ class ProductionGateHardeningTests(ProvenanceIntegrityAdversarialTests):
                 response_sha256="",
                 transport_type="MOCKED_TRANSPORT",
                 acquisition_method="CHAINLINK_RPC_LATEST_ROUND_DATA",
+                cryptographic_signature_verified=False,
             )
         with self.assertRaises(ValueError):
             _canonical_observation_payload(
@@ -5160,6 +5165,7 @@ class ProductionGateHardeningTests(ProvenanceIntegrityAdversarialTests):
                 response_sha256="",
                 transport_type="MOCKED_TRANSPORT",
                 acquisition_method="CHAINLINK_RPC_LATEST_ROUND_DATA",
+                cryptographic_signature_verified=False,
             )
 
         # Optional fields that were present in the acquired observation invalidate HMAC when stripped to None
@@ -5336,6 +5342,7 @@ class ProductionGateHardeningTests(ProvenanceIntegrityAdversarialTests):
             transport_type="MOCKED_TRANSPORT",
             acquisition_method="PYTH_HERMES_PRICE_SERVICE_HTTP",
             observation_timestamp=self.as_of_utc,
+            cryptographic_signature_verified=False,
         )
         for missing_key in ("price", "expo", "publish_time"):
             with self.subTest(pyth_missing=missing_key):
@@ -5374,6 +5381,7 @@ class ProductionGateHardeningTests(ProvenanceIntegrityAdversarialTests):
             transport_type="MOCKED_TRANSPORT",
             acquisition_method="UNISWAP_V3_ON_CHAIN_OBSERVE_RPC",
             observation_timestamp=self.as_of_utc,
+            cryptographic_signature_verified=False,
         )
         for missing_key in ("twap_price", "twap_window_seconds"):
             with self.subTest(uniswap_missing=missing_key):
@@ -5410,6 +5418,7 @@ class ProductionGateHardeningTests(ProvenanceIntegrityAdversarialTests):
             transport_type="MOCKED_TRANSPORT",
             acquisition_method="COINBASE_REST_TICKER_HTTP",
             observation_timestamp=self.as_of_utc,
+            cryptographic_signature_verified=False,
         )
         for missing_key in ("symbol", "last_price", "bid_price", "ask_price", "volume_24h"):
             with self.subTest(cex_missing=missing_key):
@@ -5446,6 +5455,7 @@ class ProductionGateHardeningTests(ProvenanceIntegrityAdversarialTests):
             transport_type="MOCKED_TRANSPORT",
             acquisition_method="DEFILLAMA_PRICES_HTTP",
             observation_timestamp=self.as_of_utc,
+            cryptographic_signature_verified=False,
         )
         for missing_key in ("price", "token", "timestamp"):
             with self.subTest(defillama_missing=missing_key):
@@ -5491,6 +5501,7 @@ class ProductionGateHardeningTests(ProvenanceIntegrityAdversarialTests):
             transport_type="MOCKED_TRANSPORT",
             acquisition_method="DEFILLAMA_PRICES_HTTP",
             observation_timestamp=self.as_of_utc,
+            cryptographic_signature_verified=False,
         )
         self.assertIsNone(dl_obs.rpc_method)
         self.assertIsNone(dl_obs.market_id)
@@ -5644,6 +5655,155 @@ class ProductionGateHardeningTests(ProvenanceIntegrityAdversarialTests):
         b_cid_diff = _canonical_observation_payload(observation={}, **{**base_kwargs, "chain_id": 42161})
         self.assertNotEqual(b_cid_int, b_cid_diff)
         self.assertNotEqual(_generate_provenance_token(b_cid_int), _generate_provenance_token(b_cid_diff))
+
+    # 26. Adversarial verification of canonical type contracts
+    def test_26_canonical_type_contract_adversarial_validation(self):
+        base_valid_kwargs = {
+            "provider": "chainlink",
+            "provider_identifier": "0x8fa59a53f040d12d26f03bc9920373707c3c4004",
+            "chain": "ethereum",
+            "chain_id": 1,
+            "quote_asset": "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48",
+            "feed_or_pool_id": "0x8fa59a53f040d12d26f03bc9920373707c3c4004",
+            "reference_asset": "USD",
+            "valuation_policy": "STABLECOIN_ORACLE_VERIFIED",
+            "price_usd": 1.0,
+            "observation": {"answer": 100000000},
+            "observation_timestamp": "2026-11-13T12:00:00Z",
+            "retrieval_timestamp_utc": "2026-11-13T12:00:00Z",
+            "http_status": 200,
+            "rpc_method": "eth_call",
+            "raw_payload": "{}",
+            "response_sha256": "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+            "transport_type": "MOCKED_TRANSPORT",
+            "acquisition_method": "CHAINLINK_RPC_LATEST_ROUND_DATA",
+            "request_url": "https://ethereum-rpc.publicnode.com",
+            "feed_id": "0x8fa59a53f040d12d26f03bc9920373707c3c4004",
+            "cryptographic_signature_verified": False,
+        }
+
+        # 1. Omitted cryptographic_signature_verified raises ValueError
+        kwargs_omitted_sig = copy.deepcopy(base_valid_kwargs)
+        kwargs_omitted_sig.pop("cryptographic_signature_verified")
+        with self.assertRaises(ValueError) as cm:
+            _canonical_observation_payload(**kwargs_omitted_sig)
+        self.assertIn("cryptographic_signature_verified is required and cannot be omitted", str(cm.exception))
+
+        # 2. Required string fields (11 fields) reject non-string types and empty strings
+        required_str_fields = (
+            "provider",
+            "provider_identifier",
+            "chain",
+            "quote_asset",
+            "feed_or_pool_id",
+            "reference_asset",
+            "valuation_policy",
+            "observation_timestamp",
+            "retrieval_timestamp_utc",
+            "transport_type",
+            "acquisition_method",
+        )
+        invalid_str_values = (123, True, False, 1.23, ["ethereum"], {"name": "ethereum"}, "", "   ", None)
+        for field in required_str_fields:
+            for bad_val in invalid_str_values:
+                with self.subTest(field=field, bad_val=bad_val):
+                    bad_kwargs = copy.deepcopy(base_valid_kwargs)
+                    bad_kwargs[field] = bad_val
+                    with self.assertRaises(ValueError):
+                        _canonical_observation_payload(**bad_kwargs)
+
+        # 3. chain_id must be int or str; rejects bool, None, floats, collections, empty string
+        invalid_chain_ids = (True, False, 1.0, 0.0, None, [1], {"id": 1}, "", "   ")
+        for bad_cid in invalid_chain_ids:
+            with self.subTest(bad_chain_id=bad_cid):
+                bad_kwargs = copy.deepcopy(base_valid_kwargs)
+                bad_kwargs["chain_id"] = bad_cid
+                with self.assertRaises(ValueError):
+                    _canonical_observation_payload(**bad_kwargs)
+
+        # Valid chain_id (int and str) are accepted
+        for valid_cid in (1, 8453, "1", "solana", "CEX_OFF_CHAIN"):
+            with self.subTest(valid_chain_id=valid_cid):
+                good_kwargs = copy.deepcopy(base_valid_kwargs)
+                good_kwargs["chain_id"] = valid_cid
+                canonical_bytes = _canonical_observation_payload(**good_kwargs)
+                self.assertIsInstance(canonical_bytes, bytes)
+
+        # 4. Optional string fields (7 fields) reject non-string / non-None types
+        optional_str_fields = (
+            "feed_id",
+            "market_id",
+            "pool_address",
+            "request_url",
+            "rpc_method",
+            "raw_payload",
+            "response_sha256",
+        )
+        invalid_opt_values = (123, True, False, 1.23, [123], {"a": 1})
+        for opt_field in optional_str_fields:
+            for bad_opt_val in invalid_opt_values:
+                with self.subTest(opt_field=opt_field, bad_opt_val=bad_opt_val):
+                    bad_kwargs = copy.deepcopy(base_valid_kwargs)
+                    bad_kwargs[opt_field] = bad_opt_val
+                    with self.assertRaises(ValueError):
+                        _canonical_observation_payload(**bad_kwargs)
+            # Verify None, "", and valid string are accepted
+            for good_opt_val in (None, "", "valid_string_value"):
+                with self.subTest(opt_field=opt_field, good_opt_val=good_opt_val):
+                    good_kwargs = copy.deepcopy(base_valid_kwargs)
+                    good_kwargs[opt_field] = good_opt_val
+                    canonical_bytes = _canonical_observation_payload(**good_kwargs)
+                    self.assertIsInstance(canonical_bytes, bytes)
+
+        # 5. http_status rejects bool, float, None, str, out-of-range (<100, >599)
+        invalid_http_statuses = (True, False, 200.0, "200", None, 0, 99, 600, 1000, -200)
+        for bad_status in invalid_http_statuses:
+            with self.subTest(bad_status=bad_status):
+                bad_kwargs = copy.deepcopy(base_valid_kwargs)
+                bad_kwargs["http_status"] = bad_status
+                with self.assertRaises(ValueError):
+                    _canonical_observation_payload(**bad_kwargs)
+
+        # Valid http_status (integers 100-599)
+        for valid_status in (100, 200, 404, 500, 599):
+            good_kwargs = copy.deepcopy(base_valid_kwargs)
+            good_kwargs["http_status"] = valid_status
+            self.assertIsInstance(_canonical_observation_payload(**good_kwargs), bytes)
+
+        # 6. price_usd rejects bool, str, None, NaN, inf, -inf, <= 0
+        invalid_prices = (True, False, "1.0", "100", None, float("nan"), float("inf"), float("-inf"), 0, 0.0, -1.0, [1.0])
+        for bad_price in invalid_prices:
+            with self.subTest(bad_price=bad_price):
+                bad_kwargs = copy.deepcopy(base_valid_kwargs)
+                bad_kwargs["price_usd"] = bad_price
+                with self.assertRaises(ValueError):
+                    _canonical_observation_payload(**bad_kwargs)
+
+        # Valid price_usd (positive finite int/float)
+        for valid_price in (1, 1.0, 0.00000001, 50000.5):
+            good_kwargs = copy.deepcopy(base_valid_kwargs)
+            good_kwargs["price_usd"] = valid_price
+            self.assertIsInstance(_canonical_observation_payload(**good_kwargs), bytes)
+
+        # 7. observation rejects non-dict non-None types
+        invalid_observations = ([1, 2], "not_a_dict", 123, True, False)
+        for bad_obs in invalid_observations:
+            with self.subTest(bad_obs=bad_obs):
+                bad_kwargs = copy.deepcopy(base_valid_kwargs)
+                bad_kwargs["observation"] = bad_obs
+                with self.assertRaises(ValueError):
+                    _canonical_observation_payload(**bad_kwargs)
+
+        # 8. Valid True and False for cryptographic_signature_verified are accepted
+        kw_t = copy.deepcopy(base_valid_kwargs)
+        kw_t["cryptographic_signature_verified"] = True
+        kw_f = copy.deepcopy(base_valid_kwargs)
+        kw_f["cryptographic_signature_verified"] = False
+        payload_t = _canonical_observation_payload(**kw_t)
+        payload_f = _canonical_observation_payload(**kw_f)
+        self.assertNotEqual(payload_t, payload_f)
+        self.assertIn(b'"cryptographic_signature_verified":true', payload_t)
+        self.assertIn(b'"cryptographic_signature_verified":false', payload_f)
 
 
 class TestLiveProviderIntegrations(unittest.TestCase):
