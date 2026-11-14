@@ -798,7 +798,7 @@ class FinalActionableGateTests(unittest.TestCase):
         }
 
     def test_exact_40_percent_and_all_evidence_pass(self):
-        result = v425.qualify_final_actionable_candidates([self.candidate], self.now, allow_mocked_transport=True)
+        result = v425.qualify_actionable_candidates_for_testing([self.candidate], self.now, _test_fixture_key=v425._TEST_FIXTURE_ISOLATION_KEY)
         self.assertEqual(len(result), 1)
         self.assertEqual(result[0]["tp_upside_pct"], 40.0)
         self.assertEqual(result[0]["trade_plan"]["tp_reference_price"], 100.0)
@@ -877,13 +877,13 @@ class FinalActionableGateTests(unittest.TestCase):
                 "maximum_tp_distance_pct": 50.0,
             },
         }
-        res_ok = v425.qualify_final_actionable_candidates([drifted_favorable], self.now, allow_mocked_transport=True)
+        res_ok = v425.qualify_actionable_candidates_for_testing([drifted_favorable], self.now, _test_fixture_key=v425._TEST_FIXTURE_ISOLATION_KEY)
         self.assertEqual(len(res_ok), 1)
         self.assertAlmostEqual(res_ok[0]["tp_upside_pct"], 47.368421, places=4)
         self.assertEqual(res_ok[0]["price"], 95.0)
 
     def test_complete_opportunity_data_and_exact_addresses(self):
-        result = v425.qualify_final_actionable_candidates([self.candidate], self.now, allow_mocked_transport=True)
+        result = v425.qualify_actionable_candidates_for_testing([self.candidate], self.now, _test_fixture_key=v425._TEST_FIXTURE_ISOLATION_KEY)
         self.assertEqual(len(result), 1)
         item = result[0]
         # Must include pair, chain, current price, TP, potential, pool address, token contract

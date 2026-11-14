@@ -168,7 +168,7 @@ class TestEngineDiagnostics:
         candidate_ok["signal_engine_executed"] = True
         candidate_ok["expected_return_engine_executed"] = True
         candidate_ok["engine_result_status"] = "SUCCESS"
-        qualified = v425.qualify_final_actionable_candidates([candidate_ok], now, allow_mocked_transport=True)
+        qualified = v425.qualify_actionable_candidates_for_testing([candidate_ok], now, _test_fixture_key=v425._TEST_FIXTURE_ISOLATION_KEY)
         assert len(qualified) == 1
 
         # 2. Verify candidate fails closed when signal engine had software failure

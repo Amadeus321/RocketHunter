@@ -1776,13 +1776,16 @@ def _update_position(position: dict[str, Any], bars: list[dict[str, Any]],
     return position
 
 
-def qualify_final_actionable_candidates(
+_TEST_FIXTURE_ISOLATION_KEY = object()
+
+
+def _qualify_actionable_candidates_core(
     candidates: list[dict[str, Any]],
     now: datetime,
     *,
-    allow_mocked_transport: bool = False,
+    _allow_mocked_transport: bool = False,
 ) -> list[dict[str, Any]]:
-    """Filter discovery rows through the deterministic production action gate."""
+    """Internal qualification logic with explicit transport gating."""
     try:
         from scripts.tp_gate import canonical_tp_upside
         from scripts.address_identity import same_address
@@ -2029,11 +2032,11 @@ def qualify_final_actionable_candidates(
                 if conv_st in conv_error_codes:
                     if not any(f"quote-asset USD conversion verification failed: {conv_st}" in b for b in sim_blockers):
                         sim_blockers.append(f"quote-asset USD conversion verification failed: {conv_st}")
-                elif not allow_mocked_transport and (tr_type == "MOCKED_TRANSPORT" or conv_st == "TEST_MOCKED_OBSERVATION_VALIDATED"):
+                elif not _allow_mocked_transport and (tr_type == "MOCKED_TRANSPORT" or conv_st == "TEST_MOCKED_OBSERVATION_VALIDATED"):
                     sim_blockers.append("quote-asset USD conversion uses MOCKED_TRANSPORT and cannot qualify for production")
                 elif sim_conv.get("provider_acquired") is not True:
                     sim_blockers.append("quote-asset USD conversion lacks genuine authenticated provider acquisition")
-                elif not allow_mocked_transport and conv_st != "PROVIDER_RESPONSE_ACQUIRED_AND_VALIDATED":
+                elif not _allow_mocked_transport and conv_st != "PROVIDER_RESPONSE_ACQUIRED_AND_VALIDATED":
                     sim_blockers.append(f"quote-asset USD conversion verification failed: {conv_st}")
 
             if sim_status in {"MISSING_QUOTE_ASSET_EVIDENCE", "QUOTE_ASSET_MISMATCH"}:
@@ -2179,7 +2182,47 @@ def qualify_final_actionable_candidates(
             entry["execution_status"] = "PASS — independently sourced buy and sell quotes"
             actionable.append(entry)
     return actionable
-    return actionable
+
+
+def qualify_final_actionable_candidates(
+    candidates: list[dict[str, Any]],
+    now: datetime,
+) -> list[dict[str, Any]]:
+    """Filter discovery rows through the deterministic production action gate.
+
+    Production entry point: strictly enforces genuine provider acquisition.
+    Mocked observations and test transports (e.g. MOCKED_TRANSPORT,
+    TEST_MOCKED_OBSERVATION_VALIDATED) are unconditionally rejected.
+    Does not accept keyword arguments, configuration flags, or candidate metadata
+    to bypass production authenticity verification.
+    """
+    return _qualify_actionable_candidates_core(
+        candidates=candidates,
+        now=now,
+        _allow_mocked_transport=False,
+    )
+
+
+def qualify_actionable_candidates_for_testing(
+    candidates: list[dict[str, Any]],
+    now: datetime,
+    *,
+    _test_fixture_key: Any,
+) -> list[dict[str, Any]]:
+    """Test-only qualification helper isolated behind a private module token.
+
+    Permits deterministic unit testing of post-conversion sizing and risk filters
+    with offline mock fixtures. Cannot be invoked or activated without the private
+    _TEST_FIXTURE_ISOLATION_KEY. Cannot be reached through production configuration,
+    environment variables, or candidate payload data.
+    """
+    if _test_fixture_key is not _TEST_FIXTURE_ISOLATION_KEY:
+        raise PermissionError("qualify_actionable_candidates_for_testing requires private _TEST_FIXTURE_ISOLATION_KEY")
+    return _qualify_actionable_candidates_core(
+        candidates=candidates,
+        now=now,
+        _allow_mocked_transport=True,
+    )
 
 
 def classify_final_candidates(candidates: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:

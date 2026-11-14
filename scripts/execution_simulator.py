@@ -1042,21 +1042,32 @@ def _canonical_observation_payload(
     response_sha256: str,
     transport_type: str,
     acquisition_method: str,
+    request_url: str = "",
+    cryptographic_signature_verified: bool = False,
+    feed_id: str | None = None,
+    market_id: str | None = None,
+    pool_address: str | None = None,
 ) -> bytes:
     canonical_dict = {
         "acquisition_method": str(acquisition_method or "").strip(),
         "chain": str(chain or "").lower().strip(),
         "chain_id": str(chain_id or "").strip(),
+        "cryptographic_signature_verified": bool(cryptographic_signature_verified),
+        "feed_id": str(feed_id or "").lower().strip(),
         "feed_or_pool_id": str(feed_or_pool_id or "").lower().strip(),
         "http_status": int(http_status or 200),
+        "market_id": str(market_id or "").strip(),
         "observation": observation or {},
         "observation_timestamp": str(observation_timestamp or "").strip(),
+        "pool_address": str(pool_address or "").lower().strip(),
         "price_usd": round(float(price_usd), 8) if price_usd is not None else 0.0,
         "provider": str(provider or "").lower().strip(),
         "provider_identifier": str(provider_identifier or "").lower().strip(),
         "quote_asset": str(quote_asset or "").lower().strip(),
+        "raw_payload": str(raw_payload or ""),
         "raw_payload_sha256": str(response_sha256 or "").lower().strip(),
         "reference_asset": str(reference_asset or "").strip().upper(),
+        "request_url": str(request_url or "").strip(),
         "retrieval_timestamp_utc": str(retrieval_timestamp_utc or "").strip(),
         "rpc_method": str(rpc_method or "").strip(),
         "transport_type": str(transport_type or "").strip(),
@@ -1067,10 +1078,29 @@ def _canonical_observation_payload(
 
 
 def _generate_provenance_token(payload_bytes: bytes) -> str:
+    """Generate an internal HMAC-SHA256 authentication token for canonical observation bytes.
+
+    SECURITY LIMITATION NOTE:
+    This token provides strictly internal in-memory anti-tampering and structural integrity
+    verification within the running Python process. It guarantees that an AcquiredProviderObservation
+    object created by genuine acquisition adapters has not been mutated or forged after creation.
+    It does NOT provide external cryptographic proof of provider origin (such as an on-chain oracle
+    signature or TLS notary proof), nor can it protect against an adversary with arbitrary in-process
+    code execution or a compromised Python runtime.
+    """
     return hmac.new(_PROVENANCE_SECRET, payload_bytes, hashlib.sha256).hexdigest()
 
 
 def _verify_provenance_token(obs: Any) -> bool:
+    """Verify internal HMAC-SHA256 authentication token for an AcquiredProviderObservation.
+
+    Validates that:
+    1. The object is a genuine AcquiredProviderObservation instance.
+    2. The object was sealed by the genuine adapter factory, not instantiated by caller code.
+    3. The internal _auth_token is present.
+    4. If raw_payload is present, its SHA-256 matches response_sha256.
+    5. The canonical bytes of all 23 security-relevant fields match the HMAC token exactly.
+    """
     if not isinstance(obs, AcquiredProviderObservation):
         return False
     if getattr(obs, "is_caller_created", False):
@@ -1187,6 +1217,11 @@ class AcquiredProviderObservation:
             response_sha256=self.response_sha256,
             transport_type=self.transport_type,
             acquisition_method=self.acquisition_method,
+            request_url=self.request_url,
+            cryptographic_signature_verified=self.cryptographic_signature_verified,
+            feed_id=self.feed_id,
+            market_id=self.market_id,
+            pool_address=self.pool_address,
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -2085,6 +2120,37 @@ def validate_quote_usd_conversion(
                     return False, "OBSERVATION_MUTATION_DETECTED", None, {
                         "reason": f"conversion dict {id_key} ({id_val}) does not match authenticated observation ({actual_obs.provider_identifier})"
                     }
+        req_url_candidate = conversion.get("request_url") or conversion.get("source_url")
+        if req_url_candidate and str(req_url_candidate).strip() != actual_obs.request_url:
+            return False, "OBSERVATION_MUTATION_DETECTED", None, {
+                "reason": f"conversion dict request_url ({req_url_candidate}) does not match authenticated observation ({actual_obs.request_url})"
+            }
+        if "rpc_method" in conversion and conversion.get("rpc_method") != actual_obs.rpc_method:
+            return False, "OBSERVATION_MUTATION_DETECTED", None, {
+                "reason": f"conversion dict rpc_method ({conversion.get('rpc_method')}) does not match authenticated observation ({actual_obs.rpc_method})"
+            }
+        if "transport_type" in conversion and str(conversion.get("transport_type")).strip() != actual_obs.transport_type:
+            return False, "OBSERVATION_MUTATION_DETECTED", None, {
+                "reason": f"conversion dict transport_type ({conversion.get('transport_type')}) does not match authenticated observation ({actual_obs.transport_type})"
+            }
+        cand_policy = conversion.get("valuation_policy") or conversion.get("policy")
+        if cand_policy and str(cand_policy).strip().upper() != actual_obs.valuation_policy.upper():
+            return False, "OBSERVATION_MUTATION_DETECTED", None, {
+                "reason": f"conversion dict valuation_policy ({cand_policy}) does not match authenticated observation ({actual_obs.valuation_policy})"
+            }
+        cand_ref = conversion.get("usd_reference_asset") or conversion.get("reference_asset") or conversion.get("usd_reference")
+        if cand_ref and str(cand_ref).strip().upper() != actual_obs.reference_asset.upper():
+            return False, "OBSERVATION_MUTATION_DETECTED", None, {
+                "reason": f"conversion dict reference_asset ({cand_ref}) does not match authenticated observation ({actual_obs.reference_asset})"
+            }
+        if "acquisition_method" in conversion and str(conversion.get("acquisition_method")).strip() != actual_obs.acquisition_method:
+            return False, "OBSERVATION_MUTATION_DETECTED", None, {
+                "reason": f"conversion dict acquisition_method ({conversion.get('acquisition_method')}) does not match authenticated observation ({actual_obs.acquisition_method})"
+            }
+        if "cryptographic_signature_verified" in conversion and bool(conversion.get("cryptographic_signature_verified")) != bool(actual_obs.cryptographic_signature_verified):
+            return False, "OBSERVATION_MUTATION_DETECTED", None, {
+                "reason": "conversion dict cryptographic_signature_verified does not match authenticated observation"
+            }
     else:
         if isinstance(conversion, dict) and conversion.get("_auth_token"):
             return False, "INVALID_PROVENANCE_SIGNATURE", None, {
@@ -2929,6 +2995,37 @@ def validate_quote_usd_conversion(
         if isinstance(conversion, dict) and "raw_payload" in conversion and str(conversion["raw_payload"]) != actual_obs.raw_payload:
             return False, "OBSERVATION_MUTATION_DETECTED", None, {
                 "reason": "conversion dict raw_payload does not match authenticated observation"
+            }
+        req_url_candidate = conversion.get("request_url") or conversion.get("source_url")
+        if req_url_candidate and str(req_url_candidate).strip() != actual_obs.request_url:
+            return False, "OBSERVATION_MUTATION_DETECTED", None, {
+                "reason": f"conversion dict request_url ({req_url_candidate}) does not match authenticated observation ({actual_obs.request_url})"
+            }
+        if "rpc_method" in conversion and conversion.get("rpc_method") != actual_obs.rpc_method:
+            return False, "OBSERVATION_MUTATION_DETECTED", None, {
+                "reason": f"conversion dict rpc_method ({conversion.get('rpc_method')}) does not match authenticated observation ({actual_obs.rpc_method})"
+            }
+        if "transport_type" in conversion and str(conversion.get("transport_type")).strip() != actual_obs.transport_type:
+            return False, "OBSERVATION_MUTATION_DETECTED", None, {
+                "reason": f"conversion dict transport_type ({conversion.get('transport_type')}) does not match authenticated observation ({actual_obs.transport_type})"
+            }
+        cand_policy = conversion.get("valuation_policy") or conversion.get("policy")
+        if cand_policy and str(cand_policy).strip().upper() != actual_obs.valuation_policy.upper():
+            return False, "OBSERVATION_MUTATION_DETECTED", None, {
+                "reason": f"conversion dict valuation_policy ({cand_policy}) does not match authenticated observation ({actual_obs.valuation_policy})"
+            }
+        cand_ref = conversion.get("usd_reference_asset") or conversion.get("reference_asset") or conversion.get("usd_reference")
+        if cand_ref and str(cand_ref).strip().upper() != actual_obs.reference_asset.upper():
+            return False, "OBSERVATION_MUTATION_DETECTED", None, {
+                "reason": f"conversion dict reference_asset ({cand_ref}) does not match authenticated observation ({actual_obs.reference_asset})"
+            }
+        if "acquisition_method" in conversion and str(conversion.get("acquisition_method")).strip() != actual_obs.acquisition_method:
+            return False, "OBSERVATION_MUTATION_DETECTED", None, {
+                "reason": f"conversion dict acquisition_method ({conversion.get('acquisition_method')}) does not match authenticated observation ({actual_obs.acquisition_method})"
+            }
+        if "cryptographic_signature_verified" in conversion and bool(conversion.get("cryptographic_signature_verified")) != bool(actual_obs.cryptographic_signature_verified):
+            return False, "OBSERVATION_MUTATION_DETECTED", None, {
+                "reason": "conversion dict cryptographic_signature_verified does not match authenticated observation"
             }
 
         transport_type_detected = actual_obs.transport_type
