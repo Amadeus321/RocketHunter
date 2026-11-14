@@ -31,6 +31,9 @@ def make_valid_trace(
     corrupt_response_ohlc: bool = False,
     corrupt_response_timestamps: bool = False,
     unparsable_response: bool = False,
+    response_http_status: Any = 200,
+    response_request_url: Any = "__DEFAULT__",
+    response_retrieved_utc: Any = "__DEFAULT__",
 ) -> dict[str, Any]:
     trace_end_dt = detection_dt + dt.timedelta(hours=duration_hours)
     retrieved_dt_str = retrieved_utc or (trace_end_dt + dt.timedelta(minutes=5)).isoformat()
@@ -122,15 +125,28 @@ def make_valid_trace(
         else:
             content_hash = hashlib.sha256(raw_body_text.encode("utf-8")).hexdigest()
 
+        req_url_val = source_ref if response_request_url == "__DEFAULT__" else response_request_url
+        resp_retrieved_val = retrieved_dt_str if response_retrieved_utc == "__DEFAULT__" else response_retrieved_utc
+
         captured_resp = {
-            "url": source_ref,
-            "request_url": source_ref,
-            "http_status": 200,
-            "retrieved_utc": retrieved_dt_str,
+            "url": req_url_val,
+            "request_url": req_url_val,
+            "http_status": response_http_status,
+            "retrieved_utc": resp_retrieved_val,
+            "retrieval_timestamp_utc": resp_retrieved_val,
             "content_hash": content_hash,
             "response_sha256": content_hash,
             "raw_body": raw_body_text,
         }
+        if response_http_status is None:
+            captured_resp.pop("http_status", None)
+            captured_resp.pop("status_code", None)
+        if response_request_url is None:
+            captured_resp.pop("request_url", None)
+            captured_resp.pop("url", None)
+        if response_retrieved_utc is None:
+            captured_resp.pop("retrieved_utc", None)
+            captured_resp.pop("retrieval_timestamp_utc", None)
 
     res_dict: dict[str, Any] = {
         "provider": provenance,
@@ -2585,3 +2601,316 @@ class TestChronologicalBacktest:
         assert audit["content_hash_verified"] is True
         assert audit["response_reconciliation_verified"] is True
         assert "not cryptographically signed" in audit["authenticity_note"]
+
+    # --- PHASE 1 FINAL RESPONSE METADATA TESTS (Regressions 86-95) ---
+
+    def test_missing_http_status_rejected(self):
+        """Regression 86: Captured response lacking explicit http_status is rejected as INVALID_RESPONSE_HTTP_STATUS."""
+        evaluator = ChronologicalBacktestEvaluator([])
+        t = dt.datetime(2026, 11, 1, 12, 0, tzinfo=dt.timezone.utc)
+        trace = make_valid_trace("dex:solana:TokenX:PoolA", t, duration_hours=24.0, mfe_pct=45.0, touch_hours=2.0, response_http_status=None)
+        item = {
+            "record_id": "rec_missing_http_status",
+            "market_key": "dex:solana:TokenX:PoolA",
+            "timestamp": t,
+            "timestamp_utc": "2026-11-01T12:00:00Z",
+            "detection_price": 1.0,
+            "raw_record": {
+                "chain": "solana",
+                "contract_address": "TokenX",
+                "pool_address": "PoolA",
+                "outcome_classification": "TARGET_REACHED",
+                "mfe_pct": 45.0,
+                "hours_to_target": 2.0,
+                "candle_trace": trace,
+            },
+        }
+        res = evaluator._resolve_outcome(item, lookup=None)
+        assert res["is_evaluated"] is False
+        assert res["outcome_classification"] in ("INVALID_RESPONSE_HTTP_STATUS", "MISSING_RESPONSE_HTTP_STATUS")
+        assert "MISSING_RESPONSE_HTTP_STATUS" in res["resolution_reason"]
+
+    def test_http_500_rejected(self):
+        """Regression 87: Captured response with HTTP 500 status code is rejected."""
+        evaluator = ChronologicalBacktestEvaluator([])
+        t = dt.datetime(2026, 11, 1, 12, 0, tzinfo=dt.timezone.utc)
+        trace = make_valid_trace("dex:solana:TokenX:PoolA", t, duration_hours=24.0, mfe_pct=45.0, touch_hours=2.0, response_http_status=500)
+        item = {
+            "record_id": "rec_http_500",
+            "market_key": "dex:solana:TokenX:PoolA",
+            "timestamp": t,
+            "timestamp_utc": "2026-11-01T12:00:00Z",
+            "detection_price": 1.0,
+            "raw_record": {
+                "chain": "solana",
+                "contract_address": "TokenX",
+                "pool_address": "PoolA",
+                "outcome_classification": "TARGET_REACHED",
+                "mfe_pct": 45.0,
+                "hours_to_target": 2.0,
+                "candle_trace": trace,
+            },
+        }
+        res = evaluator._resolve_outcome(item, lookup=None)
+        assert res["is_evaluated"] is False
+        assert res["outcome_classification"] == "INVALID_RESPONSE_HTTP_STATUS"
+        assert "500" in res["resolution_reason"]
+
+    def test_invalid_http_status_rejected(self):
+        """Regression 88: Captured response with non-integer or boolean HTTP status is rejected."""
+        evaluator = ChronologicalBacktestEvaluator([])
+        t = dt.datetime(2026, 11, 1, 12, 0, tzinfo=dt.timezone.utc)
+        # String HTTP status
+        trace1 = make_valid_trace("dex:solana:TokenX:PoolA", t, duration_hours=24.0, mfe_pct=45.0, touch_hours=2.0, response_http_status="200_OK")
+        item1 = {
+            "record_id": "rec_invalid_http_str",
+            "market_key": "dex:solana:TokenX:PoolA",
+            "timestamp": t,
+            "timestamp_utc": "2026-11-01T12:00:00Z",
+            "detection_price": 1.0,
+            "raw_record": {
+                "chain": "solana",
+                "contract_address": "TokenX",
+                "pool_address": "PoolA",
+                "outcome_classification": "TARGET_REACHED",
+                "mfe_pct": 45.0,
+                "hours_to_target": 2.0,
+                "candle_trace": trace1,
+            },
+        }
+        res1 = evaluator._resolve_outcome(item1, lookup=None)
+        assert res1["is_evaluated"] is False
+        assert res1["outcome_classification"] == "INVALID_RESPONSE_HTTP_STATUS"
+
+        # Boolean HTTP status (True is subclass of int)
+        trace2 = make_valid_trace("dex:solana:TokenX:PoolA", t, duration_hours=24.0, mfe_pct=45.0, touch_hours=2.0, response_http_status=True)
+        item2 = {
+            "record_id": "rec_invalid_http_bool",
+            "market_key": "dex:solana:TokenX:PoolA",
+            "timestamp": t,
+            "timestamp_utc": "2026-11-01T12:00:00Z",
+            "detection_price": 1.0,
+            "raw_record": {
+                "chain": "solana",
+                "contract_address": "TokenX",
+                "pool_address": "PoolA",
+                "outcome_classification": "TARGET_REACHED",
+                "mfe_pct": 45.0,
+                "hours_to_target": 2.0,
+                "candle_trace": trace2,
+            },
+        }
+        res2 = evaluator._resolve_outcome(item2, lookup=None)
+        assert res2["is_evaluated"] is False
+        assert res2["outcome_classification"] == "INVALID_RESPONSE_HTTP_STATUS"
+
+    def test_missing_request_url_rejected(self):
+        """Regression 89: Captured response missing request_url is rejected as MISSING_RESPONSE_REQUEST_URL."""
+        evaluator = ChronologicalBacktestEvaluator([])
+        t = dt.datetime(2026, 11, 1, 12, 0, tzinfo=dt.timezone.utc)
+        trace = make_valid_trace("dex:solana:TokenX:PoolA", t, duration_hours=24.0, mfe_pct=45.0, touch_hours=2.0, response_request_url=None)
+        item = {
+            "record_id": "rec_missing_req_url",
+            "market_key": "dex:solana:TokenX:PoolA",
+            "timestamp": t,
+            "timestamp_utc": "2026-11-01T12:00:00Z",
+            "detection_price": 1.0,
+            "raw_record": {
+                "chain": "solana",
+                "contract_address": "TokenX",
+                "pool_address": "PoolA",
+                "outcome_classification": "TARGET_REACHED",
+                "mfe_pct": 45.0,
+                "hours_to_target": 2.0,
+                "candle_trace": trace,
+            },
+        }
+        res = evaluator._resolve_outcome(item, lookup=None)
+        assert res["is_evaluated"] is False
+        assert res["outcome_classification"] == "MISSING_RESPONSE_REQUEST_URL"
+
+    def test_request_url_from_different_provider_rejected(self):
+        """Regression 90: Captured response with request_url belonging to a different provider is rejected."""
+        evaluator = ChronologicalBacktestEvaluator([])
+        t = dt.datetime(2026, 11, 1, 12, 0, tzinfo=dt.timezone.utc)
+        trace = make_valid_trace(
+            "dex:solana:TokenX:PoolA",
+            t,
+            duration_hours=24.0,
+            mfe_pct=45.0,
+            touch_hours=2.0,
+            provenance="geckoterminal",
+            response_request_url="https://api.binance.com/api/v3/klines",
+        )
+        item = {
+            "record_id": "rec_req_url_diff_prov",
+            "market_key": "dex:solana:TokenX:PoolA",
+            "timestamp": t,
+            "timestamp_utc": "2026-11-01T12:00:00Z",
+            "detection_price": 1.0,
+            "raw_record": {
+                "chain": "solana",
+                "contract_address": "TokenX",
+                "pool_address": "PoolA",
+                "outcome_classification": "TARGET_REACHED",
+                "mfe_pct": 45.0,
+                "hours_to_target": 2.0,
+                "candle_trace": trace,
+            },
+        }
+        res = evaluator._resolve_outcome(item, lookup=None)
+        assert res["is_evaluated"] is False
+        assert res["outcome_classification"] in ("RESPONSE_URL_PROVIDER_MISMATCH", "INVALID_RESPONSE_REQUEST_URL")
+
+    def test_request_url_domain_mismatch_rejected(self):
+        """Regression 91: Captured response request_url domain conflicting with source_ref domain is rejected."""
+        evaluator = ChronologicalBacktestEvaluator([])
+        t = dt.datetime(2026, 11, 1, 12, 0, tzinfo=dt.timezone.utc)
+        trace = make_valid_trace(
+            "dex:solana:TokenX:PoolA",
+            t,
+            duration_hours=24.0,
+            mfe_pct=45.0,
+            touch_hours=2.0,
+            provenance="geckoterminal",
+            source_ref="https://api.geckoterminal.com/api/v2/networks/solana/pools/PoolA/ohlcv/hour",
+            response_request_url="https://geckoterminal.com/api/v2/networks/solana/pools/PoolA/ohlcv/hour",
+        )
+        item = {
+            "record_id": "rec_req_url_domain_mismatch",
+            "market_key": "dex:solana:TokenX:PoolA",
+            "timestamp": t,
+            "timestamp_utc": "2026-11-01T12:00:00Z",
+            "detection_price": 1.0,
+            "raw_record": {
+                "chain": "solana",
+                "contract_address": "TokenX",
+                "pool_address": "PoolA",
+                "outcome_classification": "TARGET_REACHED",
+                "mfe_pct": 45.0,
+                "hours_to_target": 2.0,
+                "candle_trace": trace,
+            },
+        }
+        res = evaluator._resolve_outcome(item, lookup=None)
+        assert res["is_evaluated"] is False
+        assert res["outcome_classification"] == "RESPONSE_URL_DOMAIN_MISMATCH"
+
+    def test_missing_response_retrieval_timestamp_rejected(self):
+        """Regression 92: Captured response lacking retrieval_timestamp_utc is rejected."""
+        evaluator = ChronologicalBacktestEvaluator([])
+        t = dt.datetime(2026, 11, 1, 12, 0, tzinfo=dt.timezone.utc)
+        trace = make_valid_trace("dex:solana:TokenX:PoolA", t, duration_hours=24.0, mfe_pct=45.0, touch_hours=2.0, response_retrieved_utc=None)
+        item = {
+            "record_id": "rec_missing_resp_retrieval_ts",
+            "market_key": "dex:solana:TokenX:PoolA",
+            "timestamp": t,
+            "timestamp_utc": "2026-11-01T12:00:00Z",
+            "detection_price": 1.0,
+            "raw_record": {
+                "chain": "solana",
+                "contract_address": "TokenX",
+                "pool_address": "PoolA",
+                "outcome_classification": "TARGET_REACHED",
+                "mfe_pct": 45.0,
+                "hours_to_target": 2.0,
+                "candle_trace": trace,
+            },
+        }
+        res = evaluator._resolve_outcome(item, lookup=None)
+        assert res["is_evaluated"] is False
+        assert res["outcome_classification"] == "MISSING_RESPONSE_RETRIEVAL_TIMESTAMP"
+
+    def test_invalid_response_retrieval_timestamp_rejected(self):
+        """Regression 93: Captured response with unparseable or naive retrieval_timestamp_utc is rejected."""
+        evaluator = ChronologicalBacktestEvaluator([])
+        t = dt.datetime(2026, 11, 1, 12, 0, tzinfo=dt.timezone.utc)
+        trace = make_valid_trace("dex:solana:TokenX:PoolA", t, duration_hours=24.0, mfe_pct=45.0, touch_hours=2.0, response_retrieved_utc="not-a-valid-utc-date")
+        item = {
+            "record_id": "rec_invalid_resp_retrieval_ts",
+            "market_key": "dex:solana:TokenX:PoolA",
+            "timestamp": t,
+            "timestamp_utc": "2026-11-01T12:00:00Z",
+            "detection_price": 1.0,
+            "raw_record": {
+                "chain": "solana",
+                "contract_address": "TokenX",
+                "pool_address": "PoolA",
+                "outcome_classification": "TARGET_REACHED",
+                "mfe_pct": 45.0,
+                "hours_to_target": 2.0,
+                "candle_trace": trace,
+            },
+        }
+        res = evaluator._resolve_outcome(item, lookup=None)
+        assert res["is_evaluated"] is False
+        assert res["outcome_classification"] == "INVALID_RESPONSE_RETRIEVAL_TIMESTAMP"
+
+    def test_future_response_retrieval_timestamp_rejected(self):
+        """Regression 94: Captured response with future retrieval timestamp relative to UTC now is rejected."""
+        evaluator = ChronologicalBacktestEvaluator([])
+        t = dt.datetime(2026, 11, 1, 12, 0, tzinfo=dt.timezone.utc)
+        trace = make_valid_trace("dex:solana:TokenX:PoolA", t, duration_hours=24.0, mfe_pct=45.0, touch_hours=2.0, response_retrieved_utc="2099-01-01T00:00:00Z")
+        item = {
+            "record_id": "rec_future_resp_retrieval_ts",
+            "market_key": "dex:solana:TokenX:PoolA",
+            "timestamp": t,
+            "timestamp_utc": "2026-11-01T12:00:00Z",
+            "detection_price": 1.0,
+            "raw_record": {
+                "chain": "solana",
+                "contract_address": "TokenX",
+                "pool_address": "PoolA",
+                "outcome_classification": "TARGET_REACHED",
+                "mfe_pct": 45.0,
+                "hours_to_target": 2.0,
+                "candle_trace": trace,
+            },
+        }
+        res = evaluator._resolve_outcome(item, lookup=None)
+        assert res["is_evaluated"] is False
+        assert res["outcome_classification"] == "FUTURE_RESPONSE_RETRIEVAL_TIMESTAMP"
+
+    def test_valid_response_metadata_accepted(self):
+        """Regression 95: Complete and valid response metadata (explicit HTTP 200, matching URL, valid UTC retrieval timestamp) is accepted."""
+        evaluator = ChronologicalBacktestEvaluator([])
+        t = dt.datetime(2026, 11, 1, 12, 0, tzinfo=dt.timezone.utc)
+        trace = make_valid_trace(
+            "dex:solana:TokenX:PoolA",
+            t,
+            duration_hours=24.0,
+            mfe_pct=46.0,
+            touch_hours=3.0,
+            provenance="geckoterminal",
+            source_ref="https://api.geckoterminal.com/api/v2/networks/solana/pools/PoolA/ohlcv/hour",
+            response_http_status=200,
+            response_request_url="https://api.geckoterminal.com/api/v2/networks/solana/pools/PoolA/ohlcv/hour",
+            response_retrieved_utc=(t + dt.timedelta(hours=24, minutes=5)).isoformat(),
+        )
+        item = {
+            "record_id": "rec_valid_metadata_accepted",
+            "market_key": "dex:solana:TokenX:PoolA",
+            "timestamp": t,
+            "timestamp_utc": "2026-11-01T12:00:00Z",
+            "detection_price": 1.0,
+            "raw_record": {
+                "chain": "solana",
+                "contract_address": "TokenX",
+                "pool_address": "PoolA",
+                "outcome_classification": "TARGET_REACHED",
+                "mfe_pct": 46.0,
+                "hours_to_target": 3.0,
+                "candle_trace": trace,
+            },
+        }
+        res = evaluator._resolve_outcome(item, lookup=None)
+        assert res["is_evaluated"] is True
+        assert res["target_reached"] is True
+        assert res["hours_to_target"] == 3.0
+        audit = res["evidence_audit"]
+        assert audit["evidence_level"] == "PROVIDER_ATTRIBUTED_INGESTION_AUDITED"
+        assert audit["http_status"] == 200
+        assert audit["request_url"] == "https://api.geckoterminal.com/api/v2/networks/solana/pools/PoolA/ohlcv/hour"
+        assert audit["response_retrieval_utc"] == (t + dt.timedelta(hours=24, minutes=5)).isoformat()
+        assert audit["content_hash_verified"] is True
+        assert audit["response_reconciliation_verified"] is True

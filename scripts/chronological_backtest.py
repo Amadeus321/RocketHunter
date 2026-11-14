@@ -100,7 +100,7 @@ CANDLE_TRACE_SCHEMA = {
         "captured_response",   # immutable captured provider HTTP response evidence
     ],
     "candle_fields": ["timestamp_utc", "open", "high", "low", "close"],
-    "response_evidence_fields": ["request_url", "http_status", "content_hash", "raw_body"],
+    "response_evidence_fields": ["request_url", "http_status", "content_hash", "raw_body", "retrieval_timestamp_utc"],
     "recognized_providers": sorted(RECOGNIZED_TRACE_PROVIDERS),
     "provider_domain_allowlist": {k: sorted(v) for k, v in PROVIDER_DOMAIN_ALLOWLIST.items()},
     "recognized_intervals": list(CANDLE_INTERVAL_SECONDS.keys()),
@@ -1417,7 +1417,7 @@ class ChronologicalBacktestEvaluator:
                     "execution_net_return_pct": None,
                 }, None
 
-        # 13. Verifiable Source-Response Evidence Reconciliation & Content Hashing (Fail-Closed)
+        # 13. Verifiable Source-Response Evidence Reconciliation & Metadata Validation (Fail-Closed)
         captured_resp = (
             trace.get("captured_response")
             or trace.get("response_evidence")
@@ -1440,6 +1440,235 @@ class ChronologicalBacktestEvaluator:
                 "execution_net_return_pct": None,
             }, None
 
+        # 13a. Validate captured response HTTP status (must be explicit integer, strictly 200)
+        raw_status = (
+            captured_resp.get("http_status")
+            if "http_status" in captured_resp
+            else captured_resp.get("status_code")
+        )
+        if raw_status is None:
+            self.diagnostics["unresolved_outcomes"] += 1
+            return False, {
+                "outcome_classification": "INVALID_RESPONSE_HTTP_STATUS",
+                "target_reached": None,
+                "market_target_reached": None,
+                "mfe_pct": mfe_pct,
+                "mae_pct": None,
+                "hours_to_target": None,
+                "is_evaluated": False,
+                "resolution_reason": "INVALID_RESPONSE_HTTP_STATUS: MISSING_RESPONSE_HTTP_STATUS captured response lacks explicit integer http_status",
+                "execution_status": exec_status,
+                "execution_net_return_pct": None,
+            }, None
+
+        if not isinstance(raw_status, int) or isinstance(raw_status, bool):
+            self.diagnostics["unresolved_outcomes"] += 1
+            return False, {
+                "outcome_classification": "INVALID_RESPONSE_HTTP_STATUS",
+                "target_reached": None,
+                "market_target_reached": None,
+                "mfe_pct": mfe_pct,
+                "mae_pct": None,
+                "hours_to_target": None,
+                "is_evaluated": False,
+                "resolution_reason": f"INVALID_RESPONSE_HTTP_STATUS: http_status must be an integer, got {type(raw_status).__name__} ({raw_status!r})",
+                "execution_status": exec_status,
+                "execution_net_return_pct": None,
+            }, None
+
+        if raw_status != 200:
+            self.diagnostics["unresolved_outcomes"] += 1
+            return False, {
+                "outcome_classification": "INVALID_RESPONSE_HTTP_STATUS",
+                "target_reached": None,
+                "market_target_reached": None,
+                "mfe_pct": mfe_pct,
+                "mae_pct": None,
+                "hours_to_target": None,
+                "is_evaluated": False,
+                "resolution_reason": f"INVALID_RESPONSE_HTTP_STATUS: HTTP {raw_status} rejected; only HTTP 200 is accepted",
+                "execution_status": exec_status,
+                "execution_net_return_pct": None,
+            }, None
+
+        resp_status = raw_status
+
+        # 13b. Validate captured request URL
+        raw_req_url = (
+            captured_resp.get("request_url")
+            if "request_url" in captured_resp
+            else captured_resp.get("url")
+        )
+        if not raw_req_url or not isinstance(raw_req_url, str) or not raw_req_url.strip():
+            self.diagnostics["unresolved_outcomes"] += 1
+            return False, {
+                "outcome_classification": "MISSING_RESPONSE_REQUEST_URL",
+                "target_reached": None,
+                "market_target_reached": None,
+                "mfe_pct": mfe_pct,
+                "mae_pct": None,
+                "hours_to_target": None,
+                "is_evaluated": False,
+                "resolution_reason": "MISSING_RESPONSE_REQUEST_URL: captured response lacks explicit request_url",
+                "execution_status": exec_status,
+                "execution_net_return_pct": None,
+            }, None
+
+        resp_url = raw_req_url.strip()
+        req_domain = extract_source_domain(resp_url)
+        if not req_domain:
+            self.diagnostics["unresolved_outcomes"] += 1
+            return False, {
+                "outcome_classification": "INVALID_RESPONSE_REQUEST_URL",
+                "target_reached": None,
+                "market_target_reached": None,
+                "mfe_pct": mfe_pct,
+                "mae_pct": None,
+                "hours_to_target": None,
+                "is_evaluated": False,
+                "resolution_reason": f"INVALID_RESPONSE_REQUEST_URL: cannot extract valid hostname/domain from request_url '{resp_url}'",
+                "execution_status": exec_status,
+                "execution_net_return_pct": None,
+            }, None
+
+        is_req_domain_valid, req_domain_status = validate_provider_source_domain(norm_prov, req_domain)
+        if not is_req_domain_valid:
+            self.diagnostics["unresolved_outcomes"] += 1
+            if req_domain_status == "PROVIDER_DOMAIN_MISMATCH":
+                return False, {
+                    "outcome_classification": "RESPONSE_URL_PROVIDER_MISMATCH",
+                    "target_reached": None,
+                    "market_target_reached": None,
+                    "mfe_pct": mfe_pct,
+                    "mae_pct": None,
+                    "hours_to_target": None,
+                    "is_evaluated": False,
+                    "resolution_reason": f"RESPONSE_URL_PROVIDER_MISMATCH: request_url domain '{req_domain}' belongs to a different provider than '{norm_prov}'",
+                    "execution_status": exec_status,
+                    "execution_net_return_pct": None,
+                }, None
+            else:
+                return False, {
+                    "outcome_classification": "INVALID_RESPONSE_REQUEST_URL",
+                    "target_reached": None,
+                    "market_target_reached": None,
+                    "mfe_pct": mfe_pct,
+                    "mae_pct": None,
+                    "hours_to_target": None,
+                    "is_evaluated": False,
+                    "resolution_reason": f"INVALID_RESPONSE_REQUEST_URL: request_url domain '{req_domain}' not approved for provider '{norm_prov}'",
+                    "execution_status": exec_status,
+                    "execution_net_return_pct": None,
+                }, None
+
+        if req_domain != source_domain:
+            self.diagnostics["unresolved_outcomes"] += 1
+            return False, {
+                "outcome_classification": "RESPONSE_URL_DOMAIN_MISMATCH",
+                "target_reached": None,
+                "market_target_reached": None,
+                "mfe_pct": mfe_pct,
+                "mae_pct": None,
+                "hours_to_target": None,
+                "is_evaluated": False,
+                "resolution_reason": f"RESPONSE_URL_DOMAIN_MISMATCH: request_url domain '{req_domain}' conflicts with source_ref domain '{source_domain}'",
+                "execution_status": exec_status,
+                "execution_net_return_pct": None,
+            }, None
+
+        # 13c. Validate response retrieval time
+        raw_resp_retrieved = (
+            captured_resp.get("retrieval_timestamp_utc")
+            if "retrieval_timestamp_utc" in captured_resp
+            else (captured_resp.get("retrieved_utc") if "retrieved_utc" in captured_resp else captured_resp.get("retrieved_at"))
+        )
+        if not raw_resp_retrieved or not isinstance(raw_resp_retrieved, str) or not raw_resp_retrieved.strip():
+            self.diagnostics["unresolved_outcomes"] += 1
+            return False, {
+                "outcome_classification": "MISSING_RESPONSE_RETRIEVAL_TIMESTAMP",
+                "target_reached": None,
+                "market_target_reached": None,
+                "mfe_pct": mfe_pct,
+                "mae_pct": None,
+                "hours_to_target": None,
+                "is_evaluated": False,
+                "resolution_reason": "MISSING_RESPONSE_RETRIEVAL_TIMESTAMP: captured response lacks retrieval_timestamp_utc",
+                "execution_status": exec_status,
+                "execution_net_return_pct": None,
+            }, None
+
+        resp_retrieved_dt = _parse_utc(raw_resp_retrieved)
+        if resp_retrieved_dt is None:
+            self.diagnostics["unresolved_outcomes"] += 1
+            return False, {
+                "outcome_classification": "INVALID_RESPONSE_RETRIEVAL_TIMESTAMP",
+                "target_reached": None,
+                "market_target_reached": None,
+                "mfe_pct": mfe_pct,
+                "mae_pct": None,
+                "hours_to_target": None,
+                "is_evaluated": False,
+                "resolution_reason": f"INVALID_RESPONSE_RETRIEVAL_TIMESTAMP: retrieval_timestamp_utc '{raw_resp_retrieved}' is invalid or timezone-naive",
+                "execution_status": exec_status,
+                "execution_net_return_pct": None,
+            }, None
+
+        now_utc = dt.datetime.now(dt.timezone.utc)
+        if resp_retrieved_dt > (now_utc + dt.timedelta(minutes=15)):
+            self.diagnostics["unresolved_outcomes"] += 1
+            return False, {
+                "outcome_classification": "FUTURE_RESPONSE_RETRIEVAL_TIMESTAMP",
+                "target_reached": None,
+                "market_target_reached": None,
+                "mfe_pct": mfe_pct,
+                "mae_pct": None,
+                "hours_to_target": None,
+                "is_evaluated": False,
+                "resolution_reason": f"FUTURE_RESPONSE_RETRIEVAL_TIMESTAMP: retrieval timestamp {resp_retrieved_dt.isoformat()} is in the future relative to current time {now_utc.isoformat()}",
+                "execution_status": exec_status,
+                "execution_net_return_pct": None,
+            }, None
+
+        retrieval_tolerance_s = 300.0  # Documented 5-minute tolerance
+        if abs((resp_retrieved_dt - retrieved_dt).total_seconds()) > retrieval_tolerance_s:
+            self.diagnostics["unresolved_outcomes"] += 1
+            return False, {
+                "outcome_classification": "RESPONSE_RETRIEVAL_TIME_MISMATCH",
+                "target_reached": None,
+                "market_target_reached": None,
+                "mfe_pct": mfe_pct,
+                "mae_pct": None,
+                "hours_to_target": None,
+                "is_evaluated": False,
+                "resolution_reason": (
+                    f"RESPONSE_RETRIEVAL_TIME_MISMATCH: captured response retrieval time {resp_retrieved_dt.isoformat()} "
+                    f"differs from trace retrieval time {retrieved_dt.isoformat()} by "
+                    f"{abs((resp_retrieved_dt - retrieved_dt).total_seconds()):.1f}s (tolerance: {retrieval_tolerance_s:.1f}s)"
+                ),
+                "execution_status": exec_status,
+                "execution_net_return_pct": None,
+            }, None
+
+        if sorted_candles and sorted_candles[-1]["dt"] > resp_retrieved_dt:
+            max_c_dt = sorted_candles[-1]["dt"]
+            self.diagnostics["unresolved_outcomes"] += 1
+            return False, {
+                "outcome_classification": "CANDLE_TIMESTAMP_EXCEEDS_RETRIEVAL_TIME",
+                "target_reached": None,
+                "market_target_reached": None,
+                "mfe_pct": mfe_pct,
+                "mae_pct": None,
+                "hours_to_target": None,
+                "is_evaluated": False,
+                "resolution_reason": (
+                    f"CANDLE_TIMESTAMP_EXCEEDS_RETRIEVAL_TIME: candle at {max_c_dt.isoformat()} "
+                    f"is later than captured response retrieval time {resp_retrieved_dt.isoformat()}"
+                ),
+                "execution_status": exec_status,
+                "execution_net_return_pct": None,
+            }, None
+
+        # 13d. Reconcile captured response payload and content hash (fail-closed)
         raw_body = (
             captured_resp.get("raw_body")
             if "raw_body" in captured_resp
@@ -1450,8 +1679,6 @@ class ChronologicalBacktestEvaluator:
             or captured_resp.get("response_sha256")
             or captured_resp.get("hash")
         )
-        resp_url = captured_resp.get("request_url") or captured_resp.get("url") or source_ref
-        resp_status = captured_resp.get("http_status") or captured_resp.get("status_code") or 200
 
         if raw_body is None or declared_hash is None or not str(declared_hash).strip():
             self.diagnostics["unresolved_outcomes"] += 1
@@ -1748,6 +1975,7 @@ class ChronologicalBacktestEvaluator:
             "content_hash_verified": True,
             "response_reconciliation_verified": True,
             "retrieved_utc": raw_retrieved,
+            "response_retrieval_utc": raw_resp_retrieved,
             "provider_metadata": trace.get("provider_metadata") or trace.get("metadata") or trace.get("raw_response_metadata"),
         }
 
@@ -2078,10 +2306,12 @@ class ChronologicalBacktestEvaluator:
             "content_hash_verified": trace_info.get("content_hash_verified") if trace_info else False,
             "response_reconciliation_verified": trace_info.get("response_reconciliation_verified") if trace_info else False,
             "retrieved_utc": trace_info.get("retrieved_utc") if trace_info else None,
+            "response_retrieval_utc": trace_info.get("response_retrieval_utc") if trace_info else None,
             "provider_metadata": trace_info.get("provider_metadata") if trace_info else None,
             "authenticity_note": (
                 "Evidence is provider-attributed and ingestion-audited via captured HTTP response "
-                "reconciliation and SHA-256 content hashing. It is not cryptographically signed."
+                "reconciliation and SHA-256 content hashing. The SHA-256 digest proves content integrity "
+                "relative to the captured body, not provider origin. It is not cryptographically signed."
             ),
         }
         return {
