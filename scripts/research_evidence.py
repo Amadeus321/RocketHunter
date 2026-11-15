@@ -1127,14 +1127,14 @@ class DatasetAReconciliationEngine:
         cost_basis_remaining = round(entry.quote_expenditure - allocated_exp, 6)
 
         # 6. Provenance classification:
-        # Until receipt bytes/logs are independently fetched or cryptographically validated
-        # against a trusted chain source, classify the result strictly as unverified USER_REPORTED_EXECUTION.
-        if entry_receipt.is_trusted_chain_validated and exit_receipt.is_trusted_chain_validated:
-            status = EvidenceTier.INDEPENDENTLY_VERIFIED_EXECUTION
-            contributes = True
-        else:
-            status = EvidenceTier.USER_REPORTED_EXECUTION
-            contributes = False
+        # Checking caller-supplied boolean flags or digests does not authenticate the chain source.
+        # Until receipt bytes and state logs are independently fetched or cryptographically validated
+        # by the engine against an authenticated, trusted chain client/node, all caller-supplied
+        # receipts remain strictly classified as USER_REPORTED_EXECUTION and are excluded from verified P/L
+        # (contributes_to_verified_pl = False). Even if a receipt asserts is_trusted_chain_validated=True,
+        # it cannot promote to INDEPENDENTLY_VERIFIED_EXECUTION.
+        status = EvidenceTier.USER_REPORTED_EXECUTION
+        contributes = False
 
         return ReconciledTrancheOutcome(
             status=status,

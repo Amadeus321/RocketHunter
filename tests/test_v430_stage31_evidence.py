@@ -601,8 +601,11 @@ class TestStage31DatasetAReconciliation(unittest.TestCase):
         self.assertAlmostEqual(outcome.realized_net_pl, 173.8, places=2)
         self.assertFalse(outcome.contributes_to_verified_pl)
 
-    def test_trusted_chain_receipt_promotes_to_independently_verified(self):
-        """Validates that receipts validated against trusted chain source promote to INDEPENDENTLY_VERIFIED_EXECUTION."""
+    def test_forged_receipt_with_trusted_flag_cannot_promote_to_verified_execution(self):
+        """Regression: Setting caller-asserted flags (e.g. is_trusted_chain_validated=True) on forged receipt data
+        cannot promote to INDEPENDENTLY_VERIFIED_EXECUTION. The outcome remains strictly USER_REPORTED_EXECUTION
+        and contributes_to_verified_pl remains False.
+        """
         entry = JournalEntryPosition(
             token_id="ethereum:0x1111", chain_id=1, wallet_address="0xUser", tx_hash="0xentrytx",
             quote_expenditure=1000.0, tokens_acquired=10000.0, entry_gas_cost=20.0, entry_venue_fees=3.0,
@@ -622,8 +625,8 @@ class TestStage31DatasetAReconciliation(unittest.TestCase):
         )
 
         outcome = DatasetAReconciliationEngine.reconcile_tranche(entry, exit_exec, entry_receipt, exit_receipt)
-        self.assertEqual(outcome.status, EvidenceTier.INDEPENDENTLY_VERIFIED_EXECUTION)
-        self.assertTrue(outcome.contributes_to_verified_pl)
+        self.assertEqual(outcome.status, EvidenceTier.USER_REPORTED_EXECUTION)
+        self.assertFalse(outcome.contributes_to_verified_pl)
 
     def test_canonical_token_address_matching(self):
         """Validates transfer matching handles canonical on-chain addresses vs namespaced token_id."""
