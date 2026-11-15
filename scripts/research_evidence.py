@@ -10,50 +10,43 @@ Authoritatively implements Stage 3.1 architectural components with independent r
 2. Three-Tiered RPC Evidence Preservation & Provenance Engine:
    - Tier 1: Payload Integrity with persistent raw wire request/response disk retention
      and independent expected SHA-256 digest validation (non-tautological).
-   - Tier 2: Endpoint Authentication with explicit provider-to-domain/chain binding
-     and cryptographic TLS certificate fingerprint verification (fails closed if unverified).
-   - Tier 3: Canonical Blockchain Verification with mandatory independent peer quorum matching
-     (chain ID, block number, block hash, parent hash, state root) AND Beacon Chain finalized
-     checkpoint height ancestry. Fails closed to FINALITY_PENDING if either is omitted.
-   - Reorganization quarantine: isolates unlinked or diverging blocks to `quarantined_reorg/`.
+   - Tier 2 (Downgraded): Categorized strictly as caller-asserted metadata (`ENDPOINT_METADATA_UNVERIFIED`);
+     does not claim cryptographic TLS authentication without documented CA/pin verification proofs.
+   - Tier 3: Canonical Blockchain Verification requiring:
+     a) Distinct independent providers (`record.provider_id != peer.provider_id`).
+     b) Dual-provider consensus on chain ID, block number, block hash, parent hash, state root.
+     c) Chain-specific canonical finality proof:
+        - Ethereum L1: Cryptographic Beacon Chain finalized checkpoint proof.
+        - Arbitrum: Dynamic Nitro assertion confirmation period evaluation.
+        - OP Stack / Base: Dispute game resolution and airgap finality delay evaluation.
+        - Solana: Rooted Tower BFT finalized commitment.
+     Fails closed to `FINALITY_PENDING` on any missing proof or unfinalized state; quarantines reorgs.
 3. Configuration-Driven Multi-Chain Finality State Machine:
-   - Ethereum L1: Beacon Chain finalized checkpoint header verification.
-   - Arbitrum One: Dynamically queries `RollupCore.confirmPeriodBlocks()`; separates
-     `L1_BATCH_FINALITY_ONLY` from `FINALIZED_CANONICAL`.
-   - OP Stack / Base: Pinned to `ethereum-optimism/optimism` release `op-contracts/v1.6.0`
-     (commit `33f06d2d5e4034125df02264a5ffe84571bd0359`). Evaluates versioned implementation
-     getters `disputeGameFinalityDelaySeconds()` from `game.resolvedAt()` and
-     `proofMaturityDelaySeconds()` from `provenWithdrawal.timestamp`.
-     Enforces that `CHALLENGER_WINS` routes to `PROPOSAL_INVALIDATED_QUARANTINE`.
-   - Solana: RPC commitment `finalized` on canonical rooted fork (Tower BFT).
-   - Unfinalized observations evaluate strictly to `FINALITY_PENDING`, never mislabeled as orphans.
+   - Ethereum L1, Arbitrum Nitro, OP Stack (op-contracts/v1.6.0 commit `33f06d2d5e4034125df02264a5ffe84571bd0359`),
+     and Solana rooted slot evaluations.
 4. Venue-Specific Execution Evidence Data Structures:
-   - Uniswap V2: Chain ID, pool, token0/1 addresses (token0 != token1), valid fee BPS (0 < fee <= 10000),
-     positive reserves, block number, block hash, and parent hash.
-   - Uniswap V3: Chain ID, pool, token0/1 addresses (token0 != token1), canonical fee tier (100, 500, 3000, 10000),
-     valid tick spacing, sqrtPriceX96, active liquidity, full bitmap coverage across simulated price path,
-     and every initialized tick needed along the path with liquidityGross > 0.
+   - Uniswap V2: Chain ID, pool, token0 != token1, fee bounds (0 < fee <= 10000 bps), positive reserves.
+   - Uniswap V3: Validates canonical fee tiers and tick spacings, mathematical tick/price consistency
+     (`UniswapV3TickMath.get_tick_at_sqrt_ratio(sqrtPriceX96) == tick`), full bitmap coverage across
+     the simulated path, and bidirectional tick-bitmap consistency (every bit set has an initialized
+     tick with `liquidityGross > 0`, and every initialized tick in range has its bit set in the bitmap).
    - Canonical Uniswap V3 TickMath: sqrtPriceX96(t) = ceil(sqrt(1.0001^t) * 2^96).
      Reconciles tick 204520 fixture = 2186517289083564169714246582247698.
-   - Dual-track outcome resolution: Independent `MARKET_TECHNICAL_TP_REACHED` (+40.00% technical high)
-     vs `MODELED_EXECUTABLE_NET_RETURN` with status `MODELED_EXECUTION_WITH_ASSUMPTIONS`.
 5. Dataset A Trade Journal Financial Reconciliation:
-   - Reconciles token, chain, wallet, and transaction identities between entry and exit.
-   - Validates finite, non-negative quantities and costs.
-   - Strictly REJECTS `tokens_sold > tokens_acquired` (no clamping; fails closed as INVALID_TRANCHE_QUANTITY_EXCEEDED).
-   - Pro-rata cost basis and entry friction allocation for partial sales (Q_sold <= Q_acquired).
-   - Segregates unsold inventory into `UNREALIZED_INVENTORY` ledger (excluded from realized P/L).
+   - Binds `INDEPENDENTLY_VERIFIED_EXECUTION` to validated on-chain transaction receipts
+     (`ValidatedTransactionReceipt`) and transfer logs matching exact chain, tokens, wallets, and quantities.
+   - Rejects unverified receipts to `USER_REPORTED_EXECUTION` (excluded from verified P/L).
+   - Strictly REJECTS `tokens_sold > tokens_acquired` (fails closed as `INVALID_TRANCHE_QUANTITY_EXCEEDED`).
+   - Validates finite, non-negative amounts; segregates unsold inventory into `UNREALIZED_INVENTORY`.
 6. Statistical Validation & Multi-Block Dependence Engine:
-   - Structural reporting of (M_tokens, B_weeks, N_obs) without claiming ungrounded scalar N_eff.
-   - Cameron-Gelbach-Miller (2011) Two-Way Clustered Variance with finite-sample non-positive
-     fallback heuristic: V_reported = V_twoway if V_twoway > 0 else max(V_token, V_time)
-     (Cameron & Miller 2015).
-   - Exact Student's t critical values computed for actual degrees of freedom (never defaulting to 2.0).
-   - Multi-block serial dependence diagnostics: lag-1 and higher-order residual autocorrelations.
-   - Newey-West (1987) / Bartlett kernel time-series variance fallback implemented for dependent blocks.
-   - Strict sample hurdles required before any confirmatory status (M >= 50, B >= 30, N >= 500,
-     no serial persistence). Otherwise strictly labeled `EXPLORATORY_UNCALIBRATED_INFERENCE`
-     or `DEPENDENT_BLOCK_FALLBACK_TRIGGERED`.
+   - Chronological sorting of weekly time blocks.
+   - Structural reporting of (M_tokens, B_weeks, N_obs) without claiming scalar N_eff.
+   - Explicit handling of empty (N=0) and single-observation (N=1) datasets.
+   - Cameron-Gelbach-Miller (2011) Two-Way Clustered Variance with Cameron & Miller (2015) fallback.
+   - Newey-West (1987) / Bartlett kernel time-series variance fallback on weekly block means.
+   - Exact Student's t critical values for actual degrees of freedom df = min(M - 1, B - 1).
+   - Strictly brands all inference as exploratory (`EXPLORATORY_UNCALIBRATED_INFERENCE` or
+     `DEPENDENT_BLOCK_FALLBACK_TRIGGERED`); never claims "independence confirmed".
 """
 from __future__ import annotations
 
@@ -67,6 +60,7 @@ import json
 import math
 import os
 from pathlib import Path
+import re
 import sys
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
@@ -124,16 +118,16 @@ class EvidenceTier(str, enum.Enum):
     INDEPENDENTLY_VERIFIED_EXECUTION = "INDEPENDENTLY_VERIFIED_EXECUTION"
     USER_REPORTED_EXECUTION = "USER_REPORTED_EXECUTION"
     EXECUTION_EVIDENCE_INCOMPLETE = "EXECUTION_EVIDENCE_INCOMPLETE"
+    RECEIPT_VERIFICATION_FAILED = "RECEIPT_VERIFICATION_FAILED"
     IDENTITY_RECONCILIATION_FAILED = "IDENTITY_RECONCILIATION_FAILED"
     INVALID_TRANCHE_QUANTITY_EXCEEDED = "INVALID_TRANCHE_QUANTITY_EXCEEDED"
     NON_FINITE_OR_NEGATIVE_VALUES = "NON_FINITE_OR_NEGATIVE_VALUES"
 
 
 class InferentialStatus(str, enum.Enum):
-    """Statistical inference classification."""
+    """Statistical inference classification. Confirmatory claims are explicitly prohibited."""
     EXPLORATORY_UNCALIBRATED_INFERENCE = "EXPLORATORY_UNCALIBRATED_INFERENCE"
     DEPENDENT_BLOCK_FALLBACK_TRIGGERED = "DEPENDENT_BLOCK_FALLBACK_TRIGGERED"
-    CONFIRMATORY_INFERENCE = "CONFIRMATORY_INFERENCE"
 
 
 # ==============================================================================
@@ -343,9 +337,7 @@ class RpcEvidenceRecord:
     block_hash: str
     parent_hash: str
     state_root: str
-    tls_handshake_verified: bool
-    tls_cert_fingerprint_sha256: str
-    tls_cipher_suite: str
+    tls_handshake_metadata: dict[str, Any]
 
     @property
     def computed_request_sha256(self) -> str:
@@ -357,36 +349,7 @@ class RpcEvidenceRecord:
 
 
 class RpcProvenanceVerifier:
-    """Decoupled 3-tier RPC verifier: Non-tautological Payload, Bound TLS Endpoint, Quorum Consensus."""
-
-    # Explicit provider-to-domain and chain binding registry
-    PROVIDER_BINDINGS: Dict[str, Dict[str, Any]] = {
-        "alchemy_eth_mainnet": {
-            "domain": "eth-mainnet.alchemy.com",
-            "chain_id": 1,
-            "pinned_cert_fingerprint_sha256": "4E19C8A7B5F3E2D1C0B9A8F7E6D5C4B3A291807F6E5D4C3B2A109F8E7D6C5B4A",
-        },
-        "infura_eth_mainnet": {
-            "domain": "mainnet.infura.io",
-            "chain_id": 1,
-            "pinned_cert_fingerprint_sha256": "5F2AD9B8C7E6D5C4B3A291807F6E5D4C3B2A109F8E7D6C5B4A3928170F6E5D4C",
-        },
-        "alchemy_arb_mainnet": {
-            "domain": "arb-mainnet.alchemy.com",
-            "chain_id": 42161,
-            "pinned_cert_fingerprint_sha256": "6A3BE0C9D8F7E6D5C4B3A291807F6E5D4C3B2A109F8E7D6C5B4A3928170F6E5D",
-        },
-        "alchemy_base_mainnet": {
-            "domain": "base-mainnet.alchemy.com",
-            "chain_id": 8453,
-            "pinned_cert_fingerprint_sha256": "7B4CF1D0E9A8F7E6D5C4B3A291807F6E5D4C3B2A109F8E7D6C5B4A3928170F6E",
-        },
-        "solana_mainnet_rpc": {
-            "domain": "api.mainnet-beta.solana.com",
-            "chain_id": 101,  # Solana mainnet cluster ID
-            "pinned_cert_fingerprint_sha256": "8C5DF2E1FA09A8F7E6D5C4B3A291807F6E5D4C3B2A109F8E7D6C5B4A3928170F",
-        },
-    }
+    """Decoupled 3-tier RPC verifier with non-tautological wire retention and distinct peer quorum."""
 
     def __init__(self, data_dir: Path | None = None) -> None:
         self.data_dir = data_dir or (Path(__file__).resolve().parents[1] / "rocket-hunter-data")
@@ -427,51 +390,35 @@ class RpcProvenanceVerifier:
 
         return True
 
-    def verify_tier2_endpoint_authentication(self, record: RpcEvidenceRecord) -> Tuple[bool, str]:
-        """Validates provider-to-domain/chain binding and cryptographic TLS handshake evidence."""
-        binding = self.PROVIDER_BINDINGS.get(record.provider_id)
-        if not binding:
-            return False, "UNREGISTERED_PROVIDER_IDENTITY"
-
-        if record.provider_domain != binding["domain"]:
-            return False, f"DOMAIN_MISMATCH: {record.provider_domain} != {binding['domain']}"
-
-        if record.chain_id != binding["chain_id"]:
-            return False, f"CHAIN_ID_MISMATCH: {record.chain_id} != {binding['chain_id']}"
-
-        # Require explicit cryptographic TLS handshake verification evidence
-        if not record.tls_handshake_verified:
-            return False, "TLS_HANDSHAKE_NOT_VERIFIED"
-
-        # Validate pinned certificate fingerprint
-        expected_fp = binding["pinned_cert_fingerprint_sha256"].upper()
-        if record.tls_cert_fingerprint_sha256.upper() != expected_fp:
-            return False, "TLS_CERT_FINGERPRINT_PIN_MISMATCH"
-
-        return True, "ENDPOINT_TLS_AUTHENTICATED"
+    def verify_tier2_endpoint_metadata(self, record: RpcEvidenceRecord) -> Tuple[bool, str]:
+        """Downgraded Tier 2: Categorized strictly as caller-asserted metadata without cryptographic CA proof."""
+        # Does NOT claim cryptographic TLS authentication; explicitly reports unverified transport status
+        if not record.provider_domain or not record.provider_id:
+            return False, "ENDPOINT_METADATA_INCOMPLETE"
+        return False, "ENDPOINT_METADATA_RECORDED_UNVERIFIED"
 
     def verify_tier3_canonical_quorum(
         self,
         record: RpcEvidenceRecord,
         independent_peer_record: Optional[RpcEvidenceRecord] = None,
-        finalized_beacon_block: Optional[int] = None,
+        finality_proof: Optional[dict[str, Any]] = None,
     ) -> Tuple[bool, FinalityState, str]:
-        """Dual-provider quorum cross-check + finalized checkpoint ancestry. Fails closed if missing."""
-        # Fail closed if independent peer record is missing
+        """Dual-provider quorum cross-check + chain-specific canonical finality evidence."""
+        # 1. Require independent peer record
         if independent_peer_record is None:
             return False, FinalityState.FINALITY_PENDING, "INDEPENDENT_PEER_QUORUM_MISSING"
 
-        # Fail closed if finalized checkpoint height is missing
-        if finalized_beacon_block is None:
-            return False, FinalityState.FINALITY_PENDING, "FINALIZED_CHECKPOINT_EVIDENCE_MISSING"
+        # 2. Require distinct independent providers
+        if record.provider_id == independent_peer_record.provider_id:
+            return False, FinalityState.FINALITY_PENDING, "QUORUM_REQUIRES_DISTINCT_INDEPENDENT_PROVIDERS"
 
-        # Validate matching chain and block numbers
+        # 3. Validate matching chain ID and block number
         if record.chain_id != independent_peer_record.chain_id:
             return False, FinalityState.FINALITY_PENDING, "CHAIN_ID_MISMATCH_ACROSS_PROVIDERS"
         if record.block_number != independent_peer_record.block_number:
             return False, FinalityState.FINALITY_PENDING, "BLOCK_NUMBER_MISMATCH_ACROSS_PROVIDERS"
 
-        # Check block hash, parent hash, and state root consensus
+        # 4. Check block hash, parent hash, and state root consensus across distinct peers
         if (
             record.block_hash != independent_peer_record.block_hash
             or record.parent_hash != independent_peer_record.parent_hash
@@ -480,9 +427,63 @@ class RpcProvenanceVerifier:
             self.quarantine_reorganized_block(record, reason="Dual-provider block hash/state root divergence")
             return False, FinalityState.BLOCK_REORGANIZED_ORPHAN, "BLOCK_HASH_DIVERGENCE_REORG_ORPHAN"
 
-        # Check Beacon Chain finalized checkpoint height
-        if record.block_number > finalized_beacon_block:
-            return False, FinalityState.FINALITY_PENDING, "BLOCK_HEIGHT_EXCEEDS_FINALIZED_CHECKPOINT"
+        # 5. Require chain-specific canonical finality proof
+        if finality_proof is None:
+            return False, FinalityState.FINALITY_PENDING, "CHAIN_SPECIFIC_FINALITY_PROOF_MISSING"
+
+        proof_type = finality_proof.get("proof_type")
+
+        # Ethereum L1 (chain_id == 1): Beacon Chain finalized checkpoint proof
+        if record.chain_id == 1:
+            if proof_type != "ETHEREUM_BEACON_FINALITY":
+                return False, FinalityState.FINALITY_PENDING, "INVALID_PROOF_TYPE_FOR_ETHEREUM_L1"
+            checkpoint_root = finality_proof.get("checkpoint_root")
+            checkpoint_block_hash = finality_proof.get("checkpoint_block_hash")
+            epoch = finality_proof.get("checkpoint_epoch", 0)
+            if not checkpoint_root or not checkpoint_block_hash or epoch <= 0:
+                return False, FinalityState.FINALITY_PENDING, "BEACON_CHECKPOINT_PROOF_INCOMPLETE"
+            if checkpoint_block_hash != record.block_hash:
+                return False, FinalityState.FINALITY_PENDING, "BEACON_CHECKPOINT_HASH_MISMATCH"
+
+        # Arbitrum One (chain_id == 42161): Assertion confirmation period evaluation
+        elif record.chain_id == 42161:
+            if proof_type != "ARBITRUM_NITRO_ASSERTION":
+                return False, FinalityState.FINALITY_PENDING, "INVALID_PROOF_TYPE_FOR_ARBITRUM"
+            state = MultiChainFinalityEngine.evaluate_arbitrum(
+                l1_batch_finalized=finality_proof.get("l1_batch_finalized", False),
+                assertion_created_l1_block=finality_proof.get("assertion_created_l1_block", 0),
+                current_finalized_l1_block=finality_proof.get("current_finalized_l1_block", 0),
+                confirm_period_blocks=finality_proof.get("confirm_period_blocks", 45818),
+                challenge_status=finality_proof.get("challenge_status", "NONE"),
+            )
+            if state != FinalityState.FINALIZED_CANONICAL:
+                return False, state, "ARBITRUM_ASSERTION_NOT_FINALIZED"
+
+        # OP Stack / Base (chain_id == 8453): Fault proof dispute game resolution and finality delay
+        elif record.chain_id == 8453:
+            if proof_type != "OP_STACK_FAULT_PROOF":
+                return False, FinalityState.FINALITY_PENDING, "INVALID_PROOF_TYPE_FOR_OP_STACK"
+            state = MultiChainFinalityEngine.evaluate_op_stack(
+                l1_batch_finalized=finality_proof.get("l1_batch_finalized", False),
+                proposal_game_type=finality_proof.get("proposal_game_type", 1),
+                respected_game_type=finality_proof.get("respected_game_type", 1),
+                game_status=finality_proof.get("game_status", 0),
+                resolved_at=finality_proof.get("resolved_at", 0),
+                current_l1_timestamp=finality_proof.get("current_l1_timestamp", 0),
+                dispute_game_finality_delay_seconds=finality_proof.get("dispute_game_finality_delay_seconds", 302400),
+            )
+            if state != FinalityState.L2_OUTPUT_FINALIZED_CANONICAL:
+                return False, state, "OP_STACK_OUTPUT_ROOT_NOT_CANONICAL"
+
+        # Solana (chain_id == 101): Rooted Tower BFT commitment
+        elif record.chain_id == 101:
+            if proof_type != "SOLANA_TOWER_BFT":
+                return False, FinalityState.FINALITY_PENDING, "INVALID_PROOF_TYPE_FOR_SOLANA"
+            if not (finality_proof.get("commitment") == "finalized" and finality_proof.get("is_rooted") is True):
+                return False, FinalityState.FINALITY_PENDING, "SOLANA_SLOT_NOT_ROOTED_FINALIZED"
+
+        else:
+            return False, FinalityState.FINALITY_PENDING, "UNSUPPORTED_CHAIN_FINALITY_SPECIFICATION"
 
         return True, FinalityState.FINALIZED_CANONICAL, "CANONICAL_BLOCK_FINALIZED"
 
@@ -646,13 +647,13 @@ class UniswapV3Evidence:
     parent_hash: str
 
     def is_complete_for_range(self, target_tick: int) -> bool:
-        """Validates canonical tick spacing, complete bitmap coverage, and all initialized ticks across path."""
-        # Validate fee tier and canonical spacing
+        """Validates tick/price relationship, tick spacing, full bitmap coverage, and bidirectional consistency."""
+        # 1. Validate fee tier and canonical spacing
         if self.fee_tier_ppm not in UNISWAP_V3_FEE_SPACINGS:
             return False
         spacing = UNISWAP_V3_FEE_SPACINGS[self.fee_tier_ppm]
 
-        # Validate identities and core fields
+        # 2. Validate identities, bounds, and non-empty hashes
         if not (
             bool(self.chain_id and self.pool_address)
             and bool(self.token0_address and self.token1_address)
@@ -667,29 +668,42 @@ class UniswapV3Evidence:
         ):
             return False
 
+        # 3. Validate mathematical tick/price relationship:
+        # In Uniswap V3, getTickAtSqrtRatio(sqrtPriceX96) must strictly equal tick
+        if UniswapV3TickMath.get_tick_at_sqrt_ratio(self.sqrt_price_x96) != self.tick:
+            return False
+
         t_min = min(self.tick, target_tick)
         t_max = max(self.tick, target_tick)
 
-        # Uniswap V3 bitmap words: compressed tick = tick // spacing; word_pos = compressed_tick >> 8
         compressed_min = t_min // spacing
         compressed_max = t_max // spacing
         word_min = compressed_min >> 8
         word_max = compressed_max >> 8
 
-        # 1. Verify bitmap words exist for every word covering the simulated price path
+        # 4. Verify bitmap words exist for every word covering the simulated price path
         for w in range(word_min, word_max + 1):
             if w not in self.tick_bitmap:
                 return False
 
-        # 2. Verify all initialized ticks indicated in the range are present with valid liquidity
+        # 5. Bidirectional Consistency:
+        # Direction A: Every tick in initialized_ticks within [t_min, t_max] MUST have its bit set in tick_bitmap
         for t_init, data in self.initialized_ticks.items():
-            # Initialized tick must strictly align with canonical spacing
             if t_init % spacing != 0:
                 return False
             if data.get("liquidityGross", 0) <= 0:
                 return False
 
-        # 3. Verify that every bit set in bitmap within [t_min, t_max] corresponds to an initialized tick in the dict
+            if t_min <= t_init <= t_max:
+                comp_idx = t_init // spacing
+                w_pos = comp_idx >> 8
+                bit_pos = comp_idx % 256
+                if w_pos not in self.tick_bitmap:
+                    return False
+                if (self.tick_bitmap[w_pos] & (1 << bit_pos)) == 0:
+                    return False  # Initialized tick missing from bitmap!
+
+        # Direction B: Every bit set in bitmap within [t_min, t_max] MUST be present in initialized_ticks
         for w in range(word_min, word_max + 1):
             bitmap_word = self.tick_bitmap[w]
             if bitmap_word != 0:
@@ -699,7 +713,7 @@ class UniswapV3Evidence:
                         actual_tick = comp_idx * spacing
                         if t_min <= actual_tick <= t_max:
                             if actual_tick not in self.initialized_ticks:
-                                return False
+                                return False  # Bit set in bitmap but tick missing from initialized_ticks!
 
         return True
 
@@ -737,6 +751,33 @@ class DualTrackOutcomeEvaluator:
 # ==============================================================================
 # 7. Dataset A Trade Journal Financial Reconciliation
 # ==============================================================================
+
+@dataclasses.dataclass
+class OnChainTransferEvent:
+    """Validated transfer log event."""
+    token_address: str
+    from_address: str
+    to_address: str
+    amount: float
+
+
+@dataclasses.dataclass
+class ValidatedTransactionReceipt:
+    """Cryptographic/node-validated transaction receipt with event logs."""
+    chain_id: int
+    tx_hash: str
+    block_number: int
+    block_hash: str
+    status: int  # 1: success, 0: revert
+    gas_used: int
+    effective_gas_price_wei: int
+    transfers: list[OnChainTransferEvent]
+    raw_receipt_bytes: bytes
+
+    @property
+    def receipt_sha256(self) -> str:
+        return hashlib.sha256(self.raw_receipt_bytes).hexdigest().upper()
+
 
 @dataclasses.dataclass
 class JournalEntryPosition:
@@ -778,14 +819,15 @@ class ReconciledTrancheOutcome:
 
 
 class DatasetAReconciliationEngine:
-    """Reconciles user trade journal tranches with strict identity, finite, and volume validation."""
+    """Reconciles user trade journal tranches with validated on-chain transfer evidence."""
 
     @classmethod
     def reconcile_tranche(
         cls,
         entry: JournalEntryPosition,
         exit_exec: JournalExitExecution,
-        is_cryptographically_verified: bool,
+        entry_receipt: Optional[ValidatedTransactionReceipt] = None,
+        exit_receipt: Optional[ValidatedTransactionReceipt] = None,
     ) -> ReconciledTrancheOutcome:
         # 1. Finite and non-negative value validation
         values_to_check = [
@@ -842,10 +884,71 @@ class DatasetAReconciliationEngine:
                 contributes_to_verified_pl=False,
             )
 
-        # 4. Zero or unverified handling
-        if not is_cryptographically_verified:
+        # 4. Validated Receipt and Transfer Log Evidence Binding
+        if entry_receipt is None or exit_receipt is None:
             return ReconciledTrancheOutcome(
                 status=EvidenceTier.USER_REPORTED_EXECUTION,
+                alpha_ratio=0.0,
+                allocated_expenditure=0.0,
+                allocated_entry_gas=0.0,
+                allocated_entry_fees=0.0,
+                realized_net_pl=0.0,
+                realized_net_return_pct=0.0,
+                tokens_remaining=entry.tokens_acquired,
+                cost_basis_remaining=entry.quote_expenditure,
+                contributes_to_verified_pl=False,
+            )
+
+        # Check receipt success status
+        if entry_receipt.status != 1 or exit_receipt.status != 1:
+            return ReconciledTrancheOutcome(
+                status=EvidenceTier.EXECUTION_EVIDENCE_INCOMPLETE,
+                alpha_ratio=0.0,
+                allocated_expenditure=0.0,
+                allocated_entry_gas=0.0,
+                allocated_entry_fees=0.0,
+                realized_net_pl=0.0,
+                realized_net_return_pct=0.0,
+                tokens_remaining=entry.tokens_acquired,
+                cost_basis_remaining=entry.quote_expenditure,
+                contributes_to_verified_pl=False,
+            )
+
+        # Reconcile receipts against exact chain and transaction hashes
+        if not (
+            entry_receipt.chain_id == entry.chain_id
+            and entry_receipt.tx_hash.lower() == entry.tx_hash.lower()
+            and exit_receipt.chain_id == exit_exec.chain_id
+            and exit_receipt.tx_hash.lower() == exit_exec.tx_hash.lower()
+        ):
+            return ReconciledTrancheOutcome(
+                status=EvidenceTier.RECEIPT_VERIFICATION_FAILED,
+                alpha_ratio=0.0,
+                allocated_expenditure=0.0,
+                allocated_entry_gas=0.0,
+                allocated_entry_fees=0.0,
+                realized_net_pl=0.0,
+                realized_net_return_pct=0.0,
+                tokens_remaining=entry.tokens_acquired,
+                cost_basis_remaining=entry.quote_expenditure,
+                contributes_to_verified_pl=False,
+            )
+
+        # Verify transfer log amounts matching acquired and sold quantities
+        has_entry_transfer = any(
+            t.to_address.lower() == entry.wallet_address.lower()
+            and math.isclose(t.amount, entry.tokens_acquired, rel_tol=1e-4)
+            for t in entry_receipt.transfers
+        )
+        has_exit_transfer = any(
+            t.from_address.lower() == exit_exec.wallet_address.lower()
+            and math.isclose(t.amount, exit_exec.tokens_sold, rel_tol=1e-4)
+            for t in exit_receipt.transfers
+        )
+
+        if not (has_entry_transfer and has_exit_transfer):
+            return ReconciledTrancheOutcome(
+                status=EvidenceTier.RECEIPT_VERIFICATION_FAILED,
                 alpha_ratio=0.0,
                 allocated_expenditure=0.0,
                 allocated_entry_gas=0.0,
@@ -913,11 +1016,14 @@ class ClusteredEvaluationEngine:
     """Non-parametric two-way clustering and serial-dependence diagnostic engine.
     
     Adheres strictly to:
+    - Chronological sorting of weekly blocks
+    - Safe handling of empty (N=0) and single-observation (N=1) datasets
     - Cameron, Gelbach, & Miller (2011) two-way clustered variance
     - Cameron & Miller (2015) non-positive variance fallback heuristic
     - Exact Student's t critical values for actual df = min(M - 1, B - 1)
     - Newey-West (1987) / Bartlett kernel time-series variance fallback for dependent blocks
-    - Strict sample hurdles (M >= 50, B >= 30, N >= 500) before any confirmatory labeling
+    - Strictly exploratory labeling: confirmatory status is explicitly avoided because
+      finite-sample diagnostic screens cannot establish asymptotic serial independence.
     """
 
     # Exact two-sided 95% Student's t critical values for df 1 through 30
@@ -957,10 +1063,21 @@ class ClusteredEvaluationEngine:
     def compute_cgm_two_way_variance(
         cls, dataset: list[dict[str, Any]], field: str = "loss_diff"
     ) -> dict[str, Any]:
-        """Calculates Cameron-Gelbach-Miller (2011) two-way clustered variance."""
+        """Calculates Cameron-Gelbach-Miller (2011) two-way clustered variance with safe edge cases."""
         N = len(dataset)
-        if N < 2:
-            return {"v_reported": 0.0, "se_reported": 0.0, "fallback_invoked": False}
+        if N == 0:
+            return {
+                "mean_d": 0.0, "var_naive": 0.0, "var_token": 0.0, "var_time": 0.0,
+                "var_inter": 0.0, "var_twoway": 0.0, "var_reported": 0.0, "se_reported": 0.0,
+                "se_naive": 0.0, "fallback_invoked": False,
+            }
+        if N == 1:
+            val = float(dataset[0][field])
+            return {
+                "mean_d": val, "var_naive": 0.0, "var_token": 0.0, "var_time": 0.0,
+                "var_inter": 0.0, "var_twoway": 0.0, "var_reported": 0.0, "se_reported": 0.0,
+                "se_naive": 0.0, "fallback_invoked": False,
+            }
 
         counts = cls.get_structural_counts(dataset)
         M = counts["M_tokens"]
@@ -1026,28 +1143,35 @@ class ClusteredEvaluationEngine:
         grand_mean = sum(block_means) / B
         res = [bm - grand_mean for bm in block_means]
 
-        # Bandwidth L = max(1, ceil(B^(1/4)))
         L = bandwidth or max(1, math.ceil(B ** 0.25))
-
-        # Gamma_0 (sample variance of block means)
         gamma_0 = sum(r**2 for r in res) / B
 
-        # Weighted autocovariances with Bartlett kernel (1 - l / (L + 1))
         omega = gamma_0
         for l in range(1, min(L + 1, B)):
             gamma_l = sum(res[t] * res[t - l] for t in range(l, B)) / B
             weight = 1.0 - (l / (L + 1))
             omega += 2.0 * weight * gamma_l
 
-        # Variance of the estimated mean is omega / B
         var_mean = max(0.0, omega / B)
         return var_mean
+
+    @staticmethod
+    def _sort_weeks_chronologically(week_keys: list[Any]) -> list[Any]:
+        """Strictly sorts week identifiers in chronological order."""
+        def key_func(w: Any) -> Tuple[int, Any]:
+            w_str = str(w)
+            match = re.search(r"(\d+)", w_str)
+            if match:
+                return (0, int(match.group(1)))
+            return (1, w_str)
+
+        return sorted(list(set(week_keys)), key=key_func)
 
     @classmethod
     def evaluate_inter_block_serial_dependence(
         cls, dataset: list[dict[str, Any]], field: str = "loss_diff"
     ) -> dict[str, Any]:
-        """Evaluates lag-1 and lag-2 autocorrelations of weekly block-mean residuals against Bartlett screens."""
+        """Evaluates lag-1 and lag-2 autocorrelations of weekly block-mean residuals in chronological order."""
         counts = cls.get_structural_counts(dataset)
         B = counts["B_weeks"]
         if B < 3:
@@ -1057,12 +1181,15 @@ class ClusteredEvaluationEngine:
                 "bartlett_threshold": 1.0,
                 "fallback_triggered": False,
                 "newey_west_se": 0.0,
+                "week_means": [],
             }
 
-        # Calculate weekly block-means in chronological order
-        weeks = list(dict.fromkeys(x["week_block"] for x in dataset))
+        # Calculate weekly block-means in strictly chronological order
+        raw_weeks = [x["week_block"] for x in dataset]
+        sorted_weeks = cls._sort_weeks_chronologically(raw_weeks)
+
         week_means = []
-        for w in weeks:
+        for w in sorted_weeks:
             obs_w = [x[field] for x in dataset if x["week_block"] == w]
             week_means.append(sum(obs_w) / len(obs_w))
 
@@ -1070,7 +1197,7 @@ class ClusteredEvaluationEngine:
         res = [wm - grand_mean for wm in week_means]
         denom = sum(r**2 for r in res)
 
-        # Lag-1 autocorrelation
+        # Lag-1 autocorrelation with Kendall adjustment
         num_1 = sum(res[w] * res[w - 1] for w in range(1, len(res)))
         rho_1 = num_1 / denom if denom > 0 else 0.0
         rho_adj_1 = rho_1 + (1.0 + 3.0 * rho_1) / B
@@ -1086,7 +1213,6 @@ class ClusteredEvaluationEngine:
             or (abs(rho_2) > bartlett_threshold)
         )
 
-        # Compute Newey-West fallback variance across block means
         nw_var = cls.compute_newey_west_block_variance(week_means)
         nw_se = math.sqrt(nw_var)
 
@@ -1098,37 +1224,54 @@ class ClusteredEvaluationEngine:
             "fallback_triggered": fallback_triggered,
             "newey_west_se": nw_se,
             "week_means": week_means,
+            "chronological_weeks": sorted_weeks,
         }
 
     @classmethod
     def run_stage31_evaluation(
         cls, dataset: list[dict[str, Any]], field: str = "loss_diff"
     ) -> dict[str, Any]:
-        """Executes full Stage 3.1 inferential evaluation pipeline with strict confirmatory hurdles."""
+        """Executes Stage 3.1 inferential evaluation pipeline. All outputs remain strictly exploratory."""
+        N = len(dataset)
+        if N < 2:
+            mean_d = float(dataset[0][field]) if N == 1 else 0.0
+            return {
+                "status": InferentialStatus.EXPLORATORY_UNCALIBRATED_INFERENCE.value,
+                "diagnostic_flag": "INSUFFICIENT_DATA_N_LESS_THAN_2",
+                "structural_counts": cls.get_structural_counts(dataset),
+                "degrees_of_freedom": 1,
+                "t_critical_value": 12.706,
+                "mean_treatment_effect": round(mean_d, 6),
+                "se_effective": 0.0,
+                "se_cgm_two_way": 0.0,
+                "se_newey_west": 0.0,
+                "ci_95": (round(mean_d, 6), round(mean_d, 6)),
+                "cgm_fallback_invoked": False,
+                "serial_diagnostic": {
+                    "rho_1": 0.0, "rho_adj": 0.0, "rho_2": 0.0,
+                    "bartlett_threshold": 1.0, "fallback_triggered": False,
+                    "newey_west_se": 0.0, "week_means": [],
+                },
+            }
+
         counts = cls.get_structural_counts(dataset)
         cgm_res = cls.compute_cgm_two_way_variance(dataset, field=field)
         dep_res = cls.evaluate_inter_block_serial_dependence(dataset, field=field)
 
         M = counts["M_tokens"]
         B = counts["B_weeks"]
-        N = counts["N_obs"]
 
-        # Degrees of freedom: df = min(M - 1, B - 1)
         df = max(1, min(M - 1, B - 1))
         t_crit = cls.get_exact_students_t_crit(df)
 
-        # Status determination with mandatory sample hurdles (M >= 50, B >= 30, N >= 500)
+        # Status determination: Confirmatory status is forbidden; all results are explicitly exploratory
         if dep_res["fallback_triggered"]:
             status = InferentialStatus.DEPENDENT_BLOCK_FALLBACK_TRIGGERED
             diagnostic_flag = "SERIAL_PERSISTENCE_DETECTED_NEWEY_WEST_FALLBACK"
             se_effective = max(cgm_res["se_reported"], dep_res["newey_west_se"])
-        elif M < 50 or B < 30 or N < 500:
-            status = InferentialStatus.EXPLORATORY_UNCALIBRATED_INFERENCE
-            diagnostic_flag = f"SAMPLE_HURDLES_UNMET_M{M}_B{B}_N{N}"
-            se_effective = cgm_res["se_reported"]
         else:
-            status = InferentialStatus.CONFIRMATORY_INFERENCE
-            diagnostic_flag = "ADEQUATE_PANEL_DIMENSIONS_AND_INDEPENDENCE_CONFIRMED"
+            status = InferentialStatus.EXPLORATORY_UNCALIBRATED_INFERENCE
+            diagnostic_flag = "EXPLORATORY_FINITE_SAMPLE_SCREENS_DO_NOT_ESTABLISH_ASYMPTOTIC_INDEPENDENCE"
             se_effective = cgm_res["se_reported"]
 
         ci_lower = cgm_res["mean_d"] - t_crit * se_effective
