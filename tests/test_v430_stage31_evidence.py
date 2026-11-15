@@ -904,6 +904,39 @@ class TestStage31ClusteredStatisticalInference(unittest.TestCase):
         self.assertTrue("INVALID_OR_MIXED_WEEK_FORMAT_CANNOT_ESTIMATE_DEPENDENCE" in eval_res["diagnostic_flag"])
         self.assertEqual(eval_res["se_newey_west"], 0.0)
 
+    def test_invalid_iso_week_53_fails_closed_without_raising(self):
+        """Regression: 2021 has only 52 ISO weeks; 2021-W53 must return ('INVALID', None)
+        and the dataset validator must fail closed rather than raising ValueError from date.fromisocalendar().
+        """
+        # Direct parsing
+        fmt, idx = ClusteredEvaluationEngine.classify_and_parse_week("2021-W53")
+        self.assertEqual(fmt, "INVALID")
+        self.assertIsNone(idx)
+
+        # Contrast with a valid ISO week 53 year (e.g. 2020 has 53 ISO weeks)
+        fmt_2020, idx_2020 = ClusteredEvaluationEngine.classify_and_parse_week("2020-W53")
+        self.assertEqual(fmt_2020, "ISO_CALENDAR")
+        self.assertIsNotNone(idx_2020)
+
+        # Dataset validator regression: must fail closed rather than raising ValueError
+        dataset_invalid_week53 = [
+            {"token_id": "T0", "week_block": "2021-W52", "loss_diff": 0.1},
+            {"token_id": "T0", "week_block": "2021-W53", "loss_diff": 0.2},
+            {"token_id": "T0", "week_block": "2022-W01", "loss_diff": 0.3},
+        ]
+        is_valid, fmt_fam, blocks, reason = ClusteredEvaluationEngine.validate_and_classify_dataset_weeks(
+            [x["week_block"] for x in dataset_invalid_week53]
+        )
+        self.assertFalse(is_valid)
+        self.assertEqual(fmt_fam, "INVALID")
+        self.assertTrue("2021-W53" in reason)
+
+        # Full pipeline evaluation handles safely
+        diag = ClusteredEvaluationEngine.evaluate_inter_block_serial_dependence(dataset_invalid_week53, field="loss_diff")
+        self.assertFalse(diag["is_valid_format"])
+        self.assertEqual(diag["rho_1"], 0.0)
+        self.assertEqual(diag["rho_2"], 0.0)
+
     def test_same_week_alias_normalization_and_grouping(self):
         """Validates that labels referring to the same calendar week (e.g. 2026-W01 and 2026-01-01)
         are grouped by parsed week index and do not inflate B_weeks or distort week means.

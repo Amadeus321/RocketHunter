@@ -1314,7 +1314,10 @@ class ClusteredEvaluationEngine:
             year = int(iso_week_match.group(1))
             week = int(iso_week_match.group(2))
             if 1 <= week <= 53:
-                return "ISO_CALENDAR", dt.date.fromisocalendar(year, week, 1).toordinal() // 7
+                try:
+                    return "ISO_CALENDAR", dt.date.fromisocalendar(year, week, 1).toordinal() // 7
+                except (ValueError, OverflowError):
+                    return "INVALID", None
             return "INVALID", None
 
         # 2. ISO calendar date: YYYY-MM-DD
