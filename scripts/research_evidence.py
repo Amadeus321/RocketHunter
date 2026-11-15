@@ -1099,7 +1099,16 @@ class UniswapV2SwapSimulator:
         """Calculates Uniswap V2 integer getAmountOut.
         Returns (success, amount_out, effective_price, price_impact_pct, new_reserve_in, new_reserve_out).
         """
-        if reserve_in <= 0 or reserve_out <= 0 or amount_in <= 0:
+        if not isinstance(fee_bps, int) or fee_bps < 0 or fee_bps >= 10000:
+            return False, 0, 0.0, 0.0, reserve_in, reserve_out
+        if (
+            not isinstance(reserve_in, int)
+            or not isinstance(reserve_out, int)
+            or not isinstance(amount_in, int)
+            or reserve_in <= 0
+            or reserve_out <= 0
+            or amount_in <= 0
+        ):
             return False, 0, 0.0, 0.0, reserve_in, reserve_out
 
         amount_in_with_fee = amount_in * (10000 - fee_bps)
@@ -1144,82 +1153,179 @@ class UniswapV2SwapSimulator:
           100 * (reserve_quote - quote_out) * reserve_token <= 98 * reserve_quote * (reserve_token + token_in).
           token_in_minus_2pct = token_in.
           D_bid = quote_out (actual quote proceeds yielded by the swap).
+
+        Returns:
+          - On success:
+              {
+                  "status": "RESOLVED",
+                  "d_ask_plus_2pct": d_ask,
+                  "d_bid_minus_2pct": d_bid,
+                  "token_in_minus_2pct": token_in,
+                  "is_depth_complete": True,
+                  "reason": "OK",
+              }
+          - On invalid reserves/fee or unreachable/zero-output boundary:
+              {
+                  "status": DualTrackTargetStatus.MODELED_DEPTH_UNRESOLVED.value,
+                  "d_ask_plus_2pct": None,
+                  "d_bid_minus_2pct": None,
+                  "token_in_minus_2pct": None,
+                  "is_depth_complete": False,
+                  "reason": <diagnostic string>,
+              }
         """
-        if reserve_quote <= 0 or reserve_token <= 0:
-            return {"d_ask_plus_2pct": 0, "d_bid_minus_2pct": 0, "token_in_minus_2pct": 0}
+        if (
+            not isinstance(reserve_quote, int)
+            or not isinstance(reserve_token, int)
+            or reserve_quote <= 0
+            or reserve_token <= 0
+        ):
+            return {
+                "status": DualTrackTargetStatus.MODELED_DEPTH_UNRESOLVED.value,
+                "d_ask_plus_2pct": None,
+                "d_bid_minus_2pct": None,
+                "token_in_minus_2pct": None,
+                "is_depth_complete": False,
+                "reason": "RESERVES_MUST_BE_POSITIVE_INTEGERS",
+            }
 
-        # 1. Ask Depth (+2% terminal spot price): search for smallest quote_in reaching boundary
-        high = max(1, (reserve_quote * 3) // 100)
-        while True:
+        if not isinstance(fee_bps, int) or fee_bps < 0 or fee_bps >= 10000:
+            return {
+                "status": DualTrackTargetStatus.MODELED_DEPTH_UNRESOLVED.value,
+                "d_ask_plus_2pct": None,
+                "d_bid_minus_2pct": None,
+                "token_in_minus_2pct": None,
+                "is_depth_complete": False,
+                "reason": "FEE_BPS_MUST_BE_INTEGER_IN_RANGE_0_TO_9999",
+            }
+
+        # 1. Ask Depth (+2% terminal spot price boundary): search for smallest quote_in reaching boundary
+        def check_ask(amount: int) -> bool:
+            if amount <= 0:
+                return False
             ok, out, _, _, n_rq, n_rb = cls.simulate_swap(
                 reserve_in=reserve_quote,
                 reserve_out=reserve_token,
-                amount_in=high,
+                amount_in=amount,
                 fee_bps=fee_bps,
             )
-            if not ok or high >= reserve_quote:
-                high = max(high, reserve_quote)
-                break
-            if 100 * n_rq * reserve_token >= 102 * reserve_quote * n_rb:
-                break
-            high *= 2
+            return bool(ok and (100 * n_rq * reserve_token >= 102 * reserve_quote * n_rb))
 
-        low = 1
-        while low < high:
-            mid = (low + high) // 2
-            ok, out, _, _, n_rq, n_rb = cls.simulate_swap(
-                reserve_in=reserve_quote,
-                reserve_out=reserve_token,
-                amount_in=mid,
-                fee_bps=fee_bps,
-            )
-            if ok and (100 * n_rq * reserve_token >= 102 * reserve_quote * n_rb):
-                high = mid
+        high_ask = max(1, (reserve_quote * 3) // 100)
+        found_high_ask = False
+        for _ in range(128):
+            if check_ask(high_ask):
+                found_high_ask = True
+                break
+            next_high = high_ask * 2
+            if next_high <= high_ask:
+                break
+            high_ask = next_high
+
+        if not found_high_ask:
+            return {
+                "status": DualTrackTargetStatus.MODELED_DEPTH_UNRESOLVED.value,
+                "d_ask_plus_2pct": None,
+                "d_bid_minus_2pct": None,
+                "token_in_minus_2pct": None,
+                "is_depth_complete": False,
+                "reason": "ASK_DEPTH_NO_REACHABLE_BOUNDARY",
+            }
+
+        low_ask = 1
+        while low_ask < high_ask:
+            mid = (low_ask + high_ask) // 2
+            if check_ask(mid):
+                high_ask = mid
             else:
-                low = mid + 1
-        d_ask = low
+                low_ask = mid + 1
 
-        # 2. Bid Depth (-2% terminal spot price): search for smallest token_in reaching boundary
-        high = max(1, (reserve_token * 3) // 100)
-        while True:
+        if not check_ask(low_ask):
+            return {
+                "status": DualTrackTargetStatus.MODELED_DEPTH_UNRESOLVED.value,
+                "d_ask_plus_2pct": None,
+                "d_bid_minus_2pct": None,
+                "token_in_minus_2pct": None,
+                "is_depth_complete": False,
+                "reason": "ASK_DEPTH_NO_REACHABLE_BOUNDARY",
+            }
+        d_ask = low_ask
+
+        # 2. Bid Depth (-2% terminal spot price boundary): search for smallest token_in reaching boundary
+        def check_bid(amount: int) -> bool:
+            if amount <= 0:
+                return False
             ok, out, _, _, n_rb, n_rq = cls.simulate_swap(
                 reserve_in=reserve_token,
                 reserve_out=reserve_quote,
-                amount_in=high,
+                amount_in=amount,
                 fee_bps=fee_bps,
             )
-            if not ok or high >= reserve_token:
-                high = max(high, reserve_token)
-                break
-            if 100 * n_rq * reserve_token <= 98 * reserve_quote * n_rb:
-                break
-            high *= 2
+            return bool(ok and (100 * n_rq * reserve_token <= 98 * reserve_quote * n_rb))
 
-        low = 1
-        while low < high:
-            mid = (low + high) // 2
-            ok, out, _, _, n_rb, n_rq = cls.simulate_swap(
-                reserve_in=reserve_token,
-                reserve_out=reserve_quote,
-                amount_in=mid,
-                fee_bps=fee_bps,
-            )
-            if ok and (100 * n_rq * reserve_token <= 98 * reserve_quote * n_rb):
-                high = mid
+        high_bid = max(1, (reserve_token * 3) // 100)
+        found_high_bid = False
+        for _ in range(128):
+            if check_bid(high_bid):
+                found_high_bid = True
+                break
+            next_high = high_bid * 2
+            if next_high <= high_bid:
+                break
+            high_bid = next_high
+
+        if not found_high_bid:
+            return {
+                "status": DualTrackTargetStatus.MODELED_DEPTH_UNRESOLVED.value,
+                "d_ask_plus_2pct": None,
+                "d_bid_minus_2pct": None,
+                "token_in_minus_2pct": None,
+                "is_depth_complete": False,
+                "reason": "BID_DEPTH_NO_REACHABLE_BOUNDARY",
+            }
+
+        low_bid = 1
+        while low_bid < high_bid:
+            mid = (low_bid + high_bid) // 2
+            if check_bid(mid):
+                high_bid = mid
             else:
-                low = mid + 1
-        token_in = low
+                low_bid = mid + 1
+
+        if not check_bid(low_bid):
+            return {
+                "status": DualTrackTargetStatus.MODELED_DEPTH_UNRESOLVED.value,
+                "d_ask_plus_2pct": None,
+                "d_bid_minus_2pct": None,
+                "token_in_minus_2pct": None,
+                "is_depth_complete": False,
+                "reason": "BID_DEPTH_NO_REACHABLE_BOUNDARY",
+            }
+        token_in = low_bid
+
         ok_bid, d_bid, _, _, _, _ = cls.simulate_swap(
             reserve_in=reserve_token,
             reserve_out=reserve_quote,
             amount_in=token_in,
             fee_bps=fee_bps,
         )
+        if not ok_bid or d_bid <= 0:
+            return {
+                "status": DualTrackTargetStatus.MODELED_DEPTH_UNRESOLVED.value,
+                "d_ask_plus_2pct": None,
+                "d_bid_minus_2pct": None,
+                "token_in_minus_2pct": None,
+                "is_depth_complete": False,
+                "reason": "BID_DEPTH_NO_REACHABLE_OUTPUT",
+            }
 
         return {
+            "status": "RESOLVED",
             "d_ask_plus_2pct": d_ask,
             "d_bid_minus_2pct": d_bid,
             "token_in_minus_2pct": token_in,
+            "is_depth_complete": True,
+            "reason": "OK",
         }
 
 

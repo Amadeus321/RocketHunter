@@ -1563,6 +1563,73 @@ class TestBidirectionalDepthAndLiquidityHierarchy(unittest.TestCase):
                 else:
                     self.assertEqual(out0, 0)  # Zero output yielded: boundary cannot be reached
 
+    def test_v2_bidirectional_depth_unreachable_boundary_small_reserves(self):
+        """AC-8: Asserts failed/unreachable brackets return an explicit unresolved result, not numeric capacity."""
+        # 1. Ask side unreachable: reserve_token = 1 (every attempted quote_in yields 0 token output)
+        depth_ask_unreachable = UniswapV2SwapSimulator.compute_bidirectional_depth(
+            reserve_quote=100,
+            reserve_token=1,
+            fee_bps=30,
+        )
+        self.assertEqual(depth_ask_unreachable["status"], DualTrackTargetStatus.MODELED_DEPTH_UNRESOLVED.value)
+        self.assertFalse(depth_ask_unreachable["is_depth_complete"])
+        self.assertIsNone(depth_ask_unreachable["d_ask_plus_2pct"])
+        self.assertIsNone(depth_ask_unreachable["d_bid_minus_2pct"])
+        self.assertIsNone(depth_ask_unreachable["token_in_minus_2pct"])
+        self.assertEqual(depth_ask_unreachable["reason"], "ASK_DEPTH_NO_REACHABLE_BOUNDARY")
+
+        # 2. Bid side unreachable: reserve_quote = 1 (every attempted token_in yields 0 quote output)
+        depth_bid_unreachable = UniswapV2SwapSimulator.compute_bidirectional_depth(
+            reserve_quote=1,
+            reserve_token=100,
+            fee_bps=30,
+        )
+        self.assertEqual(depth_bid_unreachable["status"], DualTrackTargetStatus.MODELED_DEPTH_UNRESOLVED.value)
+        self.assertFalse(depth_bid_unreachable["is_depth_complete"])
+        self.assertIsNone(depth_bid_unreachable["d_ask_plus_2pct"])
+        self.assertIsNone(depth_bid_unreachable["d_bid_minus_2pct"])
+        self.assertIsNone(depth_bid_unreachable["token_in_minus_2pct"])
+        self.assertEqual(depth_bid_unreachable["reason"], "BID_DEPTH_NO_REACHABLE_BOUNDARY")
+
+    def test_v2_bidirectional_depth_and_swap_invalid_fee_inputs(self):
+        """AC-8: Asserts invalid fee inputs fail closed in simulate_swap and return unresolved in compute_bidirectional_depth."""
+        invalid_fees = [-1, -50, 10000, 10001, 50000, 30.5, "30", None]
+
+        for fee in invalid_fees:
+            # simulate_swap must fail closed
+            ok, out, _, _, r_in, r_out = UniswapV2SwapSimulator.simulate_swap(1_000_000, 1_000, 100, fee_bps=fee)
+            self.assertFalse(ok)
+            self.assertEqual(out, 0)
+
+            # compute_bidirectional_depth must return explicit unresolved result, not numeric capacity
+            depth = UniswapV2SwapSimulator.compute_bidirectional_depth(1_000_000, 1_000, fee_bps=fee)
+            self.assertEqual(depth["status"], DualTrackTargetStatus.MODELED_DEPTH_UNRESOLVED.value)
+            self.assertFalse(depth["is_depth_complete"])
+            self.assertIsNone(depth["d_ask_plus_2pct"])
+            self.assertIsNone(depth["d_bid_minus_2pct"])
+            self.assertIsNone(depth["token_in_minus_2pct"])
+            self.assertEqual(depth["reason"], "FEE_BPS_MUST_BE_INTEGER_IN_RANGE_0_TO_9999")
+
+    def test_v2_bidirectional_depth_invalid_reserves(self):
+        """AC-8: Asserts invalid reserves return explicit unresolved result with zero numeric capacity."""
+        invalid_reserves = [
+            (0, 1000),
+            (1000, 0),
+            (-100, 1000),
+            (1000, -50),
+            ("1000000", 1000),
+            (1000000, 1000.5),
+        ]
+
+        for rq, rb in invalid_reserves:
+            depth = UniswapV2SwapSimulator.compute_bidirectional_depth(rq, rb, fee_bps=30)
+            self.assertEqual(depth["status"], DualTrackTargetStatus.MODELED_DEPTH_UNRESOLVED.value)
+            self.assertFalse(depth["is_depth_complete"])
+            self.assertIsNone(depth["d_ask_plus_2pct"])
+            self.assertIsNone(depth["d_bid_minus_2pct"])
+            self.assertIsNone(depth["token_in_minus_2pct"])
+            self.assertEqual(depth["reason"], "RESERVES_MUST_BE_POSITIVE_INTEGERS")
+
 
 class TestMultiSizeAndIdentityConstraints(unittest.TestCase):
     """Test suite covering AC-10, AC-13, AC-14, AC-15."""
