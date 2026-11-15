@@ -787,6 +787,16 @@ class DualTrackOutcomeEvaluator:
 # 7. Dataset A Trade Journal Financial Reconciliation
 # ==============================================================================
 
+def canonicalize_token_address(token_identifier: str) -> str:
+    """Extracts canonical on-chain token address by stripping network namespace prefixes.
+    e.g. 'ethereum:0x1111' -> '0x1111', 'solana:token-a' -> 'token-a', '0x1111' -> '0x1111'
+    """
+    s = str(token_identifier).strip().lower()
+    if ":" in s:
+        s = s.split(":")[-1].strip()
+    return s
+
+
 @dataclasses.dataclass
 class OnChainTransferEvent:
     """Validated transfer log event."""
@@ -812,6 +822,7 @@ class ValidatedTransactionReceipt:
     is_canonical_block: bool = False
     reconciled_gas_cost: Optional[float] = None
     reconciled_quote_amount: Optional[float] = None
+    is_trusted_chain_validated: bool = False
 
     @property
     def receipt_sha256(self) -> str:
@@ -1006,15 +1017,18 @@ class DatasetAReconciliationEngine:
                 contributes_to_verified_pl=False,
             )
 
-        # 4d. Verify transfer log amounts matching acquired and sold quantities with exact token_address
+        # 4d. Verify transfer log amounts matching acquired and sold quantities with canonical token_address
+        canonical_entry_token = canonicalize_token_address(entry.token_id)
+        canonical_exit_token = canonicalize_token_address(exit_exec.token_id)
+
         has_entry_transfer = any(
-            t.token_address.lower() == entry.token_id.lower()
+            canonicalize_token_address(t.token_address) == canonical_entry_token
             and t.to_address.lower() == entry.wallet_address.lower()
             and math.isclose(t.amount, entry.tokens_acquired, rel_tol=1e-4)
             for t in entry_receipt.transfers
         )
         has_exit_transfer = any(
-            t.token_address.lower() == exit_exec.token_id.lower()
+            canonicalize_token_address(t.token_address) == canonical_exit_token
             and t.from_address.lower() == exit_exec.wallet_address.lower()
             and math.isclose(t.amount, exit_exec.tokens_sold, rel_tol=1e-4)
             for t in exit_receipt.transfers
@@ -1034,70 +1048,49 @@ class DatasetAReconciliationEngine:
                 contributes_to_verified_pl=False,
             )
 
-        # 4e. Reconcile quote proceeds and gas costs to reported costs
-        # Entry gas cost reconciliation
-        if entry_receipt.reconciled_gas_cost is not None:
-            if not math.isclose(entry.entry_gas_cost, entry_receipt.reconciled_gas_cost, rel_tol=1e-2):
-                return ReconciledTrancheOutcome(
-                    status=EvidenceTier.RECEIPT_VERIFICATION_FAILED,
-                    alpha_ratio=0.0,
-                    allocated_expenditure=0.0,
-                    allocated_entry_gas=0.0,
-                    allocated_entry_fees=0.0,
-                    realized_net_pl=0.0,
-                    realized_net_return_pct=0.0,
-                    tokens_remaining=entry.tokens_acquired,
-                    cost_basis_remaining=entry.quote_expenditure,
-                    contributes_to_verified_pl=False,
-                )
+        # 4e. Required amounts validation: proceeds and gas costs must be present and non-negative
+        if (
+            entry_receipt.reconciled_gas_cost is None
+            or entry_receipt.reconciled_quote_amount is None
+            or exit_receipt.reconciled_gas_cost is None
+            or exit_receipt.reconciled_quote_amount is None
+            or entry_receipt.reconciled_gas_cost < 0
+            or entry_receipt.reconciled_quote_amount < 0
+            or exit_receipt.reconciled_gas_cost < 0
+            or exit_receipt.reconciled_quote_amount < 0
+        ):
+            return ReconciledTrancheOutcome(
+                status=EvidenceTier.EXECUTION_EVIDENCE_INCOMPLETE,
+                alpha_ratio=0.0,
+                allocated_expenditure=0.0,
+                allocated_entry_gas=0.0,
+                allocated_entry_fees=0.0,
+                realized_net_pl=0.0,
+                realized_net_return_pct=0.0,
+                tokens_remaining=entry.tokens_acquired,
+                cost_basis_remaining=entry.quote_expenditure,
+                contributes_to_verified_pl=False,
+            )
 
-        # Entry quote expenditure reconciliation
-        if entry_receipt.reconciled_quote_amount is not None:
-            if not math.isclose(entry.quote_expenditure, entry_receipt.reconciled_quote_amount, rel_tol=1e-2):
-                return ReconciledTrancheOutcome(
-                    status=EvidenceTier.RECEIPT_VERIFICATION_FAILED,
-                    alpha_ratio=0.0,
-                    allocated_expenditure=0.0,
-                    allocated_entry_gas=0.0,
-                    allocated_entry_fees=0.0,
-                    realized_net_pl=0.0,
-                    realized_net_return_pct=0.0,
-                    tokens_remaining=entry.tokens_acquired,
-                    cost_basis_remaining=entry.quote_expenditure,
-                    contributes_to_verified_pl=False,
-                )
-
-        # Exit gas cost reconciliation
-        if exit_receipt.reconciled_gas_cost is not None:
-            if not math.isclose(exit_exec.exit_gas_cost, exit_receipt.reconciled_gas_cost, rel_tol=1e-2):
-                return ReconciledTrancheOutcome(
-                    status=EvidenceTier.RECEIPT_VERIFICATION_FAILED,
-                    alpha_ratio=0.0,
-                    allocated_expenditure=0.0,
-                    allocated_entry_gas=0.0,
-                    allocated_entry_fees=0.0,
-                    realized_net_pl=0.0,
-                    realized_net_return_pct=0.0,
-                    tokens_remaining=entry.tokens_acquired,
-                    cost_basis_remaining=entry.quote_expenditure,
-                    contributes_to_verified_pl=False,
-                )
-
-        # Exit quote proceeds reconciliation
-        if exit_receipt.reconciled_quote_amount is not None:
-            if not math.isclose(exit_exec.gross_proceeds, exit_receipt.reconciled_quote_amount, rel_tol=1e-2):
-                return ReconciledTrancheOutcome(
-                    status=EvidenceTier.RECEIPT_VERIFICATION_FAILED,
-                    alpha_ratio=0.0,
-                    allocated_expenditure=0.0,
-                    allocated_entry_gas=0.0,
-                    allocated_entry_fees=0.0,
-                    realized_net_pl=0.0,
-                    realized_net_return_pct=0.0,
-                    tokens_remaining=entry.tokens_acquired,
-                    cost_basis_remaining=entry.quote_expenditure,
-                    contributes_to_verified_pl=False,
-                )
+        # Check reconciliation against reported costs
+        if (
+            not math.isclose(entry.entry_gas_cost, entry_receipt.reconciled_gas_cost, rel_tol=1e-2)
+            or not math.isclose(entry.quote_expenditure, entry_receipt.reconciled_quote_amount, rel_tol=1e-2)
+            or not math.isclose(exit_exec.exit_gas_cost, exit_receipt.reconciled_gas_cost, rel_tol=1e-2)
+            or not math.isclose(exit_exec.gross_proceeds, exit_receipt.reconciled_quote_amount, rel_tol=1e-2)
+        ):
+            return ReconciledTrancheOutcome(
+                status=EvidenceTier.RECEIPT_VERIFICATION_FAILED,
+                alpha_ratio=0.0,
+                allocated_expenditure=0.0,
+                allocated_entry_gas=0.0,
+                allocated_entry_fees=0.0,
+                realized_net_pl=0.0,
+                realized_net_return_pct=0.0,
+                tokens_remaining=entry.tokens_acquired,
+                cost_basis_remaining=entry.quote_expenditure,
+                contributes_to_verified_pl=False,
+            )
 
         if exit_exec.tokens_sold <= 0 or entry.tokens_acquired <= 0:
             return ReconciledTrancheOutcome(
@@ -1133,8 +1126,18 @@ class DatasetAReconciliationEngine:
         tokens_remaining = round(entry.tokens_acquired - exit_exec.tokens_sold, 6)
         cost_basis_remaining = round(entry.quote_expenditure - allocated_exp, 6)
 
+        # 6. Provenance classification:
+        # Until receipt bytes/logs are independently fetched or cryptographically validated
+        # against a trusted chain source, classify the result strictly as unverified USER_REPORTED_EXECUTION.
+        if entry_receipt.is_trusted_chain_validated and exit_receipt.is_trusted_chain_validated:
+            status = EvidenceTier.INDEPENDENTLY_VERIFIED_EXECUTION
+            contributes = True
+        else:
+            status = EvidenceTier.USER_REPORTED_EXECUTION
+            contributes = False
+
         return ReconciledTrancheOutcome(
-            status=EvidenceTier.INDEPENDENTLY_VERIFIED_EXECUTION,
+            status=status,
             alpha_ratio=alpha,
             allocated_expenditure=allocated_exp,
             allocated_entry_gas=allocated_gas_entry,
@@ -1143,7 +1146,7 @@ class DatasetAReconciliationEngine:
             realized_net_return_pct=round(realized_return_pct, 4),
             tokens_remaining=tokens_remaining,
             cost_basis_remaining=cost_basis_remaining,
-            contributes_to_verified_pl=True,
+            contributes_to_verified_pl=contributes,
         )
 
 
@@ -1272,50 +1275,92 @@ class ClusteredEvaluationEngine:
         }
 
     @classmethod
-    def parse_utc_week_index(cls, week_val: Any) -> int:
-        """Parses arbitrary week representations into an integer continuous week index since UTC epoch.
-        Supports:
-        - ISO week strings: 'YYYY-Www', 'YYYY-Ww'
-        - ISO date strings: 'YYYY-MM-DD'
-        - Week block labels: 'week_01', 'week_12'
-        - Unix timestamps (seconds since epoch)
-        - Integers / continuous week counts
+    def classify_and_parse_week(cls, week_val: Any) -> Tuple[str, Optional[int]]:
+        """Classifies a week identifier into an explicit format family and continuous week index.
+        Returns: (format_family, integer_index) or ('INVALID', None). Never fabricates arbitrary hashes.
         """
+        if week_val is None:
+            return "INVALID", None
         s = str(week_val).strip()
+        if not s:
+            return "INVALID", None
 
         # 1. ISO week: YYYY-Www (e.g. 2026-W05)
         iso_week_match = re.fullmatch(r"(\d{4})-W(\d{1,2})", s, re.IGNORECASE)
         if iso_week_match:
             year = int(iso_week_match.group(1))
             week = int(iso_week_match.group(2))
-            return dt.date.fromisocalendar(year, week, 1).toordinal() // 7
+            if 1 <= week <= 53:
+                return "ISO_CALENDAR", dt.date.fromisocalendar(year, week, 1).toordinal() // 7
+            return "INVALID", None
 
-        # 2. ISO date: YYYY-MM-DD
+        # 2. ISO calendar date: YYYY-MM-DD
         iso_date_match = re.fullmatch(r"(\d{4})-(\d{2})-(\d{2})", s)
         if iso_date_match:
-            d = dt.date.fromisoformat(s)
-            y, w, _ = d.isocalendar()
-            return dt.date.fromisocalendar(y, w, 1).toordinal() // 7
+            try:
+                d = dt.date.fromisoformat(s)
+                y, w, _ = d.isocalendar()
+                return "ISO_CALENDAR", dt.date.fromisocalendar(y, w, 1).toordinal() // 7
+            except ValueError:
+                return "INVALID", None
 
-        # 3. Week prefix: week_01, week_10
+        # 3. Explicit relative week label: week_01, week_12
         week_num_match = re.fullmatch(r"week_?(\d+)", s, re.IGNORECASE)
         if week_num_match:
-            return int(week_num_match.group(1))
+            return "RELATIVE_LABEL", int(week_num_match.group(1))
 
-        # 4. Unix timestamp or integer
-        try:
-            val = int(s)
-            if val > 1_000_000:
-                return val // (7 * 86400)
-            return val
-        except ValueError:
-            pass
+        # 4. Integer index or Unix epoch timestamp
+        if s.isdigit() or (s.startswith("-") and s[1:].isdigit()):
+            try:
+                val = int(s)
+                if val > 1_000_000:
+                    return "UNIX_TIMESTAMP", val // (7 * 86400)
+                return "RELATIVE_INTEGER", val
+            except ValueError:
+                return "INVALID", None
 
-        return int(hashlib.md5(s.encode("utf-8")).hexdigest()[:8], 16)
+        return "INVALID", None
+
+    @classmethod
+    def validate_and_classify_dataset_weeks(
+        cls, raw_weeks: list[Any]
+    ) -> Tuple[bool, str, list[Tuple[Any, int]], str]:
+        """Validates that all week identifiers in the dataset conform to a single, consistent format family.
+        Strictly rejects invalid identifiers and mixed formats without fabricating hashes.
+        Returns: (is_valid, format_family, sorted_unique_pairs, diagnostic_reason)
+        """
+        if not raw_weeks:
+            return True, "EMPTY", [], "EMPTY_DATASET"
+
+        parsed_map: dict[Any, Tuple[str, int]] = {}
+        for w in set(raw_weeks):
+            fmt, idx = cls.classify_and_parse_week(w)
+            if fmt == "INVALID" or idx is None:
+                return False, "INVALID", [], f"Unrecognized or invalid week identifier: {w}"
+            parsed_map[w] = (fmt, idx)
+
+        formats = {fmt for fmt, _ in parsed_map.values()}
+        if len(formats) > 1:
+            return False, "MIXED", [], f"Mixed week format families detected: {sorted(list(formats))}"
+
+        format_family = list(formats)[0]
+        sorted_pairs = sorted(
+            [(w, parsed_map[w][1]) for w in parsed_map],
+            key=lambda item: (item[1], str(item[0]))
+        )
+        return True, format_family, sorted_pairs, "VALID_CONSISTENT_FORMAT"
+
+    @classmethod
+    def parse_utc_week_index(cls, week_val: Any) -> int:
+        """Parses arbitrary week representations into an integer continuous week index. Raises ValueError on invalid format."""
+        fmt, idx = cls.classify_and_parse_week(week_val)
+        if fmt == "INVALID" or idx is None:
+            raise ValueError(f"Unrecognized or invalid week identifier: {week_val}")
+        return idx
 
     @classmethod
     def _sort_weeks_chronologically(cls, week_keys: list[Any]) -> list[Any]:
-        """Strictly sorts week identifiers in chronological order using UTC week index."""
+        """Strictly sorts week identifiers in chronological order using validated UTC week index."""
         unique_weeks = list(set(week_keys))
         return sorted(unique_weeks, key=lambda w: (cls.parse_utc_week_index(w), str(w)))
 
@@ -1353,8 +1398,8 @@ class ClusteredEvaluationEngine:
     def evaluate_inter_block_serial_dependence(
         cls, dataset: list[dict[str, Any]], field: str = "loss_diff"
     ) -> dict[str, Any]:
-        """Evaluates lag-1 and lag-2 autocorrelations of weekly block-mean residuals in chronological order,
-        accounting explicitly for missing weeks/gaps.
+        """Evaluates lag-1 and lag-2 autocorrelations of weekly block-mean residuals in chronological order.
+        Strictly rejects invalid identifiers and mixed formats without producing dependence estimates.
         """
         counts = cls.get_structural_counts(dataset)
         B = counts["B_weeks"]
@@ -1366,18 +1411,35 @@ class ClusteredEvaluationEngine:
                 "fallback_triggered": False,
                 "newey_west_se": 0.0,
                 "week_means": [],
+                "chronological_weeks": [],
+                "is_valid_format": True,
+                "diagnostic_reason": "B_WEEKS_LESS_THAN_3",
             }
 
-        # Calculate weekly block-means in strictly chronological order
-        raw_weeks = [x["week_block"] for x in dataset]
-        sorted_weeks = cls._sort_weeks_chronologically(raw_weeks)
+        raw_weeks = [x.get("week_block") for x in dataset]
+        is_valid, fmt_family, sorted_pairs, reason = cls.validate_and_classify_dataset_weeks(raw_weeks)
+
+        if not is_valid:
+            return {
+                "rho_1": 0.0,
+                "rho_adj": 0.0,
+                "rho_2": 0.0,
+                "bartlett_threshold": 1.0,
+                "fallback_triggered": False,
+                "newey_west_se": 0.0,
+                "week_means": [],
+                "chronological_weeks": [],
+                "is_valid_format": False,
+                "diagnostic_reason": reason,
+            }
+
+        sorted_weeks = [w for w, _ in sorted_pairs]
+        week_indices = [idx for _, idx in sorted_pairs]
 
         week_means = []
-        week_indices = []
         for w in sorted_weeks:
-            obs_w = [x[field] for x in dataset if x["week_block"] == w]
+            obs_w = [x[field] for x in dataset if x.get("week_block") == w]
             week_means.append(sum(obs_w) / len(obs_w))
-            week_indices.append(cls.parse_utc_week_index(w))
 
         grand_mean = sum(week_means) / len(week_means)
         res = [wm - grand_mean for wm in week_means]
@@ -1419,6 +1481,8 @@ class ClusteredEvaluationEngine:
             "newey_west_se": nw_se,
             "week_means": week_means,
             "chronological_weeks": sorted_weeks,
+            "is_valid_format": True,
+            "diagnostic_reason": "VALID_CONSISTENT_FORMAT",
         }
 
     @classmethod
@@ -1459,7 +1523,11 @@ class ClusteredEvaluationEngine:
         t_crit = cls.get_exact_students_t_crit(df)
 
         # Status determination: Confirmatory status is forbidden; all results are explicitly exploratory
-        if dep_res["fallback_triggered"]:
+        if not dep_res.get("is_valid_format", True):
+            status = InferentialStatus.EXPLORATORY_UNCALIBRATED_INFERENCE
+            diagnostic_flag = f"INVALID_OR_MIXED_WEEK_FORMAT_CANNOT_ESTIMATE_DEPENDENCE: {dep_res.get('diagnostic_reason', '')}"
+            se_effective = cgm_res["se_reported"]
+        elif dep_res["fallback_triggered"]:
             status = InferentialStatus.DEPENDENT_BLOCK_FALLBACK_TRIGGERED
             diagnostic_flag = "SERIAL_PERSISTENCE_DETECTED_NEWEY_WEST_FALLBACK"
             se_effective = max(cgm_res["se_reported"], dep_res["newey_west_se"])

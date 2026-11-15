@@ -554,6 +554,7 @@ class TestStage31DatasetAReconciliation(unittest.TestCase):
         reconciled_gas: Optional[float] = None,
         reconciled_quote: Optional[float] = None,
         expected_sha256: Optional[str] = None,
+        is_trusted_chain: bool = False,
     ) -> ValidatedTransactionReceipt:
         sha = expected_sha256 if expected_sha256 is not None else hashlib.sha256(raw_bytes).hexdigest().upper()
         return ValidatedTransactionReceipt(
@@ -570,10 +571,11 @@ class TestStage31DatasetAReconciliation(unittest.TestCase):
             is_canonical_block=is_canonical,
             reconciled_gas_cost=reconciled_gas,
             reconciled_quote_amount=reconciled_quote,
+            is_trusted_chain_validated=is_trusted_chain,
         )
 
     def test_receipt_bound_verified_execution(self):
-        """Validates that receipt/transfer logs matching exact amounts, addresses, token, and costs yield verified status."""
+        """Validates that caller-supplied receipts remain USER_REPORTED_EXECUTION without trusted chain source."""
         entry = JournalEntryPosition(
             token_id="ethereum:0x1111", chain_id=1, wallet_address="0xUser", tx_hash="0xentrytx",
             quote_expenditure=1000.0, tokens_acquired=10000.0, entry_gas_cost=20.0, entry_venue_fees=3.0,
@@ -584,19 +586,93 @@ class TestStage31DatasetAReconciliation(unittest.TestCase):
         )
 
         entry_receipt = self._make_receipt(
-            1, "0xentrytx", "0xpool", "0xUser", "ethereum:0x1111", 10000.0,
-            reconciled_gas=20.0, reconciled_quote=1000.0,
+            1, "0xentrytx", "0xpool", "0xUser", "0x1111", 10000.0,
+            reconciled_gas=20.0, reconciled_quote=1000.0, is_trusted_chain=False,
         )
         exit_receipt = self._make_receipt(
-            1, "0xexittx", "0xUser", "0xpool", "ethereum:0x1111", 4000.0,
-            reconciled_gas=15.0, reconciled_quote=600.0,
+            1, "0xexittx", "0xUser", "0xpool", "0x1111", 4000.0,
+            reconciled_gas=15.0, reconciled_quote=600.0, is_trusted_chain=False,
+        )
+
+        outcome = DatasetAReconciliationEngine.reconcile_tranche(entry, exit_exec, entry_receipt, exit_receipt)
+        # Caller-supplied receipts must be classified as unverified USER_REPORTED_EXECUTION
+        self.assertEqual(outcome.status, EvidenceTier.USER_REPORTED_EXECUTION)
+        self.assertEqual(outcome.alpha_ratio, 0.40)
+        self.assertAlmostEqual(outcome.realized_net_pl, 173.8, places=2)
+        self.assertFalse(outcome.contributes_to_verified_pl)
+
+    def test_trusted_chain_receipt_promotes_to_independently_verified(self):
+        """Validates that receipts validated against trusted chain source promote to INDEPENDENTLY_VERIFIED_EXECUTION."""
+        entry = JournalEntryPosition(
+            token_id="ethereum:0x1111", chain_id=1, wallet_address="0xUser", tx_hash="0xentrytx",
+            quote_expenditure=1000.0, tokens_acquired=10000.0, entry_gas_cost=20.0, entry_venue_fees=3.0,
+        )
+        exit_exec = JournalExitExecution(
+            token_id="ethereum:0x1111", chain_id=1, wallet_address="0xUser", tx_hash="0xexittx",
+            tokens_sold=4000.0, gross_proceeds=600.0, exit_gas_cost=15.0, exit_venue_fees=2.0,
+        )
+
+        entry_receipt = self._make_receipt(
+            1, "0xentrytx", "0xpool", "0xUser", "0x1111", 10000.0,
+            reconciled_gas=20.0, reconciled_quote=1000.0, is_trusted_chain=True,
+        )
+        exit_receipt = self._make_receipt(
+            1, "0xexittx", "0xUser", "0xpool", "0x1111", 4000.0,
+            reconciled_gas=15.0, reconciled_quote=600.0, is_trusted_chain=True,
         )
 
         outcome = DatasetAReconciliationEngine.reconcile_tranche(entry, exit_exec, entry_receipt, exit_receipt)
         self.assertEqual(outcome.status, EvidenceTier.INDEPENDENTLY_VERIFIED_EXECUTION)
-        self.assertEqual(outcome.alpha_ratio, 0.40)
-        self.assertAlmostEqual(outcome.realized_net_pl, 173.8, places=2)
         self.assertTrue(outcome.contributes_to_verified_pl)
+
+    def test_canonical_token_address_matching(self):
+        """Validates transfer matching handles canonical on-chain addresses vs namespaced token_id."""
+        entry = JournalEntryPosition(
+            token_id="ethereum:0x1111", chain_id=1, wallet_address="0xUser", tx_hash="0xentrytx",
+            quote_expenditure=1000.0, tokens_acquired=10000.0, entry_gas_cost=20.0, entry_venue_fees=3.0,
+        )
+        exit_exec = JournalExitExecution(
+            token_id="ethereum:0x1111", chain_id=1, wallet_address="0xUser", tx_hash="0xexittx",
+            tokens_sold=4000.0, gross_proceeds=600.0, exit_gas_cost=15.0, exit_venue_fees=2.0,
+        )
+
+        # Transfer log has bare canonical address '0x1111', entry has namespaced 'ethereum:0x1111' -> should match!
+        entry_receipt = self._make_receipt(
+            1, "0xentrytx", "0xpool", "0xUser", "0x1111", 10000.0,
+            reconciled_gas=20.0, reconciled_quote=1000.0,
+        )
+        exit_receipt = self._make_receipt(
+            1, "0xexittx", "0xUser", "0xpool", "0x1111", 4000.0,
+            reconciled_gas=15.0, reconciled_quote=600.0,
+        )
+        outcome = DatasetAReconciliationEngine.reconcile_tranche(entry, exit_exec, entry_receipt, exit_receipt)
+        self.assertEqual(outcome.status, EvidenceTier.USER_REPORTED_EXECUTION)
+
+        # Transfer log has completely different token address '0x9999' -> must reject
+        entry_receipt_bad_token = self._make_receipt(
+            1, "0xentrytx", "0xpool", "0xUser", "0x9999", 10000.0,
+            reconciled_gas=20.0, reconciled_quote=1000.0,
+        )
+        outcome_bad = DatasetAReconciliationEngine.reconcile_tranche(entry, exit_exec, entry_receipt_bad_token, exit_receipt)
+        self.assertEqual(outcome_bad.status, EvidenceTier.RECEIPT_VERIFICATION_FAILED)
+
+    def test_unverified_when_required_gas_or_proceeds_amounts_missing(self):
+        """Adversarial: Validates that missing required gas or proceeds amounts fail closed as INCOMPLETE."""
+        entry = JournalEntryPosition("ethereum:0x1111", 1, "0xUser", "0xentrytx", 1000.0, 10000.0, 20.0, 3.0)
+        exit_exec = JournalExitExecution("ethereum:0x1111", 1, "0xUser", "0xexittx", 4000.0, 600.0, 15.0, 2.0)
+
+        # Missing reconciled_gas_cost (None)
+        entry_receipt_no_gas = self._make_receipt(
+            1, "0xentrytx", "0xpool", "0xUser", "0x1111", 10000.0,
+            reconciled_gas=None, reconciled_quote=1000.0,
+        )
+        exit_receipt = self._make_receipt(
+            1, "0xexittx", "0xUser", "0xpool", "0x1111", 4000.0,
+            reconciled_gas=15.0, reconciled_quote=600.0,
+        )
+        outcome = DatasetAReconciliationEngine.reconcile_tranche(entry, exit_exec, entry_receipt_no_gas, exit_receipt)
+        self.assertEqual(outcome.status, EvidenceTier.EXECUTION_EVIDENCE_INCOMPLETE)
+        self.assertFalse(outcome.contributes_to_verified_pl)
 
     def test_unverified_when_raw_receipt_bytes_digest_mismatches(self):
         """Adversarial: Validates rejection when expected_receipt_sha256 does not match raw bytes."""
@@ -788,8 +864,46 @@ class TestStage31ClusteredStatisticalInference(unittest.TestCase):
         # But lag-2 pairs DO exist (week 3 - week 1 = 2, week 5 - week 3 = 2, week 7 - week 5 = 2)
         self.assertNotEqual(diag_gaps["rho_2"], 0.0)
 
+    def test_invalid_week_format_cannot_produce_dependence_estimates(self):
+        """Validates that unrecognized or invalid week labels are strictly rejected without producing dependence estimates."""
+        dataset_bad = [
+            {"token_id": "T0", "week_block": "invalid_label_xyz", "loss_diff": 1.0},
+            {"token_id": "T0", "week_block": "random_custom_week", "loss_diff": 2.0},
+            {"token_id": "T0", "week_block": "bad_week_99999", "loss_diff": 3.0},
+        ]
+        diag = ClusteredEvaluationEngine.evaluate_inter_block_serial_dependence(dataset_bad, field="loss_diff")
+        self.assertFalse(diag["is_valid_format"])
+        self.assertEqual(diag["rho_1"], 0.0)
+        self.assertEqual(diag["rho_2"], 0.0)
+        self.assertEqual(diag["newey_west_se"], 0.0)
+        self.assertTrue("Unrecognized or invalid" in diag["diagnostic_reason"])
+
+        eval_res = ClusteredEvaluationEngine.run_stage31_evaluation(dataset_bad, field="loss_diff")
+        self.assertEqual(eval_res["status"], InferentialStatus.EXPLORATORY_UNCALIBRATED_INFERENCE.value)
+        self.assertTrue("INVALID_OR_MIXED_WEEK_FORMAT_CANNOT_ESTIMATE_DEPENDENCE" in eval_res["diagnostic_flag"])
+        self.assertEqual(eval_res["se_newey_west"], 0.0)
+
+    def test_mixed_week_formats_cannot_produce_dependence_estimates(self):
+        """Validates that datasets mixing disparate week format families fail closed without estimating dependence."""
+        dataset_mixed = [
+            {"token_id": "T0", "week_block": "2026-W01", "loss_diff": 1.0},
+            {"token_id": "T0", "week_block": "week_02", "loss_diff": 2.0},
+            {"token_id": "T0", "week_block": "2026-W03", "loss_diff": 3.0},
+        ]
+        diag = ClusteredEvaluationEngine.evaluate_inter_block_serial_dependence(dataset_mixed, field="loss_diff")
+        self.assertFalse(diag["is_valid_format"])
+        self.assertTrue("Mixed week format" in diag["diagnostic_reason"])
+        self.assertEqual(diag["rho_1"], 0.0)
+        self.assertEqual(diag["rho_2"], 0.0)
+        self.assertEqual(diag["newey_west_se"], 0.0)
+
+        eval_res = ClusteredEvaluationEngine.run_stage31_evaluation(dataset_mixed, field="loss_diff")
+        self.assertTrue("INVALID_OR_MIXED_WEEK_FORMAT_CANNOT_ESTIMATE_DEPENDENCE" in eval_res["diagnostic_flag"])
+        self.assertEqual(eval_res["se_newey_west"], 0.0)
+
     def test_all_inference_labeled_exploratory(self):
         """Validates that confirmatory status is never claimed and results are branded exploratory."""
+        random.seed(42)
         dataset_large = [
             {"token_id": f"token_{i}", "week_block": f"week_{w:02d}", "loss_diff": 0.05 + random.gauss(0, 0.005)}
             for w in range(30)
