@@ -819,6 +819,10 @@ class UniswapV3Evidence:
 
         return True
 
+    def is_complete(self) -> bool:
+        """Validates general completeness at current pool tick."""
+        return self.is_complete_for_range(self.tick)
+
 
 class UniswapV3SwapMath:
     """Exact integer math library replicating Uniswap V3 SqrtPriceMath.sol and SwapMath.sol."""
@@ -1122,32 +1126,31 @@ class UniswapV2SwapSimulator:
         fee_bps: int = 30,
     ) -> Dict[str, Any]:
         """Calculates exact integer bidirectional depth within +/- 2.0% price impact band.
-        Uses pure integer arithmetic (math.isqrt with 10^18 fixed-point scale) with zero floating-point drift.
-        D_ask: Gross quote input to push price +2% (with fee applied to input).
-        D_bid: Quote output yielded at -2% terminal price (NO fee applied to output).
-        token_in: Required token input to reach -2% terminal price (fee applied to input).
+        Uses exact integer constant-product derivation (math.isqrt on integer square products)
+        with zero fixed-scale truncation and zero floating-point drift:
+        - At +2% spot price: R_q' = isqrt((102 * R_q^2) // 100).
+          Delta q_eff = R_q' - R_q.
+          D_ask = (Delta q_eff * 10000) // (10000 - fee_bps).
+        - At -2% spot price: R_q' = isqrt((98 * R_q^2) // 100).
+          D_bid = R_q - R_q' (no fee on quote proceeds).
+        - Base token input to reach -2% terminal price:
+          R_b' = isqrt((100 * R_b^2) // 98).
+          token_in = ((R_b' - R_b) * 10000) // (10000 - fee_bps).
         """
         if reserve_quote <= 0 or reserve_token <= 0:
             return {"d_ask_plus_2pct": 0, "d_bid_minus_2pct": 0, "token_in_minus_2pct": 0}
 
-        scale = 10**18
-        # Sqrt(1.02) scaled: sqrt(102/100 * scale^2)
-        sqrt_102 = math.isqrt(102 * scale * scale // 100)
-        # Sqrt(0.98) scaled: sqrt(98/100 * scale^2)
-        sqrt_98 = math.isqrt(98 * scale * scale // 100)
-        # Sqrt(1/0.98) scaled: sqrt(100/98 * scale^2)
-        sqrt_recip_98 = math.isqrt(scale * scale * 100 // 98)
+        # Exact integer square root on scaled reserve square (zero intermediate scale truncation)
+        rq_target_ask = math.isqrt((102 * reserve_quote * reserve_quote) // 100)
+        delta_q_ask = rq_target_ask - reserve_quote
+        d_ask = (delta_q_ask * 10000) // (10000 - fee_bps)
 
-        denom_fee = scale * (10000 - fee_bps)
+        rq_target_bid = math.isqrt((98 * reserve_quote * reserve_quote) // 100)
+        d_bid = reserve_quote - rq_target_bid
 
-        # D_ask = Rq * (sqrt(1.02) - 1) / (1 - f)
-        d_ask = (reserve_quote * (sqrt_102 - scale) * 10000) // denom_fee
-
-        # D_bid = Rq * (1 - sqrt(0.98))  [No fee multiplier on output]
-        d_bid = (reserve_quote * (scale - sqrt_98)) // scale
-
-        # token_in = Rb * (1/sqrt(0.98) - 1) / (1 - f)  [Fee applied to required input]
-        token_in = (reserve_token * (sqrt_recip_98 - scale) * 10000) // denom_fee
+        rb_target_bid = math.isqrt((100 * reserve_token * reserve_token) // 98)
+        delta_b_in = rb_target_bid - reserve_token
+        token_in = (delta_b_in * 10000) // (10000 - fee_bps)
 
         return {
             "d_ask_plus_2pct": d_ask,
@@ -1165,17 +1168,29 @@ def calculate_evm_gas_cost_usd(
 ) -> Tuple[float, float, str]:
     """Calculates EVM EIP-1559 gas cost in ETH and USD using canonical effective gas price formula:
     effective_gas_price = base_fee + min(priority_fee, max_fee - base_fee).
-    Returns (gas_cost_eth, gas_cost_usd, 'MODELED_GAS_COST_WITH_ASSUMPTIONS').
+    Under canonical EIP-1559:
+      - max_fee_per_gas_wei must be >= base_fee_wei. If max_fee < base_fee, transaction cannot execute (fails closed).
+      - Returns status 'MODELED_GAS_COST_CANONICAL_EIP1559'.
+    If max_fee_per_gas_wei is None:
+      - Uncapped assumption is explicitly labeled 'MODELED_GAS_COST_UNCAPPED_LEGACY_ASSUMPTION' (not canonical EIP-1559).
     """
+    if base_fee_wei < 0 or priority_fee_wei < 0 or gas_used < 0:
+        raise ValueError("Gas parameters must be non-negative")
+
     if max_fee_per_gas_wei is not None:
-        effective_tip = min(priority_fee_wei, max(0, max_fee_per_gas_wei - base_fee_wei))
+        if max_fee_per_gas_wei < base_fee_wei:
+            return 0.0, 0.0, "MODELED_GAS_FAIL_MAX_FEE_BELOW_BASE_FEE"
+        effective_tip = min(priority_fee_wei, max_fee_per_gas_wei - base_fee_wei)
+        status_label = "MODELED_GAS_COST_CANONICAL_EIP1559"
     else:
         effective_tip = priority_fee_wei
+        status_label = "MODELED_GAS_COST_UNCAPPED_LEGACY_ASSUMPTION"
+
     effective_gas_price_wei = base_fee_wei + effective_tip
     gas_cost_wei = gas_used * effective_gas_price_wei
     gas_cost_eth = gas_cost_wei / 1e18
     gas_cost_usd = gas_cost_eth * native_usd_price
-    return gas_cost_eth, gas_cost_usd, "MODELED_GAS_COST_WITH_ASSUMPTIONS"
+    return gas_cost_eth, gas_cost_usd, status_label
 
 
 def calculate_solana_tx_fee_lamports(
@@ -1336,20 +1351,35 @@ class TwoLegExecutionSimulator:
                 return {"status": DualTrackTargetStatus.MODELED_ROUNDTRIP_UNRESOLVED_STATE_MISSING.value, "net_return_pct": None, "diagnostic": "TOUCH_V3_EVIDENCE_TOKEN_NOT_IN_POOL", "tranche_usd": tranche_usd}
 
         # 3. Gas calculation
-        _, gas_buy_usd, _ = calculate_evm_gas_cost_usd(
+        _, gas_buy_usd, buy_gas_status = calculate_evm_gas_cost_usd(
             gas_used=gas_used_buy,
             base_fee_wei=entry_state.base_fee_per_gas_wei,
             priority_fee_wei=entry_state.priority_fee_per_gas_wei,
             native_usd_price=entry_state.native_usd_price,
             max_fee_per_gas_wei=entry_state.max_fee_per_gas_wei,
         )
-        _, gas_sell_usd, _ = calculate_evm_gas_cost_usd(
+        if buy_gas_status == "MODELED_GAS_FAIL_MAX_FEE_BELOW_BASE_FEE":
+            return {
+                "status": DualTrackTargetStatus.MODELED_ROUNDTRIP_UNRESOLVED_STATE_MISSING.value,
+                "net_return_pct": None,
+                "diagnostic": "ENTRY_MAX_FEE_BELOW_BASE_FEE",
+                "tranche_usd": tranche_usd,
+            }
+
+        _, gas_sell_usd, sell_gas_status = calculate_evm_gas_cost_usd(
             gas_used=gas_used_sell,
             base_fee_wei=touch_state.base_fee_per_gas_wei,
             priority_fee_wei=touch_state.priority_fee_per_gas_wei,
             native_usd_price=touch_state.native_usd_price,
             max_fee_per_gas_wei=touch_state.max_fee_per_gas_wei,
         )
+        if sell_gas_status == "MODELED_GAS_FAIL_MAX_FEE_BELOW_BASE_FEE":
+            return {
+                "status": DualTrackTargetStatus.MODELED_ROUNDTRIP_UNRESOLVED_STATE_MISSING.value,
+                "net_return_pct": None,
+                "diagnostic": "TOUCH_MAX_FEE_BELOW_BASE_FEE",
+                "tranche_usd": tranche_usd,
+            }
 
         # 4. Leg 1: Entry Buy
         q_in = tranche_usd / entry_state.quote_usd_price
@@ -1357,19 +1387,50 @@ class TwoLegExecutionSimulator:
             ev = entry_state.evidence_v2
             if not ev or not ev.is_complete():
                 return {"status": DualTrackTargetStatus.MODELED_DEPTH_UNRESOLVED.value, "net_return_pct": None, "diagnostic": "V2_ENTRY_EVIDENCE_INCOMPLETE"}
-            # Assume token1 is quote, token0 is base
-            q_in_raw = int(q_in * (10 ** ev.token1_decimals))
-            ok_buy, tokens_acquired_raw, p_buy, impact_buy, _, _ = UniswapV2SwapSimulator.simulate_swap(
-                reserve_in=ev.raw_reserve1, reserve_out=ev.raw_reserve0, amount_in=q_in_raw, fee_bps=ev.fee_bps
-            )
+
+            canon_target = canonicalize_token_address(entry_state.token_address)
+            canon_t0 = canonicalize_token_address(ev.token0_address)
+            canon_t1 = canonicalize_token_address(ev.token1_address)
+
+            if canon_target == canon_t0:
+                # Tracked asset is token0, quote is token1
+                q_in_raw = int(q_in * (10 ** ev.token1_decimals))
+                ok_buy, tokens_acquired_raw, p_buy, impact_buy, _, _ = UniswapV2SwapSimulator.simulate_swap(
+                    reserve_in=ev.raw_reserve1, reserve_out=ev.raw_reserve0, amount_in=q_in_raw, fee_bps=ev.fee_bps
+                )
+            elif canon_target == canon_t1:
+                # Tracked asset is token1 (reversed), quote is token0
+                q_in_raw = int(q_in * (10 ** ev.token0_decimals))
+                ok_buy, tokens_acquired_raw, p_buy, impact_buy, _, _ = UniswapV2SwapSimulator.simulate_swap(
+                    reserve_in=ev.raw_reserve0, reserve_out=ev.raw_reserve1, amount_in=q_in_raw, fee_bps=ev.fee_bps
+                )
+            else:
+                return {"status": DualTrackTargetStatus.MODELED_ROUNDTRIP_UNRESOLVED_STATE_MISSING.value, "net_return_pct": None, "diagnostic": "V2_TARGET_TOKEN_NOT_IN_PAIR"}
+
             if not ok_buy:
                 return {"status": DualTrackTargetStatus.MODELED_TP40_LIQUIDITY_INSUFFICIENT.value, "net_return_pct": None, "diagnostic": "LEG1_BUY_FAILED_LIQUIDITY"}
         elif entry_state.venue_type == "UNISWAP_V3":
             ev3 = entry_state.evidence_v3
             if not ev3 or not ev3.is_complete():
                 return {"status": DualTrackTargetStatus.MODELED_DEPTH_UNRESOLVED.value, "net_return_pct": None, "diagnostic": "V3_ENTRY_EVIDENCE_INCOMPLETE"}
-            z4o_buy = entry_state.token0_is_quote
-            dec_in = ev3.token0_decimals if z4o_buy else ev3.token1_decimals
+
+            canon_target = canonicalize_token_address(entry_state.token_address)
+            canon_t0 = canonicalize_token_address(ev3.token0_address)
+            canon_t1 = canonicalize_token_address(ev3.token1_address)
+
+            if canon_target == canon_t0:
+                if entry_state.token0_is_quote:
+                    return {"status": DualTrackTargetStatus.MODELED_ROUNDTRIP_UNRESOLVED_STATE_MISSING.value, "net_return_pct": None, "diagnostic": "V3_ORIENTATION_CONFLICT_TOKEN0_BASE_BUT_FLAG_TRUE"}
+                z4o_buy = False
+                dec_in = ev3.token1_decimals
+            elif canon_target == canon_t1:
+                if not entry_state.token0_is_quote:
+                    return {"status": DualTrackTargetStatus.MODELED_ROUNDTRIP_UNRESOLVED_STATE_MISSING.value, "net_return_pct": None, "diagnostic": "V3_ORIENTATION_CONFLICT_TOKEN1_BASE_BUT_FLAG_FALSE"}
+                z4o_buy = True
+                dec_in = ev3.token0_decimals
+            else:
+                return {"status": DualTrackTargetStatus.MODELED_ROUNDTRIP_UNRESOLVED_STATE_MISSING.value, "net_return_pct": None, "diagnostic": "V3_ENTRY_TOKEN_NOT_IN_POOL"}
+
             q_in_raw = int(q_in * (10 ** dec_in))
             ok_buy, consumed, tokens_acquired_raw, _, diag = UniswapV3SwapSimulator.simulate_swap(
                 ev3, amount_in=q_in_raw, zero_for_one=z4o_buy
@@ -1384,23 +1445,56 @@ class TwoLegExecutionSimulator:
             ev_touch = touch_state.evidence_v2
             if not ev_touch or not ev_touch.is_complete():
                 return {"status": DualTrackTargetStatus.MODELED_DEPTH_UNRESOLVED.value, "net_return_pct": None, "diagnostic": "V2_TOUCH_EVIDENCE_INCOMPLETE"}
-            ok_sell, q_out_raw, p_sell, impact_sell, _, _ = UniswapV2SwapSimulator.simulate_swap(
-                reserve_in=ev_touch.raw_reserve0, reserve_out=ev_touch.raw_reserve1, amount_in=tokens_acquired_raw, fee_bps=ev_touch.fee_bps
-            )
-            if not ok_sell:
-                return {"status": DualTrackTargetStatus.MODELED_TP40_LIQUIDITY_INSUFFICIENT.value, "net_return_pct": None, "diagnostic": "LEG2_SELL_FAILED_LIQUIDITY"}
-            gross_proceeds_usd = (q_out_raw / (10 ** ev_touch.token1_decimals)) * touch_state.quote_usd_price
+
+            canon_target = canonicalize_token_address(touch_state.token_address)
+            canon_t0 = canonicalize_token_address(ev_touch.token0_address)
+            canon_t1 = canonicalize_token_address(ev_touch.token1_address)
+
+            if canon_target == canon_t0:
+                # Selling token0 for quote token1
+                ok_sell, q_out_raw, p_sell, impact_sell, _, _ = UniswapV2SwapSimulator.simulate_swap(
+                    reserve_in=ev_touch.raw_reserve0, reserve_out=ev_touch.raw_reserve1, amount_in=tokens_acquired_raw, fee_bps=ev_touch.fee_bps
+                )
+                if not ok_sell:
+                    return {"status": DualTrackTargetStatus.MODELED_TP40_LIQUIDITY_INSUFFICIENT.value, "net_return_pct": None, "diagnostic": "LEG2_SELL_FAILED_LIQUIDITY"}
+                gross_proceeds_usd = (q_out_raw / (10 ** ev_touch.token1_decimals)) * touch_state.quote_usd_price
+            elif canon_target == canon_t1:
+                # Selling token1 for quote token0
+                ok_sell, q_out_raw, p_sell, impact_sell, _, _ = UniswapV2SwapSimulator.simulate_swap(
+                    reserve_in=ev_touch.raw_reserve1, reserve_out=ev_touch.raw_reserve0, amount_in=tokens_acquired_raw, fee_bps=ev_touch.fee_bps
+                )
+                if not ok_sell:
+                    return {"status": DualTrackTargetStatus.MODELED_TP40_LIQUIDITY_INSUFFICIENT.value, "net_return_pct": None, "diagnostic": "LEG2_SELL_FAILED_LIQUIDITY"}
+                gross_proceeds_usd = (q_out_raw / (10 ** ev_touch.token0_decimals)) * touch_state.quote_usd_price
+            else:
+                return {"status": DualTrackTargetStatus.MODELED_ROUNDTRIP_UNRESOLVED_STATE_MISSING.value, "net_return_pct": None, "diagnostic": "V2_TOUCH_TARGET_TOKEN_NOT_IN_PAIR"}
         elif touch_state.venue_type == "UNISWAP_V3":
             ev3_touch = touch_state.evidence_v3
             if not ev3_touch or not ev3_touch.is_complete():
                 return {"status": DualTrackTargetStatus.MODELED_DEPTH_UNRESOLVED.value, "net_return_pct": None, "diagnostic": "V3_TOUCH_EVIDENCE_INCOMPLETE"}
-            z4o_sell = not touch_state.token0_is_quote
+
+            canon_target = canonicalize_token_address(touch_state.token_address)
+            canon_t0 = canonicalize_token_address(ev3_touch.token0_address)
+            canon_t1 = canonicalize_token_address(ev3_touch.token1_address)
+
+            if canon_target == canon_t0:
+                if touch_state.token0_is_quote:
+                    return {"status": DualTrackTargetStatus.MODELED_ROUNDTRIP_UNRESOLVED_STATE_MISSING.value, "net_return_pct": None, "diagnostic": "V3_TOUCH_ORIENTATION_CONFLICT"}
+                z4o_sell = True
+                dec_out = ev3_touch.token1_decimals
+            elif canon_target == canon_t1:
+                if not touch_state.token0_is_quote:
+                    return {"status": DualTrackTargetStatus.MODELED_ROUNDTRIP_UNRESOLVED_STATE_MISSING.value, "net_return_pct": None, "diagnostic": "V3_TOUCH_ORIENTATION_CONFLICT"}
+                z4o_sell = False
+                dec_out = ev3_touch.token0_decimals
+            else:
+                return {"status": DualTrackTargetStatus.MODELED_ROUNDTRIP_UNRESOLVED_STATE_MISSING.value, "net_return_pct": None, "diagnostic": "V3_TOUCH_TOKEN_NOT_IN_POOL"}
+
             ok_sell, consumed, q_out_raw, _, diag = UniswapV3SwapSimulator.simulate_swap(
                 ev3_touch, amount_in=tokens_acquired_raw, zero_for_one=z4o_sell
             )
             if not ok_sell:
                 return {"status": DualTrackTargetStatus.MODELED_TP40_LIQUIDITY_INSUFFICIENT.value, "net_return_pct": None, "diagnostic": f"LEG2_SELL_FAILED_LIQUIDITY_{diag}"}
-            dec_out = ev3_touch.token0_decimals if touch_state.token0_is_quote else ev3_touch.token1_decimals
             gross_proceeds_usd = (q_out_raw / (10 ** dec_out)) * touch_state.quote_usd_price
         else:
             return {"status": DualTrackTargetStatus.MODELED_DEPTH_UNRESOLVED.value, "net_return_pct": None, "diagnostic": f"UNSUPPORTED_VENUE_{touch_state.venue_type}"}
@@ -1471,7 +1565,9 @@ class LiquidityClassificationEngine:
         records: List[LiquidityObservationRecord],
         initial_t0_utc: str,
     ) -> Dict[str, Any]:
-        """Evaluates 24-hour liquidity trajectory respecting collapse precedence."""
+        """Evaluates 24-hour liquidity trajectory respecting collapse precedence, strict window boundaries,
+        and single-identity consistency.
+        """
         if not records:
             return {
                 "status": LiquidityClassificationStatus.UNRESOLVED_LIQUIDITY.value,
@@ -1483,15 +1579,34 @@ class LiquidityClassificationEngine:
                 "recovery_confirmed_at_window_end": False,
             }
 
-        rec0 = records[0]
-        initial_ask = rec0.d_ask_plus_2pct
-        initial_bid = rec0.d_bid_minus_2pct
-        initial_usd = rec0.liquidity_usd
+        # 1. Enforce common exact identity across all records
+        target_chain = records[0].chain_id
+        target_token = canonicalize_token_address(records[0].token_mint)
+        target_pool = canonicalize_token_address(records[0].pool_address)
 
-        if initial_ask <= 0 or initial_bid <= 0:
+        for r in records:
+            if (
+                r.chain_id != target_chain
+                or canonicalize_token_address(r.token_mint) != target_token
+                or canonicalize_token_address(r.pool_address) != target_pool
+            ):
+                return {
+                    "status": LiquidityClassificationStatus.UNRESOLVED_LIQUIDITY.value,
+                    "diagnostic": "MIXED_IDENTITY_IN_LIQUIDITY_RECORDS",
+                    "window_end_status": "WINDOW_END_UNRESOLVED",
+                    "liquidity_end_usd_observed_unverified": None,
+                    "liquidity_end_usd_authenticated_verified": None,
+                    "recovery_observed_after_collapse": False,
+                    "recovery_confirmed_at_window_end": False,
+                }
+
+        # 2. Parse timestamps and sort chronologically
+        try:
+            t0_dt = dt.datetime.fromisoformat(initial_t0_utc.replace("Z", "+00:00"))
+        except Exception:
             return {
                 "status": LiquidityClassificationStatus.UNRESOLVED_LIQUIDITY.value,
-                "diagnostic": "INITIAL_DEPTH_NON_POSITIVE",
+                "diagnostic": "INVALID_INITIAL_T0_TIMESTAMP",
                 "window_end_status": "WINDOW_END_UNRESOLVED",
                 "liquidity_end_usd_observed_unverified": None,
                 "liquidity_end_usd_authenticated_verified": None,
@@ -1499,24 +1614,41 @@ class LiquidityClassificationEngine:
                 "recovery_confirmed_at_window_end": False,
             }
 
-        # Check window boundaries
-        t0_dt = dt.datetime.fromisoformat(initial_t0_utc.replace("Z", "+00:00"))
+        parsed_records = []
+        for r in records:
+            try:
+                r_dt = dt.datetime.fromisoformat(r.source_event_timestamp_utc.replace("Z", "+00:00"))
+                parsed_records.append((r_dt, r))
+            except Exception:
+                return {
+                    "status": LiquidityClassificationStatus.UNRESOLVED_LIQUIDITY.value,
+                    "diagnostic": "INVALID_RECORD_TIMESTAMP",
+                    "window_end_status": "WINDOW_END_UNRESOLVED",
+                    "liquidity_end_usd_observed_unverified": None,
+                    "liquidity_end_usd_authenticated_verified": None,
+                    "recovery_observed_after_collapse": False,
+                    "recovery_confirmed_at_window_end": False,
+                }
+
+        parsed_records.sort(key=lambda x: x[0])
+
+        # 3. Restrict records to 24-hour evaluation window [t0, t0 + 24.0h] (excluding out-of-window samples)
         t_init_end = t0_dt + dt.timedelta(hours=0.5)
         t_term_start = t0_dt + dt.timedelta(hours=23.5)
         t_term_end = t0_dt + dt.timedelta(hours=24.0)
 
-        # Initial sample check: [t0, t0 + 0.5h]
+        in_window = [(r_dt, r) for r_dt, r in parsed_records if t0_dt <= r_dt <= t_term_end]
+
+        # 4. Initial sample check: [t0, t0 + 0.5h]
         initial_rec = None
-        for r in records:
-            r_dt = dt.datetime.fromisoformat(r.source_event_timestamp_utc.replace("Z", "+00:00"))
+        for r_dt, r in in_window:
             if t0_dt <= r_dt <= t_init_end:
                 initial_rec = r
                 break
 
-        # Terminal sample check: [t0 + 23.5h, t0 + 24.0h]
+        # 5. Terminal sample check: [t0 + 23.5h, t0 + 24.0h]
         terminal_rec = None
-        for r in reversed(records):
-            r_dt = dt.datetime.fromisoformat(r.source_event_timestamp_utc.replace("Z", "+00:00"))
+        for r_dt, r in reversed(in_window):
             if t_term_start <= r_dt <= t_term_end:
                 terminal_rec = r
                 break
@@ -1525,8 +1657,50 @@ class LiquidityClassificationEngine:
         liquidity_end_usd_unverified = terminal_rec.liquidity_usd if terminal_rec else None
         liquidity_end_usd_verified = None  # Strictly None in Stage 3.2
 
+        has_lp_burn = any(r.has_lp_burn_event for _, r in in_window)
+
+        if initial_rec is None:
+            if has_lp_burn:
+                return {
+                    "status": LiquidityClassificationStatus.LP_WITHDRAWAL_COLLAPSE_OBSERVED_UNVERIFIED.value,
+                    "window_end_status": window_end_status,
+                    "min_depth_ratio": None,
+                    "depth_min_timestamp_utc": None,
+                    "recovery_observed_after_collapse": False,
+                    "recovery_confirmed_at_window_end": False,
+                    "liquidity_end_usd_observed_unverified": liquidity_end_usd_unverified,
+                    "liquidity_end_usd_authenticated_verified": None,
+                }
+            return {
+                "status": LiquidityClassificationStatus.UNRESOLVED_LIQUIDITY.value,
+                "diagnostic": "INITIAL_SAMPLE_MISSING",
+                "window_end_status": window_end_status,
+                "min_depth_ratio": None,
+                "recovery_observed_after_collapse": False,
+                "recovery_confirmed_at_window_end": False,
+                "liquidity_end_usd_observed_unverified": liquidity_end_usd_unverified,
+                "liquidity_end_usd_authenticated_verified": None,
+            }
+
+        # Use validated initial-window sample as baseline
+        initial_ask = initial_rec.d_ask_plus_2pct
+        initial_bid = initial_rec.d_bid_minus_2pct
+        initial_usd = initial_rec.liquidity_usd
+
+        if initial_ask <= 0 or initial_bid <= 0:
+            return {
+                "status": LiquidityClassificationStatus.UNRESOLVED_LIQUIDITY.value,
+                "diagnostic": "INITIAL_DEPTH_NON_POSITIVE",
+                "window_end_status": window_end_status,
+                "min_depth_ratio": None,
+                "liquidity_end_usd_observed_unverified": liquidity_end_usd_unverified,
+                "liquidity_end_usd_authenticated_verified": None,
+                "recovery_observed_after_collapse": False,
+                "recovery_confirmed_at_window_end": False,
+            }
+
         recovery_confirmed_end = False
-        if terminal_rec:
+        if terminal_rec is not None:
             r_end_depth = min(terminal_rec.d_ask_plus_2pct / initial_ask, terminal_rec.d_bid_minus_2pct / initial_bid)
             if r_end_depth >= 0.80:
                 recovery_confirmed_end = True
@@ -1535,12 +1709,8 @@ class LiquidityClassificationEngine:
         min_depth_ratio = 1.0
         depth_collapse_detected = False
         depth_min_timestamp = None
-        has_lp_burn = False
 
-        for r in records:
-            if r.has_lp_burn_event:
-                has_lp_burn = True
-
+        for r_dt, r in in_window:
             ratio_ask = r.d_ask_plus_2pct / initial_ask
             ratio_bid = r.d_bid_minus_2pct / initial_bid
             r_depth = min(ratio_ask, ratio_bid)
@@ -1555,7 +1725,7 @@ class LiquidityClassificationEngine:
         # Recovery checks after collapse
         recovery_observed = False
         if depth_collapse_detected and depth_min_timestamp:
-            for r in records:
+            for r_dt, r in in_window:
                 if r.source_event_timestamp_utc > depth_min_timestamp:
                     r_depth = min(r.d_ask_plus_2pct / initial_ask, r.d_bid_minus_2pct / initial_bid)
                     if r_depth >= 0.80:
@@ -1588,18 +1758,6 @@ class LiquidityClassificationEngine:
             }
 
         # Priority 2: Missing observations & boundary coverage
-        if initial_rec is None:
-            return {
-                "status": LiquidityClassificationStatus.UNRESOLVED_LIQUIDITY.value,
-                "diagnostic": "INITIAL_SAMPLE_MISSING",
-                "window_end_status": window_end_status,
-                "min_depth_ratio": round(min_depth_ratio, 4),
-                "recovery_observed_after_collapse": False,
-                "recovery_confirmed_at_window_end": recovery_confirmed_end,
-                "liquidity_end_usd_observed_unverified": liquidity_end_usd_unverified,
-                "liquidity_end_usd_authenticated_verified": None,
-            }
-
         if terminal_rec is None:
             return {
                 "status": LiquidityClassificationStatus.UNRESOLVED_LIQUIDITY.value,
@@ -1613,9 +1771,9 @@ class LiquidityClassificationEngine:
             }
 
         has_gap = False
-        for i in range(len(records) - 1):
-            t1 = dt.datetime.fromisoformat(records[i].source_event_timestamp_utc.replace("Z", "+00:00"))
-            t2 = dt.datetime.fromisoformat(records[i + 1].source_event_timestamp_utc.replace("Z", "+00:00"))
+        for i in range(len(in_window) - 1):
+            t1 = in_window[i][0]
+            t2 = in_window[i + 1][0]
             if (t2 - t1).total_seconds() > 6 * 3600:
                 has_gap = True
                 break
@@ -1645,7 +1803,7 @@ class LiquidityClassificationEngine:
             }
 
         # Priority 4: Survived or Asset Price Depreciation
-        min_usd_ratio = min((r.liquidity_usd / initial_usd) for r in records)
+        min_usd_ratio = min((r.liquidity_usd / initial_usd) for _, r in in_window)
         if min_usd_ratio < 0.20:
             status = LiquidityClassificationStatus.ASSET_PRICE_DEPRECIATION_OBSERVED_UNVERIFIED
         else:
