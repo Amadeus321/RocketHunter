@@ -411,6 +411,60 @@ class TestStage32TwoLegExecutionAndGasMath(unittest.TestCase):
         self.assertEqual(res5["status"], DualTrackTargetStatus.MODELED_ROUNDTRIP_UNRESOLVED_STATE_MISSING.value)
         self.assertIn("BLOCK_PROVENANCE_MISMATCH", res5["diagnostic"])
 
+    def test_simulate_roundtrip_solana_snapshot_fails_closed_without_evm_gas(self):
+        """AC-1, AC-7: Asserts Solana / non-EVM snapshot cannot be charged EVM gas or treated as supported roundtrip."""
+        sol_entry = PoolStateSnapshot(
+            chain_id=101,  # Solana Mainnet
+            token_address="So11111111111111111111111111111111111111112",
+            pool_address="58oQChx4yWmvKdwLLZzBi4ChoCc2fqCUWBkwMihLYQo2",
+            block_number=280_000_000,
+            block_hash="4Nd1mBQtrMJVYVfKf2PJy9NZToeBlAoibJ27JwV7GbpJ",
+            source_timestamp_utc="2026-11-15T00:00:00Z",
+            venue_type="RAYDIUM",
+            quote_usd_price=1.0,
+            native_usd_price=150.0,
+            base_fee_per_gas_wei=20_000_000_000,
+            priority_fee_per_gas_wei=2_000_000_000,
+        )
+        sol_touch = dataclasses.replace(
+            sol_entry,
+            block_number=280_001_000,
+            block_hash="5Me2nCRusNKWZWgLg3QKz0OafCpbcKpjKd38KxW8HcqK",
+            source_timestamp_utc="2026-11-15T02:00:00Z",
+        )
+
+        res = TwoLegExecutionSimulator.simulate_roundtrip(sol_entry, sol_touch, tranche_usd=500.0)
+        self.assertEqual(res["status"], DualTrackTargetStatus.MODELED_ROUNDTRIP_UNRESOLVED_STATE_MISSING.value)
+        self.assertEqual(res["diagnostic"], "UNSUPPORTED_NON_EVM_CHAIN_SOLANA_101")
+        self.assertIsNone(res["net_return_pct"])
+        # Must NOT be charged EVM gas or assigned EVM gas model labels
+        self.assertIsNone(res["gas_buy_model_label"])
+        self.assertIsNone(res["gas_sell_model_label"])
+        self.assertEqual(res["gas_buy_usd"], 0.0)
+        self.assertEqual(res["gas_sell_usd"], 0.0)
+
+        # Cross-contamination test: Solana chain_id with spoofed venue_type="UNISWAP_V2" must also fail closed
+        sol_spoofed_entry = dataclasses.replace(sol_entry, venue_type="UNISWAP_V2")
+        sol_spoofed_touch = dataclasses.replace(sol_touch, venue_type="UNISWAP_V2")
+        res_spoof = TwoLegExecutionSimulator.simulate_roundtrip(sol_spoofed_entry, sol_spoofed_touch, tranche_usd=500.0)
+        self.assertEqual(res_spoof["status"], DualTrackTargetStatus.MODELED_ROUNDTRIP_UNRESOLVED_STATE_MISSING.value)
+        self.assertEqual(res_spoof["diagnostic"], "UNSUPPORTED_NON_EVM_CHAIN_SOLANA_101")
+        self.assertIsNone(res_spoof["gas_buy_model_label"])
+        self.assertIsNone(res_spoof["gas_sell_model_label"])
+        self.assertEqual(res_spoof["gas_buy_usd"], 0.0)
+        self.assertEqual(res_spoof["gas_sell_usd"], 0.0)
+
+        # Unsupported venue on EVM chain (e.g. RAYDIUM on chain_id=1) must also fail closed without charging EVM gas
+        evm_unsupported_venue_entry = dataclasses.replace(sol_entry, chain_id=1, venue_type="RAYDIUM")
+        evm_unsupported_venue_touch = dataclasses.replace(sol_touch, chain_id=1, venue_type="RAYDIUM")
+        res_venue = TwoLegExecutionSimulator.simulate_roundtrip(evm_unsupported_venue_entry, evm_unsupported_venue_touch, tranche_usd=500.0)
+        self.assertEqual(res_venue["status"], DualTrackTargetStatus.MODELED_ROUNDTRIP_UNRESOLVED_STATE_MISSING.value)
+        self.assertEqual(res_venue["diagnostic"], "UNSUPPORTED_VENUE_RAYDIUM")
+        self.assertIsNone(res_venue["gas_buy_model_label"])
+        self.assertIsNone(res_venue["gas_sell_model_label"])
+        self.assertEqual(res_venue["gas_buy_usd"], 0.0)
+        self.assertEqual(res_venue["gas_sell_usd"], 0.0)
+
     def test_simulate_roundtrip_max_fee_below_base_fee_fails_closed(self):
         """AC-1, AC-7: Max fee below base fee fails closed with ENTRY_MAX_FEE_BELOW_BASE_FEE."""
         base_entry = PoolStateSnapshot(
@@ -672,7 +726,7 @@ class TestStage32TwoLegExecutionAndGasMath(unittest.TestCase):
         self.assertAlmostEqual(fee_sol, 0.000005247, places=12)
         # 0.000005247 * $150.00 = $0.00078705
         self.assertAlmostEqual(fee_usd, 0.00078705, places=8)
-        self.assertEqual(label, "MODELED_GAS_COST_WITH_ASSUMPTIONS")
+        self.assertEqual(label, "MODELED_GAS_COST_SOLANA_COMPUTE_UNITS")
 
 
 class TestUniswapV3ExactMathAndSimulation(unittest.TestCase):

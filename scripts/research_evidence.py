@@ -1383,14 +1383,14 @@ def calculate_solana_tx_fee_usd(
     sol_usd_price: float,
 ) -> Tuple[float, float, str]:
     """Calculates Solana transaction fee in SOL and USD with ceiling rounding.
-    Returns (fee_sol, fee_usd, 'MODELED_GAS_COST_WITH_ASSUMPTIONS').
+    Returns (fee_sol, fee_usd, 'MODELED_GAS_COST_SOLANA_COMPUTE_UNITS').
     """
     fee_lamports = calculate_solana_tx_fee_lamports(
         base_signatures, compute_unit_limit, compute_unit_price_micro_lamports
     )
     fee_sol = fee_lamports / 1e9
     fee_usd = fee_sol * sol_usd_price
-    return fee_sol, fee_usd, "MODELED_GAS_COST_WITH_ASSUMPTIONS"
+    return fee_sol, fee_usd, "MODELED_GAS_COST_SOLANA_COMPUTE_UNITS"
 
 
 @dataclasses.dataclass
@@ -1470,6 +1470,35 @@ class TwoLegExecutionSimulator:
                 "status": DualTrackTargetStatus.MODELED_ROUNDTRIP_UNRESOLVED_STATE_MISSING.value,
                 "net_return_pct": None,
                 "diagnostic": f"BLOCK_ORDER_INVALID_TOUCH_{touch_state.block_number}_LT_ENTRY_{entry_state.block_number}",
+                "tranche_usd": tranche_usd,
+            }
+
+        # 2b. Non-EVM / unsupported chain and venue validation
+        SOLANA_CHAIN_IDS = {101, 102, 103}  # 101: Solana Mainnet, 102: Testnet, 103: Devnet
+        if entry_state.chain_id in SOLANA_CHAIN_IDS or touch_state.chain_id in SOLANA_CHAIN_IDS:
+            return {
+                "status": DualTrackTargetStatus.MODELED_ROUNDTRIP_UNRESOLVED_STATE_MISSING.value,
+                "net_return_pct": None,
+                "diagnostic": f"UNSUPPORTED_NON_EVM_CHAIN_SOLANA_{entry_state.chain_id}",
+                "gas_buy_model_label": None,
+                "gas_sell_model_label": None,
+                "gas_buy_usd": 0.0,
+                "gas_sell_usd": 0.0,
+                "tranche_usd": tranche_usd,
+            }
+
+        if (
+            entry_state.venue_type not in {"UNISWAP_V2", "UNISWAP_V3"}
+            or touch_state.venue_type not in {"UNISWAP_V2", "UNISWAP_V3"}
+        ):
+            return {
+                "status": DualTrackTargetStatus.MODELED_ROUNDTRIP_UNRESOLVED_STATE_MISSING.value,
+                "net_return_pct": None,
+                "diagnostic": f"UNSUPPORTED_VENUE_{entry_state.venue_type}",
+                "gas_buy_model_label": None,
+                "gas_sell_model_label": None,
+                "gas_buy_usd": 0.0,
+                "gas_sell_usd": 0.0,
                 "tranche_usd": tranche_usd,
             }
 
