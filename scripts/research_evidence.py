@@ -1190,14 +1190,19 @@ class ClusteredEvaluationEngine:
         t_val = z + (z**3 + z) / (4.0 * df) + (5.0 * z**5 + 16.0 * z**3 + 3.0 * z) / (96.0 * df**2)
         return round(t_val, 4)
 
-    @staticmethod
-    def get_structural_counts(dataset: list[dict[str, Any]]) -> dict[str, int]:
-        """Returns raw structural dimensions without claiming an ungrounded scalar N_eff."""
-        tokens = set(x["token_id"] for x in dataset)
-        weeks = set(x["week_block"] for x in dataset)
+    @classmethod
+    def get_structural_counts(cls, dataset: list[dict[str, Any]]) -> dict[str, int]:
+        """Returns raw structural dimensions normalized by parsed week index."""
+        tokens = set(x.get("token_id") for x in dataset)
+        raw_weeks = [x.get("week_block") for x in dataset]
+        is_valid, _, unique_blocks, _ = cls.validate_and_classify_dataset_weeks(raw_weeks)
+        if is_valid and unique_blocks:
+            b_weeks = len(unique_blocks)
+        else:
+            b_weeks = len(set(raw_weeks))
         return {
             "M_tokens": len(tokens),
-            "B_weeks": len(weeks),
+            "B_weeks": b_weeks,
             "N_obs": len(dataset),
         }
 
@@ -1239,14 +1244,31 @@ class ClusteredEvaluationEngine:
         var_token = (M / (M - 1)) * sum(s**2 for s in token_sums.values()) / (N**2) if M > 1 else var_naive
 
         # 3. Time-block clustered variance (V_time)
+        # Group observations by continuous week index so aliases belong to the same cluster
+        raw_weeks = [x.get("week_block") for x in dataset]
+        is_valid, _, _, _ = cls.validate_and_classify_dataset_weeks(raw_weeks)
+        if is_valid:
+            parsed_idx_map = {w: cls.classify_and_parse_week(w)[1] for w in set(raw_weeks)}
+        else:
+            parsed_idx_map = {w: w for w in set(raw_weeks)}
+
         week_sums: dict[Any, float] = {}
         for idx, obs in enumerate(dataset):
-            w_id = obs["week_block"]
-            week_sums[w_id] = week_sums.get(w_id, 0.0) + residuals[idx]
+            w_val = obs.get("week_block")
+            cluster_key = parsed_idx_map.get(w_val, w_val)
+            week_sums[cluster_key] = week_sums.get(cluster_key, 0.0) + residuals[idx]
         var_time = (B / (B - 1)) * sum(s**2 for s in week_sums.values()) / (N**2) if B > 1 else var_naive
 
         # 4. Intersection variance (V_token_intersect_time)
-        var_inter = (N / (N - 1)) * sum(r**2 for r in residuals) / (N**2)
+        inter_sums: dict[Tuple[str, Any], float] = {}
+        for idx, obs in enumerate(dataset):
+            t_id = obs["token_id"]
+            w_val = obs.get("week_block")
+            cluster_key = parsed_idx_map.get(w_val, w_val)
+            pair_key = (t_id, cluster_key)
+            inter_sums[pair_key] = inter_sums.get(pair_key, 0.0) + residuals[idx]
+        K_inter = len(inter_sums)
+        var_inter = (K_inter / (K_inter - 1)) * sum(s**2 for s in inter_sums.values()) / (N**2) if K_inter > 1 else var_naive
 
         # 5. Exact Cameron-Gelbach-Miller two-way variance
         var_twoway = var_token + var_time - var_inter
@@ -1278,6 +1300,7 @@ class ClusteredEvaluationEngine:
     def classify_and_parse_week(cls, week_val: Any) -> Tuple[str, Optional[int]]:
         """Classifies a week identifier into an explicit format family and continuous week index.
         Returns: (format_family, integer_index) or ('INVALID', None). Never fabricates arbitrary hashes.
+        Rejects ambiguous numeric timestamps lacking an explicit unit.
         """
         if week_val is None:
             return "INVALID", None
@@ -1309,13 +1332,35 @@ class ClusteredEvaluationEngine:
         if week_num_match:
             return "RELATIVE_LABEL", int(week_num_match.group(1))
 
-        # 4. Integer index or Unix epoch timestamp
+        # 4. Explicit Unix timestamp with unit (seconds vs milliseconds)
+        # Suffix matching:
+        ms_suffix_match = re.fullmatch(r"(\d+)(?:_?ms|_?msec)", s, re.IGNORECASE)
+        s_suffix_match = re.fullmatch(r"(\d+)(?:_?s|_?sec)", s, re.IGNORECASE)
+        epoch_prefix_match = re.fullmatch(r"epoch_?(s|ms):?\s*(\d+)", s, re.IGNORECASE)
+
+        if ms_suffix_match:
+            ms_val = int(ms_suffix_match.group(1))
+            return "UNIX_TIMESTAMP", (ms_val // 1000) // (7 * 86400)
+        elif s_suffix_match:
+            s_val = int(s_suffix_match.group(1))
+            return "UNIX_TIMESTAMP", s_val // (7 * 86400)
+        elif epoch_prefix_match:
+            unit = epoch_prefix_match.group(1).lower()
+            val = int(epoch_prefix_match.group(2))
+            if unit == "ms":
+                return "UNIX_TIMESTAMP", (val // 1000) // (7 * 86400)
+            else:
+                return "UNIX_TIMESTAMP", val // (7 * 86400)
+
+        # 5. Plain relative integer (small numbers e.g. 0, 1, 2, ..., 52, up to 100,000)
+        # Large bare integers (> 100,000) without explicit unit are strictly rejected as ambiguous
         if s.isdigit() or (s.startswith("-") and s[1:].isdigit()):
             try:
                 val = int(s)
-                if val > 1_000_000:
-                    return "UNIX_TIMESTAMP", val // (7 * 86400)
-                return "RELATIVE_INTEGER", val
+                if abs(val) <= 100_000:
+                    return "RELATIVE_INTEGER", val
+                else:
+                    return "INVALID", None
             except ValueError:
                 return "INVALID", None
 
@@ -1324,10 +1369,11 @@ class ClusteredEvaluationEngine:
     @classmethod
     def validate_and_classify_dataset_weeks(
         cls, raw_weeks: list[Any]
-    ) -> Tuple[bool, str, list[Tuple[Any, int]], str]:
+    ) -> Tuple[bool, str, list[dict[str, Any]], str]:
         """Validates that all week identifiers in the dataset conform to a single, consistent format family.
-        Strictly rejects invalid identifiers and mixed formats without fabricating hashes.
-        Returns: (is_valid, format_family, sorted_unique_pairs, diagnostic_reason)
+        Strictly rejects invalid identifiers, ambiguous numeric timestamps, and mixed formats.
+        Returns: (is_valid, format_family, unique_blocks, diagnostic_reason)
+        where unique_blocks is sorted chronologically by continuous week index and groups same-week aliases.
         """
         if not raw_weeks:
             return True, "EMPTY", [], "EMPTY_DATASET"
@@ -1336,7 +1382,12 @@ class ClusteredEvaluationEngine:
         for w in set(raw_weeks):
             fmt, idx = cls.classify_and_parse_week(w)
             if fmt == "INVALID" or idx is None:
-                return False, "INVALID", [], f"Unrecognized or invalid week identifier: {w}"
+                s = str(w).strip()
+                if s.isdigit() and int(s) > 100_000:
+                    reason = f"Ambiguous numeric timestamp without explicit unit (e.g. 's' or 'ms'): {w}"
+                else:
+                    reason = f"Unrecognized or invalid week identifier: {w}"
+                return False, "INVALID", [], reason
             parsed_map[w] = (fmt, idx)
 
         formats = {fmt for fmt, _ in parsed_map.values()}
@@ -1344,11 +1395,29 @@ class ClusteredEvaluationEngine:
             return False, "MIXED", [], f"Mixed week format families detected: {sorted(list(formats))}"
 
         format_family = list(formats)[0]
-        sorted_pairs = sorted(
-            [(w, parsed_map[w][1]) for w in parsed_map],
-            key=lambda item: (item[1], str(item[0]))
-        )
-        return True, format_family, sorted_pairs, "VALID_CONSISTENT_FORMAT"
+
+        # Group by unique week index (normalizing same-week aliases)
+        # Maintain first seen label order from raw_weeks for consistent block labeling
+        first_seen_label: dict[int, Any] = {}
+        all_labels_for_idx: dict[int, set[Any]] = {}
+        for w in raw_weeks:
+            idx = parsed_map[w][1]
+            if idx not in first_seen_label:
+                first_seen_label[idx] = w
+                all_labels_for_idx[idx] = set()
+            all_labels_for_idx[idx].add(w)
+
+        unique_indices = sorted(first_seen_label.keys())
+        unique_blocks = [
+            {
+                "week_index": idx,
+                "representative_label": first_seen_label[idx],
+                "alias_labels": all_labels_for_idx[idx],
+            }
+            for idx in unique_indices
+        ]
+
+        return True, format_family, unique_blocks, "VALID_CONSISTENT_FORMAT"
 
     @classmethod
     def parse_utc_week_index(cls, week_val: Any) -> int:
@@ -1399,26 +1468,14 @@ class ClusteredEvaluationEngine:
         cls, dataset: list[dict[str, Any]], field: str = "loss_diff"
     ) -> dict[str, Any]:
         """Evaluates lag-1 and lag-2 autocorrelations of weekly block-mean residuals in chronological order.
-        Strictly rejects invalid identifiers and mixed formats without producing dependence estimates.
+        Strictly rejects invalid identifiers, ambiguous numeric timestamps, and mixed formats
+        before performing any count or dependence calculations.
+        Normalizes same-week aliases by continuous week index.
         """
-        counts = cls.get_structural_counts(dataset)
-        B = counts["B_weeks"]
-        if B < 3:
-            return {
-                "rho_1": 0.0,
-                "rho_2": 0.0,
-                "bartlett_threshold": 1.0,
-                "fallback_triggered": False,
-                "newey_west_se": 0.0,
-                "week_means": [],
-                "chronological_weeks": [],
-                "is_valid_format": True,
-                "diagnostic_reason": "B_WEEKS_LESS_THAN_3",
-            }
-
         raw_weeks = [x.get("week_block") for x in dataset]
-        is_valid, fmt_family, sorted_pairs, reason = cls.validate_and_classify_dataset_weeks(raw_weeks)
+        is_valid, fmt_family, unique_blocks, reason = cls.validate_and_classify_dataset_weeks(raw_weeks)
 
+        # 1. Format validation first: invalid or mixed formats fail closed immediately
         if not is_valid:
             return {
                 "rho_1": 0.0,
@@ -1433,13 +1490,45 @@ class ClusteredEvaluationEngine:
                 "diagnostic_reason": reason,
             }
 
-        sorted_weeks = [w for w, _ in sorted_pairs]
-        week_indices = [idx for _, idx in sorted_pairs]
+        # 2. Extract normalized blocks grouped by week index
+        B = len(unique_blocks)
+        if B < 3:
+            block_means = []
+            chronological_weeks = []
+            if unique_blocks:
+                parsed_idx_map = {w: cls.classify_and_parse_week(w)[1] for w in set(raw_weeks)}
+                for b in unique_blocks:
+                    idx = b["week_index"]
+                    obs_w = [x[field] for x in dataset if parsed_idx_map.get(x.get("week_block")) == idx]
+                    if obs_w:
+                        block_means.append(sum(obs_w) / len(obs_w))
+                        chronological_weeks.append(b["representative_label"])
 
+            return {
+                "rho_1": 0.0,
+                "rho_adj": 0.0,
+                "rho_2": 0.0,
+                "bartlett_threshold": 1.0,
+                "fallback_triggered": False,
+                "newey_west_se": 0.0,
+                "week_means": block_means,
+                "chronological_weeks": chronological_weeks,
+                "is_valid_format": True,
+                "diagnostic_reason": "B_WEEKS_LESS_THAN_3",
+            }
+
+        # 3. For B >= 3, compute week means and lag correlations normalized by parsed week index
+        parsed_idx_map = {w: cls.classify_and_parse_week(w)[1] for w in set(raw_weeks)}
         week_means = []
-        for w in sorted_weeks:
-            obs_w = [x[field] for x in dataset if x.get("week_block") == w]
+        chronological_weeks = []
+        week_indices = []
+
+        for b in unique_blocks:
+            idx = b["week_index"]
+            obs_w = [x[field] for x in dataset if parsed_idx_map.get(x.get("week_block")) == idx]
             week_means.append(sum(obs_w) / len(obs_w))
+            chronological_weeks.append(b["representative_label"])
+            week_indices.append(idx)
 
         grand_mean = sum(week_means) / len(week_means)
         res = [wm - grand_mean for wm in week_means]
@@ -1480,7 +1569,7 @@ class ClusteredEvaluationEngine:
             "fallback_triggered": fallback_triggered,
             "newey_west_se": nw_se,
             "week_means": week_means,
-            "chronological_weeks": sorted_weeks,
+            "chronological_weeks": chronological_weeks,
             "is_valid_format": True,
             "diagnostic_reason": "VALID_CONSISTENT_FORMAT",
         }

@@ -904,6 +904,93 @@ class TestStage31ClusteredStatisticalInference(unittest.TestCase):
         self.assertTrue("INVALID_OR_MIXED_WEEK_FORMAT_CANNOT_ESTIMATE_DEPENDENCE" in eval_res["diagnostic_flag"])
         self.assertEqual(eval_res["se_newey_west"], 0.0)
 
+    def test_same_week_alias_normalization_and_grouping(self):
+        """Validates that labels referring to the same calendar week (e.g. 2026-W01 and 2026-01-01)
+        are grouped by parsed week index and do not inflate B_weeks or distort week means.
+        """
+        dataset = [
+            {"token_id": "T0", "week_block": "2026-W01", "loss_diff": 0.10},
+            {"token_id": "T1", "week_block": "2026-01-01", "loss_diff": 0.20},  # Same calendar week as 2026-W01
+            {"token_id": "T0", "week_block": "2026-W02", "loss_diff": 0.30},
+            {"token_id": "T1", "week_block": "2026-W02", "loss_diff": 0.30},
+            {"token_id": "T0", "week_block": "2026-W03", "loss_diff": 0.50},
+            {"token_id": "T1", "week_block": "2026-W03", "loss_diff": 0.50},
+        ]
+        # Counts must reflect B=3 weeks, not 4
+        counts = ClusteredEvaluationEngine.get_structural_counts(dataset)
+        self.assertEqual(counts["B_weeks"], 3)
+        self.assertEqual(counts["N_obs"], 6)
+
+        diag = ClusteredEvaluationEngine.evaluate_inter_block_serial_dependence(dataset, field="loss_diff")
+        self.assertEqual(len(diag["chronological_weeks"]), 3)
+        self.assertEqual(len(diag["week_means"]), 3)
+        # Week 1 mean should average 0.10 and 0.20 -> 0.15
+        self.assertAlmostEqual(diag["week_means"][0], 0.15, places=6)
+        self.assertAlmostEqual(diag["week_means"][1], 0.30, places=6)
+        self.assertAlmostEqual(diag["week_means"][2], 0.50, places=6)
+
+    def test_explicit_timestamp_unit_seconds_vs_milliseconds(self):
+        """Validates that explicit units ('s' and 'ms') map identical timestamps to the same week index,
+        while ambiguous bare numeric timestamps without explicit units are strictly rejected.
+        """
+        # 1767225600 is 2026-01-01 00:00:00 UTC (week of 2026-W01)
+        # In seconds: 1767225600s
+        # In milliseconds: 1767225600000ms
+        fmt_s, idx_s = ClusteredEvaluationEngine.classify_and_parse_week("1767225600s")
+        fmt_ms, idx_ms = ClusteredEvaluationEngine.classify_and_parse_week("1767225600000ms")
+        self.assertEqual(fmt_s, "UNIX_TIMESTAMP")
+        self.assertEqual(fmt_ms, "UNIX_TIMESTAMP")
+        self.assertEqual(idx_s, idx_ms)
+
+        # Ambiguous bare numbers without unit must fail closed as INVALID
+        fmt_ambig_s, idx_ambig_s = ClusteredEvaluationEngine.classify_and_parse_week("1767225600")
+        fmt_ambig_ms, idx_ambig_ms = ClusteredEvaluationEngine.classify_and_parse_week("1767225600000")
+        self.assertEqual(fmt_ambig_s, "INVALID")
+        self.assertIsNone(idx_ambig_s)
+        self.assertEqual(fmt_ambig_ms, "INVALID")
+        self.assertIsNone(idx_ambig_ms)
+
+        # Datasets with ambiguous bare timestamps must fail closed without estimating dependence
+        dataset_ambig = [
+            {"token_id": "T0", "week_block": "1767225600", "loss_diff": 0.1},
+            {"token_id": "T0", "week_block": "1767830400", "loss_diff": 0.2},
+            {"token_id": "T0", "week_block": "1768435200", "loss_diff": 0.3},
+        ]
+        diag = ClusteredEvaluationEngine.evaluate_inter_block_serial_dependence(dataset_ambig, field="loss_diff")
+        self.assertFalse(diag["is_valid_format"])
+        self.assertTrue("Ambiguous numeric timestamp" in diag["diagnostic_reason"])
+
+    def test_format_validation_before_b_less_than_3_early_return(self):
+        """Validates that short datasets (B < 3 or N < 3) with invalid or mixed formats
+        retain the correct invalid/mixed diagnostic rather than masking it with B_WEEKS_LESS_THAN_3.
+        """
+        # Short dataset with invalid format (N=2, B=2)
+        dataset_short_invalid = [
+            {"token_id": "T0", "week_block": "invalid_week_foo", "loss_diff": 0.1},
+            {"token_id": "T0", "week_block": "invalid_week_bar", "loss_diff": 0.2},
+        ]
+        diag_inv = ClusteredEvaluationEngine.evaluate_inter_block_serial_dependence(dataset_short_invalid, field="loss_diff")
+        self.assertFalse(diag_inv["is_valid_format"])
+        self.assertTrue("Unrecognized or invalid" in diag_inv["diagnostic_reason"])
+
+        # Short dataset with mixed format (N=2)
+        dataset_short_mixed = [
+            {"token_id": "T0", "week_block": "2026-W01", "loss_diff": 0.1},
+            {"token_id": "T0", "week_block": "week_02", "loss_diff": 0.2},
+        ]
+        diag_mix = ClusteredEvaluationEngine.evaluate_inter_block_serial_dependence(dataset_short_mixed, field="loss_diff")
+        self.assertFalse(diag_mix["is_valid_format"])
+        self.assertTrue("Mixed week format" in diag_mix["diagnostic_reason"])
+
+        # Short dataset with valid format (N=2, B=2) correctly reports B_WEEKS_LESS_THAN_3
+        dataset_short_valid = [
+            {"token_id": "T0", "week_block": "2026-W01", "loss_diff": 0.1},
+            {"token_id": "T0", "week_block": "2026-W02", "loss_diff": 0.2},
+        ]
+        diag_val = ClusteredEvaluationEngine.evaluate_inter_block_serial_dependence(dataset_short_valid, field="loss_diff")
+        self.assertTrue(diag_val["is_valid_format"])
+        self.assertEqual(diag_val["diagnostic_reason"], "B_WEEKS_LESS_THAN_3")
+
     def test_all_inference_labeled_exploratory(self):
         """Validates that confirmatory status is never claimed and results are branded exploratory."""
         random.seed(42)
