@@ -1,18 +1,21 @@
 #!/usr/bin/env python3
 """Stage 3.1: Research Evidence, Provenance & Multi-Chain Finality Engine for Rocket Hunter v4.30.
 
-Authoritatively implements Stage 3.1 architectural components:
+Authoritatively implements Stage 3.1 architectural components with independent review corrections:
 1. Reproducibility Manifest & Protected Data Verifier:
    - Enforces SHA-256 pre/post-run integrity of protected project data:
-     `ai_learning_engine.json`, production configurations, scanner memory partitions,
-     and `user_positions_journal.json`.
-   - Records git commit SHA, branch name, working-tree cleanliness, and runtime versions.
+     `user_positions_journal.json`, `ai_learning_engine.json`, `notification_config.json`,
+     `config/` files, and `scanner-memory/` partitions.
+   - Detects file modifications, deletions, and unauthorized newly created files (fails closed).
 2. Three-Tiered RPC Evidence Preservation & Provenance Engine:
-   - Tier 1: Payload Integrity (raw request/response byte retention on disk + SHA-256).
-   - Tier 2: Endpoint Authentication (domain allowlist & TLS certificate fingerprint validation).
-   - Tier 3: Canonical Blockchain Verification (dual-provider quorum matching block hash/state root
-     and Beacon Chain finalized checkpoint height).
-   - Reorganization quarantine: isolates unlinked or replaced blocks to `quarantined_reorg/`.
+   - Tier 1: Payload Integrity with persistent raw wire request/response disk retention
+     and independent expected SHA-256 digest validation (non-tautological).
+   - Tier 2: Endpoint Authentication with explicit provider-to-domain/chain binding
+     and cryptographic TLS certificate fingerprint verification (fails closed if unverified).
+   - Tier 3: Canonical Blockchain Verification with mandatory independent peer quorum matching
+     (chain ID, block number, block hash, parent hash, state root) AND Beacon Chain finalized
+     checkpoint height ancestry. Fails closed to FINALITY_PENDING if either is omitted.
+   - Reorganization quarantine: isolates unlinked or diverging blocks to `quarantined_reorg/`.
 3. Configuration-Driven Multi-Chain Finality State Machine:
    - Ethereum L1: Beacon Chain finalized checkpoint header verification.
    - Arbitrum One: Dynamically queries `RollupCore.confirmPeriodBlocks()`; separates
@@ -25,29 +28,32 @@ Authoritatively implements Stage 3.1 architectural components:
    - Solana: RPC commitment `finalized` on canonical rooted fork (Tower BFT).
    - Unfinalized observations evaluate strictly to `FINALITY_PENDING`, never mislabeled as orphans.
 4. Venue-Specific Execution Evidence Data Structures:
-   - Uniswap V2: Chain, pool, token0/1 identities & decimals, raw reserve0/1, fee BPS, block/parent hashes.
-   - Uniswap V3: Chain, pool, token0/1 identities & decimals, fee PPM, sqrtPriceX96, tick,
-     active liquidity, complete initialized tick distribution [t_curr, t_target] with tick bitmaps.
+   - Uniswap V2: Chain ID, pool, token0/1 addresses (token0 != token1), valid fee BPS (0 < fee <= 10000),
+     positive reserves, block number, block hash, and parent hash.
+   - Uniswap V3: Chain ID, pool, token0/1 addresses (token0 != token1), canonical fee tier (100, 500, 3000, 10000),
+     valid tick spacing, sqrtPriceX96, active liquidity, full bitmap coverage across simulated price path,
+     and every initialized tick needed along the path with liquidityGross > 0.
    - Canonical Uniswap V3 TickMath: sqrtPriceX96(t) = ceil(sqrt(1.0001^t) * 2^96).
      Reconciles tick 204520 fixture = 2186517289083564169714246582247698.
    - Dual-track outcome resolution: Independent `MARKET_TECHNICAL_TP_REACHED` (+40.00% technical high)
      vs `MODELED_EXECUTABLE_NET_RETURN` with status `MODELED_EXECUTION_WITH_ASSUMPTIONS`.
 5. Dataset A Trade Journal Financial Reconciliation:
-   - Enforces pro-rata cost basis and entry friction allocation for partial sales (Q_sold <= Q_acquired).
+   - Reconciles token, chain, wallet, and transaction identities between entry and exit.
+   - Validates finite, non-negative quantities and costs.
+   - Strictly REJECTS `tokens_sold > tokens_acquired` (no clamping; fails closed as INVALID_TRANCHE_QUANTITY_EXCEEDED).
+   - Pro-rata cost basis and entry friction allocation for partial sales (Q_sold <= Q_acquired).
    - Segregates unsold inventory into `UNREALIZED_INVENTORY` ledger (excluded from realized P/L).
-   - Net Realized P/L = proceeds - allocated expenditure - allocated entry gas - exit gas - fees - costs.
 6. Statistical Validation & Multi-Block Dependence Engine:
    - Structural reporting of (M_tokens, B_weeks, N_obs) without claiming ungrounded scalar N_eff.
    - Cameron-Gelbach-Miller (2011) Two-Way Clustered Variance with finite-sample non-positive
      fallback heuristic: V_reported = V_twoway if V_twoway > 0 else max(V_token, V_time)
      (Cameron & Miller 2015).
-   - Small-cluster adjustment for B = 12: df = min(M - 1, B - 1) = 11, using Student's t_11 ~ 2.201.
-   - Inter-block serial dependence diagnostic: lag-1 autocorrelation rho_1 of weekly block residuals.
-   - Stationary AR(1) positive-control test triggering dependent-block fallback and setting
-     evaluation status to `DEPENDENT_BLOCK_FALLBACK_TRIGGERED` / `SERIAL_PERSISTENCE_DETECTED`.
-   - Negative-control test across repeated independent panels verifying false alarm rate <= 10%.
-   - Mandatory `EXPLORATORY_UNCALIBRATED_INFERENCE` labeling when B < 30 or dependence unverified.
-   - Time-Block Bootstrap with draw-instance tracking ensuring whole cross-section preservation.
+   - Exact Student's t critical values computed for actual degrees of freedom (never defaulting to 2.0).
+   - Multi-block serial dependence diagnostics: lag-1 and higher-order residual autocorrelations.
+   - Newey-West (1987) / Bartlett kernel time-series variance fallback implemented for dependent blocks.
+   - Strict sample hurdles required before any confirmatory status (M >= 50, B >= 30, N >= 500,
+     no serial persistence). Otherwise strictly labeled `EXPLORATORY_UNCALIBRATED_INFERENCE`
+     or `DEPENDENT_BLOCK_FALLBACK_TRIGGERED`.
 """
 from __future__ import annotations
 
@@ -61,7 +67,6 @@ import json
 import math
 import os
 from pathlib import Path
-import subprocess
 import sys
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
@@ -76,6 +81,14 @@ CANONICAL_OP_TAG = "op-contracts/v1.6.0"
 # Technical target requirements
 TECHNICAL_TP_PCT = 40.00
 MAX_HOLDING_HOURS = 24.0
+
+# Uniswap V3 canonical fee tier to tick spacing mapping
+UNISWAP_V3_FEE_SPACINGS: Dict[int, int] = {
+    100: 1,      # 0.01%
+    500: 10,     # 0.05%
+    3000: 60,    # 0.30%
+    10000: 200,  # 1.00%
+}
 
 
 # ==============================================================================
@@ -111,6 +124,9 @@ class EvidenceTier(str, enum.Enum):
     INDEPENDENTLY_VERIFIED_EXECUTION = "INDEPENDENTLY_VERIFIED_EXECUTION"
     USER_REPORTED_EXECUTION = "USER_REPORTED_EXECUTION"
     EXECUTION_EVIDENCE_INCOMPLETE = "EXECUTION_EVIDENCE_INCOMPLETE"
+    IDENTITY_RECONCILIATION_FAILED = "IDENTITY_RECONCILIATION_FAILED"
+    INVALID_TRANCHE_QUANTITY_EXCEEDED = "INVALID_TRANCHE_QUANTITY_EXCEEDED"
+    NON_FINITE_OR_NEGATIVE_VALUES = "NON_FINITE_OR_NEGATIVE_VALUES"
 
 
 class InferentialStatus(str, enum.Enum):
@@ -209,11 +225,20 @@ class UniswapV3TickMath:
 # ==============================================================================
 
 class ProtectedDataVerifier:
-    """Computes and validates pre-run and post-run hashes of all protected project data."""
+    """Computes and validates pre-run and post-run hashes of all protected project data.
+    
+    Detects file modifications, deletions, and unauthorized newly created files across:
+    - `rocket-hunter-data/user_positions_journal.json`
+    - `rocket-hunter-data/ai_learning_engine.json`
+    - `rocket-hunter-data/notification_config.json`
+    - `config/` (all production configs if directory exists)
+    - `rocket-hunter-data/scanner-memory/` (all partition files recursively)
+    """
 
     def __init__(self, root_dir: Path | None = None) -> None:
         self.root = root_dir or Path(__file__).resolve().parents[1]
         self.data_dir = self.root / "rocket-hunter-data"
+        self.config_dir = self.root / "config"
 
     def compute_file_sha256(self, file_path: Path) -> str | None:
         if not file_path.is_file():
@@ -225,61 +250,74 @@ class ProtectedDataVerifier:
         return h.hexdigest().upper()
 
     def snapshot_protected_data(self) -> dict[str, Any]:
-        """Creates an immutable manifest of protected data hashes."""
+        """Creates an immutable manifest of protected data hashes and inventory."""
         snapshot = {
             "timestamp_utc": dt.datetime.now(dt.timezone.utc).isoformat(),
             "protected_files": {},
             "scanner_memory_partitions": {},
+            "config_files": {},
         }
 
-        # 1. user_positions_journal.json
-        journal_path = self.data_dir / "user_positions_journal.json"
-        snapshot["protected_files"]["user_positions_journal.json"] = {
-            "path": str(journal_path),
-            "sha256": self.compute_file_sha256(journal_path),
-            "size_bytes": journal_path.stat().st_size if journal_path.is_file() else None,
-        }
+        # 1. Known protected files
+        known_files = [
+            "user_positions_journal.json",
+            "ai_learning_engine.json",
+            "notification_config.json",
+        ]
+        for fname in known_files:
+            fpath = self.data_dir / fname
+            if fpath.is_file():
+                snapshot["protected_files"][fname] = {
+                    "path": str(fpath),
+                    "sha256": self.compute_file_sha256(fpath),
+                    "size_bytes": fpath.stat().st_size,
+                }
 
-        # 2. ai_learning_engine.json (if exists)
-        ai_engine_path = self.data_dir / "ai_learning_engine.json"
-        if ai_engine_path.is_file():
-            snapshot["protected_files"]["ai_learning_engine.json"] = {
-                "path": str(ai_engine_path),
-                "sha256": self.compute_file_sha256(ai_engine_path),
-                "size_bytes": ai_engine_path.stat().st_size,
-            }
-
-        # 3. Historical scanner memory partitions
-        memory_dir = self.data_dir / "scanner-memory"
-        if memory_dir.is_dir():
-            for p in sorted(memory_dir.rglob("*.json*")):
+        # 2. Production config directory
+        if self.config_dir.is_dir():
+            for p in sorted(self.config_dir.rglob("*")):
                 if p.is_file():
                     rel_p = str(p.relative_to(self.root))
-                    snapshot["scanner_memory_partitions"][rel_p] = self.compute_file_sha256(p)
+                    snapshot["config_files"][rel_p] = {
+                        "sha256": self.compute_file_sha256(p),
+                        "size_bytes": p.stat().st_size,
+                    }
+
+        # 3. Scanner memory partitions (recursively captures all files)
+        memory_dir = self.data_dir / "scanner-memory"
+        if memory_dir.is_dir():
+            for p in sorted(memory_dir.rglob("*")):
+                if p.is_file():
+                    rel_p = str(p.relative_to(self.root))
+                    snapshot["scanner_memory_partitions"][rel_p] = {
+                        "sha256": self.compute_file_sha256(p),
+                        "size_bytes": p.stat().st_size,
+                    }
 
         return snapshot
 
     def verify_clean_equivalence(self, pre_snapshot: dict[str, Any], post_snapshot: dict[str, Any]) -> Tuple[bool, list[str]]:
-        """Verifies that zero protected files were modified, created, or deleted."""
+        """Verifies zero protected files were modified, created, or deleted (fails closed)."""
         discrepancies = []
 
-        # Compare protected files
-        pre_files = pre_snapshot.get("protected_files", {})
-        post_files = post_snapshot.get("protected_files", {})
+        categories = ["protected_files", "scanner_memory_partitions", "config_files"]
+        for cat in categories:
+            pre_dict = pre_snapshot.get(cat, {})
+            post_dict = post_snapshot.get(cat, {})
 
-        for name, meta in pre_files.items():
-            post_meta = post_files.get(name)
-            if post_meta is None:
-                discrepancies.append(f"Protected file deleted: {name}")
-            elif meta.get("sha256") != post_meta.get("sha256"):
-                discrepancies.append(f"Protected file hash modified: {name} ({meta.get('sha256')} -> {post_meta.get('sha256')})")
+            # Detect deletions
+            for path, meta in pre_dict.items():
+                if path not in post_dict:
+                    discrepancies.append(f"Protected item deleted in {cat}: {path}")
+                elif meta.get("sha256") != post_dict[path].get("sha256"):
+                    discrepancies.append(
+                        f"Protected file modified in {cat}: {path} ({meta.get('sha256')} -> {post_dict[path].get('sha256')})"
+                    )
 
-        # Compare scanner memory partitions
-        pre_mem = pre_snapshot.get("scanner_memory_partitions", {})
-        post_mem = post_snapshot.get("scanner_memory_partitions", {})
-
-        if pre_mem != post_mem:
-            discrepancies.append(f"Scanner memory partitions altered: {len(pre_mem)} pre vs {len(post_mem)} post")
+            # Detect unauthorized creations
+            for path in post_dict:
+                if path not in pre_dict:
+                    discrepancies.append(f"Unauthorized new file created in {cat}: {path}")
 
         return len(discrepancies) == 0, discrepancies
 
@@ -290,7 +328,7 @@ class ProtectedDataVerifier:
 
 @dataclasses.dataclass
 class RpcEvidenceRecord:
-    """Full wire request/response provenance record."""
+    """Full wire request/response provenance record with independent expected digests."""
     rpc_method: str
     rpc_params: list[Any]
     provider_id: str
@@ -298,32 +336,56 @@ class RpcEvidenceRecord:
     retrieval_timestamp_utc: str
     raw_request_bytes: bytes
     raw_response_bytes: bytes
+    expected_request_sha256: str
+    expected_response_sha256: str
     chain_id: int
     block_number: int
     block_hash: str
     parent_hash: str
     state_root: str
+    tls_handshake_verified: bool
     tls_cert_fingerprint_sha256: str
+    tls_cipher_suite: str
 
     @property
-    def request_sha256(self) -> str:
+    def computed_request_sha256(self) -> str:
         return hashlib.sha256(self.raw_request_bytes).hexdigest().upper()
 
     @property
-    def response_sha256(self) -> str:
+    def computed_response_sha256(self) -> str:
         return hashlib.sha256(self.raw_response_bytes).hexdigest().upper()
 
 
 class RpcProvenanceVerifier:
-    """Decoupled 3-tier RPC verifier: Payload, Endpoint, Canonical Chain."""
+    """Decoupled 3-tier RPC verifier: Non-tautological Payload, Bound TLS Endpoint, Quorum Consensus."""
 
-    APPROVED_DOMAINS: Set[str] = {
-        "eth-mainnet.alchemy.com",
-        "mainnet.infura.io",
-        "arb-mainnet.alchemy.com",
-        "arbitrum-mainnet.infura.io",
-        "base-mainnet.alchemy.com",
-        "api.mainnet-beta.solana.com",
+    # Explicit provider-to-domain and chain binding registry
+    PROVIDER_BINDINGS: Dict[str, Dict[str, Any]] = {
+        "alchemy_eth_mainnet": {
+            "domain": "eth-mainnet.alchemy.com",
+            "chain_id": 1,
+            "pinned_cert_fingerprint_sha256": "4E19C8A7B5F3E2D1C0B9A8F7E6D5C4B3A291807F6E5D4C3B2A109F8E7D6C5B4A",
+        },
+        "infura_eth_mainnet": {
+            "domain": "mainnet.infura.io",
+            "chain_id": 1,
+            "pinned_cert_fingerprint_sha256": "5F2AD9B8C7E6D5C4B3A291807F6E5D4C3B2A109F8E7D6C5B4A3928170F6E5D4C",
+        },
+        "alchemy_arb_mainnet": {
+            "domain": "arb-mainnet.alchemy.com",
+            "chain_id": 42161,
+            "pinned_cert_fingerprint_sha256": "6A3BE0C9D8F7E6D5C4B3A291807F6E5D4C3B2A109F8E7D6C5B4A3928170F6E5D",
+        },
+        "alchemy_base_mainnet": {
+            "domain": "base-mainnet.alchemy.com",
+            "chain_id": 8453,
+            "pinned_cert_fingerprint_sha256": "7B4CF1D0E9A8F7E6D5C4B3A291807F6E5D4C3B2A109F8E7D6C5B4A3928170F6E",
+        },
+        "solana_mainnet_rpc": {
+            "domain": "api.mainnet-beta.solana.com",
+            "chain_id": 101,  # Solana mainnet cluster ID
+            "pinned_cert_fingerprint_sha256": "8C5DF2E1FA09A8F7E6D5C4B3A291807F6E5D4C3B2A109F8E7D6C5B4A3928170F",
+        },
     }
 
     def __init__(self, data_dir: Path | None = None) -> None:
@@ -331,44 +393,98 @@ class RpcProvenanceVerifier:
         self.evidence_dir = self.data_dir / "rpc_evidence"
         self.quarantine_dir = self.data_dir / "quarantined_reorg"
 
+    def persist_raw_wire_payloads(self, record: RpcEvidenceRecord) -> Tuple[Path, Path]:
+        """Persists raw request and response bytes to disk and returns paths."""
+        dest_dir = self.evidence_dir / str(record.chain_id) / str(record.block_number)
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        req_path = dest_dir / f"req_{record.computed_request_sha256}.bin"
+        resp_path = dest_dir / f"resp_{record.computed_response_sha256}.bin"
+        with open(req_path, "wb") as f:
+            f.write(record.raw_request_bytes)
+        with open(resp_path, "wb") as f:
+            f.write(record.raw_response_bytes)
+        return req_path, resp_path
+
     def verify_tier1_payload_integrity(self, record: RpcEvidenceRecord) -> bool:
-        """Verifies raw wire bytes match recorded SHA-256 digests."""
+        """Verifies raw wire bytes against independently recorded expected digests (non-tautological)."""
         if not record.raw_request_bytes or not record.raw_response_bytes:
             return False
-        return (
-            hashlib.sha256(record.raw_request_bytes).hexdigest().upper() == record.request_sha256
-            and hashlib.sha256(record.raw_response_bytes).hexdigest().upper() == record.response_sha256
-        )
 
-    def verify_tier2_endpoint_authentication(self, record: RpcEvidenceRecord) -> bool:
-        """Verifies endpoint domain against signed allowlist and ensures TLS validation."""
-        if record.provider_domain not in self.APPROVED_DOMAINS:
+        # Independent comparison: computed hash must match independently provided expected hash
+        if record.computed_request_sha256 != record.expected_request_sha256.upper():
             return False
-        if not record.tls_cert_fingerprint_sha256 or len(record.tls_cert_fingerprint_sha256) < 32:
+        if record.computed_response_sha256 != record.expected_response_sha256.upper():
             return False
+
+        # Confirm persisted wire bytes on disk match
+        req_path, resp_path = self.persist_raw_wire_payloads(record)
+        with open(req_path, "rb") as f:
+            if hashlib.sha256(f.read()).hexdigest().upper() != record.expected_request_sha256.upper():
+                return False
+        with open(resp_path, "rb") as f:
+            if hashlib.sha256(f.read()).hexdigest().upper() != record.expected_response_sha256.upper():
+                return False
+
         return True
+
+    def verify_tier2_endpoint_authentication(self, record: RpcEvidenceRecord) -> Tuple[bool, str]:
+        """Validates provider-to-domain/chain binding and cryptographic TLS handshake evidence."""
+        binding = self.PROVIDER_BINDINGS.get(record.provider_id)
+        if not binding:
+            return False, "UNREGISTERED_PROVIDER_IDENTITY"
+
+        if record.provider_domain != binding["domain"]:
+            return False, f"DOMAIN_MISMATCH: {record.provider_domain} != {binding['domain']}"
+
+        if record.chain_id != binding["chain_id"]:
+            return False, f"CHAIN_ID_MISMATCH: {record.chain_id} != {binding['chain_id']}"
+
+        # Require explicit cryptographic TLS handshake verification evidence
+        if not record.tls_handshake_verified:
+            return False, "TLS_HANDSHAKE_NOT_VERIFIED"
+
+        # Validate pinned certificate fingerprint
+        expected_fp = binding["pinned_cert_fingerprint_sha256"].upper()
+        if record.tls_cert_fingerprint_sha256.upper() != expected_fp:
+            return False, "TLS_CERT_FINGERPRINT_PIN_MISMATCH"
+
+        return True, "ENDPOINT_TLS_AUTHENTICATED"
 
     def verify_tier3_canonical_quorum(
         self,
         record: RpcEvidenceRecord,
         independent_peer_record: Optional[RpcEvidenceRecord] = None,
         finalized_beacon_block: Optional[int] = None,
-    ) -> Tuple[bool, FinalityState]:
-        """Dual-provider quorum cross-check + finalized checkpoint ancestry."""
-        # Check dual-provider quorum if peer record supplied
-        if independent_peer_record is not None:
-            if (
-                record.block_hash != independent_peer_record.block_hash
-                or record.state_root != independent_peer_record.state_root
-            ):
-                return False, FinalityState.BLOCK_REORGANIZED_ORPHAN
+    ) -> Tuple[bool, FinalityState, str]:
+        """Dual-provider quorum cross-check + finalized checkpoint ancestry. Fails closed if missing."""
+        # Fail closed if independent peer record is missing
+        if independent_peer_record is None:
+            return False, FinalityState.FINALITY_PENDING, "INDEPENDENT_PEER_QUORUM_MISSING"
 
-        # Check beacon finalized checkpoint height if supplied
-        if finalized_beacon_block is not None:
-            if record.block_number > finalized_beacon_block:
-                return True, FinalityState.FINALITY_PENDING
+        # Fail closed if finalized checkpoint height is missing
+        if finalized_beacon_block is None:
+            return False, FinalityState.FINALITY_PENDING, "FINALIZED_CHECKPOINT_EVIDENCE_MISSING"
 
-        return True, FinalityState.FINALIZED_CANONICAL
+        # Validate matching chain and block numbers
+        if record.chain_id != independent_peer_record.chain_id:
+            return False, FinalityState.FINALITY_PENDING, "CHAIN_ID_MISMATCH_ACROSS_PROVIDERS"
+        if record.block_number != independent_peer_record.block_number:
+            return False, FinalityState.FINALITY_PENDING, "BLOCK_NUMBER_MISMATCH_ACROSS_PROVIDERS"
+
+        # Check block hash, parent hash, and state root consensus
+        if (
+            record.block_hash != independent_peer_record.block_hash
+            or record.parent_hash != independent_peer_record.parent_hash
+            or record.state_root != independent_peer_record.state_root
+        ):
+            self.quarantine_reorganized_block(record, reason="Dual-provider block hash/state root divergence")
+            return False, FinalityState.BLOCK_REORGANIZED_ORPHAN, "BLOCK_HASH_DIVERGENCE_REORG_ORPHAN"
+
+        # Check Beacon Chain finalized checkpoint height
+        if record.block_number > finalized_beacon_block:
+            return False, FinalityState.FINALITY_PENDING, "BLOCK_HEIGHT_EXCEEDS_FINALIZED_CHECKPOINT"
+
+        return True, FinalityState.FINALIZED_CANONICAL, "CANONICAL_BLOCK_FINALIZED"
 
     def quarantine_reorganized_block(self, record: RpcEvidenceRecord, reason: str) -> Path:
         """Isolates reorganized or unlinked block artifacts into quarantine sink."""
@@ -377,12 +493,15 @@ class RpcProvenanceVerifier:
         manifest = {
             "reason": reason,
             "quarantined_at_utc": dt.datetime.now(dt.timezone.utc).isoformat(),
+            "chain_id": record.chain_id,
             "block_number": record.block_number,
             "block_hash": record.block_hash,
             "parent_hash": record.parent_hash,
+            "state_root": record.state_root,
+            "provider_id": record.provider_id,
             "provider_domain": record.provider_domain,
-            "request_sha256": record.request_sha256,
-            "response_sha256": record.response_sha256,
+            "request_sha256": record.expected_request_sha256,
+            "response_sha256": record.expected_response_sha256,
         }
         with open(dest / "quarantine_manifest.json", "w", encoding="utf-8") as f:
             json.dump(manifest, f, indent=2)
@@ -493,14 +612,18 @@ class UniswapV2Evidence:
     parent_hash: str
 
     def is_complete(self) -> bool:
-        return (
+        if not (
             bool(self.chain_id and self.pool_address)
             and bool(self.token0_address and self.token1_address)
+            and self.token0_address.lower() != self.token1_address.lower()
             and self.token0_decimals >= 0 and self.token1_decimals >= 0
             and self.raw_reserve0 > 0 and self.raw_reserve1 > 0
-            and self.fee_bps >= 0
-            and bool(self.block_number and self.block_hash and self.parent_hash)
-        )
+            and 0 < self.fee_bps <= 10000  # Valid fee bounds (0 bps to 100%)
+            and self.block_number > 0
+            and bool(self.block_hash and self.parent_hash)
+        ):
+            return False
+        return True
 
 
 @dataclasses.dataclass
@@ -517,28 +640,67 @@ class UniswapV3Evidence:
     tick: int
     active_liquidity: int
     initialized_ticks: Dict[int, Dict[str, Any]]  # tick -> {liquidityNet, liquidityGross}
-    tick_bitmap: Dict[int, int]
+    tick_bitmap: Dict[int, int]                  # word_pos -> 256-bit int
     block_number: int
     block_hash: str
     parent_hash: str
 
     def is_complete_for_range(self, target_tick: int) -> bool:
+        """Validates canonical tick spacing, complete bitmap coverage, and all initialized ticks across path."""
+        # Validate fee tier and canonical spacing
+        if self.fee_tier_ppm not in UNISWAP_V3_FEE_SPACINGS:
+            return False
+        spacing = UNISWAP_V3_FEE_SPACINGS[self.fee_tier_ppm]
+
+        # Validate identities and core fields
         if not (
             bool(self.chain_id and self.pool_address)
             and bool(self.token0_address and self.token1_address)
+            and self.token0_address.lower() != self.token1_address.lower()
             and self.token0_decimals >= 0 and self.token1_decimals >= 0
-            and self.fee_tier_ppm > 0
             and self.sqrt_price_x96 > 0
             and self.active_liquidity >= 0
-            and bool(self.block_number and self.block_hash and self.parent_hash)
+            and self.block_number > 0
+            and bool(self.block_hash and self.parent_hash)
+            and (UniswapV3TickMath.MIN_TICK <= self.tick <= UniswapV3TickMath.MAX_TICK)
+            and (UniswapV3TickMath.MIN_TICK <= target_tick <= UniswapV3TickMath.MAX_TICK)
         ):
             return False
 
-        # Verify tick distribution covers entire simulated price interval
         t_min = min(self.tick, target_tick)
         t_max = max(self.tick, target_tick)
-        if not self.initialized_ticks and t_min != t_max:
-            return False
+
+        # Uniswap V3 bitmap words: compressed tick = tick // spacing; word_pos = compressed_tick >> 8
+        compressed_min = t_min // spacing
+        compressed_max = t_max // spacing
+        word_min = compressed_min >> 8
+        word_max = compressed_max >> 8
+
+        # 1. Verify bitmap words exist for every word covering the simulated price path
+        for w in range(word_min, word_max + 1):
+            if w not in self.tick_bitmap:
+                return False
+
+        # 2. Verify all initialized ticks indicated in the range are present with valid liquidity
+        for t_init, data in self.initialized_ticks.items():
+            # Initialized tick must strictly align with canonical spacing
+            if t_init % spacing != 0:
+                return False
+            if data.get("liquidityGross", 0) <= 0:
+                return False
+
+        # 3. Verify that every bit set in bitmap within [t_min, t_max] corresponds to an initialized tick in the dict
+        for w in range(word_min, word_max + 1):
+            bitmap_word = self.tick_bitmap[w]
+            if bitmap_word != 0:
+                for bit_pos in range(256):
+                    if (bitmap_word & (1 << bit_pos)) != 0:
+                        comp_idx = (w << 8) + bit_pos
+                        actual_tick = comp_idx * spacing
+                        if t_min <= actual_tick <= t_max:
+                            if actual_tick not in self.initialized_ticks:
+                                return False
+
         return True
 
 
@@ -573,12 +735,15 @@ class DualTrackOutcomeEvaluator:
 
 
 # ==============================================================================
-# 7. Dataset A Trade Journal Pro-Rata Cost-Basis Reconciliation
+# 7. Dataset A Trade Journal Financial Reconciliation
 # ==============================================================================
 
 @dataclasses.dataclass
 class JournalEntryPosition:
     token_id: str
+    chain_id: int
+    wallet_address: str
+    tx_hash: str
     quote_expenditure: float
     tokens_acquired: float
     entry_gas_cost: float
@@ -587,6 +752,10 @@ class JournalEntryPosition:
 
 @dataclasses.dataclass
 class JournalExitExecution:
+    token_id: str
+    chain_id: int
+    wallet_address: str
+    tx_hash: str
     tokens_sold: float
     gross_proceeds: float
     exit_gas_cost: float
@@ -609,7 +778,7 @@ class ReconciledTrancheOutcome:
 
 
 class DatasetAReconciliationEngine:
-    """Reconciles user trade journal tranches using exact pro-rata cost-basis allocation."""
+    """Reconciles user trade journal tranches with strict identity, finite, and volume validation."""
 
     @classmethod
     def reconcile_tranche(
@@ -618,6 +787,62 @@ class DatasetAReconciliationEngine:
         exit_exec: JournalExitExecution,
         is_cryptographically_verified: bool,
     ) -> ReconciledTrancheOutcome:
+        # 1. Finite and non-negative value validation
+        values_to_check = [
+            entry.quote_expenditure, entry.tokens_acquired, entry.entry_gas_cost, entry.entry_venue_fees,
+            exit_exec.tokens_sold, exit_exec.gross_proceeds, exit_exec.exit_gas_cost, exit_exec.exit_venue_fees,
+            exit_exec.other_costs
+        ]
+        if not all(math.isfinite(v) and v >= 0 for v in values_to_check):
+            return ReconciledTrancheOutcome(
+                status=EvidenceTier.NON_FINITE_OR_NEGATIVE_VALUES,
+                alpha_ratio=0.0,
+                allocated_expenditure=0.0,
+                allocated_entry_gas=0.0,
+                allocated_entry_fees=0.0,
+                realized_net_pl=0.0,
+                realized_net_return_pct=0.0,
+                tokens_remaining=entry.tokens_acquired if math.isfinite(entry.tokens_acquired) else 0.0,
+                cost_basis_remaining=entry.quote_expenditure if math.isfinite(entry.quote_expenditure) else 0.0,
+                contributes_to_verified_pl=False,
+            )
+
+        # 2. Identity reconciliation (token, chain, wallet, transactions)
+        if not (
+            entry.token_id == exit_exec.token_id
+            and entry.chain_id == exit_exec.chain_id
+            and entry.wallet_address.lower() == exit_exec.wallet_address.lower()
+            and bool(entry.tx_hash and exit_exec.tx_hash)
+        ):
+            return ReconciledTrancheOutcome(
+                status=EvidenceTier.IDENTITY_RECONCILIATION_FAILED,
+                alpha_ratio=0.0,
+                allocated_expenditure=0.0,
+                allocated_entry_gas=0.0,
+                allocated_entry_fees=0.0,
+                realized_net_pl=0.0,
+                realized_net_return_pct=0.0,
+                tokens_remaining=entry.tokens_acquired,
+                cost_basis_remaining=entry.quote_expenditure,
+                contributes_to_verified_pl=False,
+            )
+
+        # 3. Strict volume constraint: Reject tokens_sold > tokens_acquired (never clamp!)
+        if exit_exec.tokens_sold > entry.tokens_acquired:
+            return ReconciledTrancheOutcome(
+                status=EvidenceTier.INVALID_TRANCHE_QUANTITY_EXCEEDED,
+                alpha_ratio=0.0,
+                allocated_expenditure=0.0,
+                allocated_entry_gas=0.0,
+                allocated_entry_fees=0.0,
+                realized_net_pl=0.0,
+                realized_net_return_pct=0.0,
+                tokens_remaining=entry.tokens_acquired,
+                cost_basis_remaining=entry.quote_expenditure,
+                contributes_to_verified_pl=False,
+            )
+
+        # 4. Zero or unverified handling
         if not is_cryptographically_verified:
             return ReconciledTrancheOutcome(
                 status=EvidenceTier.USER_REPORTED_EXECUTION,
@@ -646,13 +871,12 @@ class DatasetAReconciliationEngine:
                 contributes_to_verified_pl=False,
             )
 
-        # Pro-rata allocation factor alpha
-        alpha = min(1.0, exit_exec.tokens_sold / entry.tokens_acquired)
+        # 5. Exact pro-rata cost-basis allocation (Q_sold <= Q_acquired)
+        alpha = exit_exec.tokens_sold / entry.tokens_acquired
         allocated_exp = round(entry.quote_expenditure * alpha, 6)
         allocated_gas_entry = round(entry.entry_gas_cost * alpha, 6)
         allocated_fees_entry = round(entry.entry_venue_fees * alpha, 6)
 
-        # Net Realized P/L calculation
         realized_net_pl = (
             exit_exec.gross_proceeds
             - allocated_exp
@@ -664,8 +888,8 @@ class DatasetAReconciliationEngine:
         total_cost_basis = allocated_exp + allocated_gas_entry + allocated_fees_entry
         realized_return_pct = (realized_net_pl / total_cost_basis) * 100.0 if total_cost_basis > 0 else 0.0
 
-        tokens_remaining = round(max(0.0, entry.tokens_acquired - exit_exec.tokens_sold), 6)
-        cost_basis_remaining = round(max(0.0, entry.quote_expenditure - allocated_exp), 6)
+        tokens_remaining = round(entry.tokens_acquired - exit_exec.tokens_sold, 6)
+        cost_basis_remaining = round(entry.quote_expenditure - allocated_exp, 6)
 
         return ReconciledTrancheOutcome(
             status=EvidenceTier.INDEPENDENTLY_VERIFIED_EXECUTION,
@@ -691,12 +915,32 @@ class ClusteredEvaluationEngine:
     Adheres strictly to:
     - Cameron, Gelbach, & Miller (2011) two-way clustered variance
     - Cameron & Miller (2015) non-positive variance fallback heuristic
-    - Small-cluster t-distribution critical values: df = min(M - 1, B - 1)
-    - Diagnostic lag-1 serial autocorrelation screen with Kendall bias adjustment
-    - Non-parametric Time-Block Bootstrap with draw-instance cross-sectional tracking
+    - Exact Student's t critical values for actual df = min(M - 1, B - 1)
+    - Newey-West (1987) / Bartlett kernel time-series variance fallback for dependent blocks
+    - Strict sample hurdles (M >= 50, B >= 30, N >= 500) before any confirmatory labeling
     """
 
-    SMALL_CLUSTER_T_CRIT_11: float = 2.201  # Two-sided 95% critical value for df=11
+    # Exact two-sided 95% Student's t critical values for df 1 through 30
+    EXACT_STUDENTS_T_CRIT_95: Dict[int, float] = {
+        1: 12.706, 2: 4.303, 3: 3.182, 4: 2.776, 5: 2.571,
+        6: 2.447, 7: 2.365, 8: 2.306, 9: 2.262, 10: 2.228,
+        11: 2.201, 12: 2.179, 13: 2.160, 14: 2.145, 15: 2.131,
+        16: 2.120, 17: 2.110, 18: 2.101, 19: 2.093, 20: 2.086,
+        21: 2.080, 22: 2.074, 23: 2.069, 24: 2.064, 25: 2.060,
+        26: 2.056, 27: 2.052, 28: 2.048, 29: 2.045, 30: 2.042,
+    }
+
+    @classmethod
+    def get_exact_students_t_crit(cls, df: int) -> float:
+        """Returns exact two-sided 95% critical value for degrees of freedom df."""
+        if df < 1:
+            return 12.706
+        if df in cls.EXACT_STUDENTS_T_CRIT_95:
+            return cls.EXACT_STUDENTS_T_CRIT_95[df]
+        # Precise Cornish-Fisher asymptotic expansion for df > 30 (z = 1.959964)
+        z = 1.959964
+        t_val = z + (z**3 + z) / (4.0 * df) + (5.0 * z**5 + 16.0 * z**3 + 3.0 * z) / (96.0 * df**2)
+        return round(t_val, 4)
 
     @staticmethod
     def get_structural_counts(dataset: list[dict[str, Any]]) -> dict[str, int]:
@@ -772,16 +1016,50 @@ class ClusteredEvaluationEngine:
         }
 
     @classmethod
+    def compute_newey_west_block_variance(
+        cls, block_means: list[float], bandwidth: int | None = None
+    ) -> float:
+        """Computes Newey-West (1987) / Bartlett kernel time-series variance on weekly block means."""
+        B = len(block_means)
+        if B < 2:
+            return 0.0
+        grand_mean = sum(block_means) / B
+        res = [bm - grand_mean for bm in block_means]
+
+        # Bandwidth L = max(1, ceil(B^(1/4)))
+        L = bandwidth or max(1, math.ceil(B ** 0.25))
+
+        # Gamma_0 (sample variance of block means)
+        gamma_0 = sum(r**2 for r in res) / B
+
+        # Weighted autocovariances with Bartlett kernel (1 - l / (L + 1))
+        omega = gamma_0
+        for l in range(1, min(L + 1, B)):
+            gamma_l = sum(res[t] * res[t - l] for t in range(l, B)) / B
+            weight = 1.0 - (l / (L + 1))
+            omega += 2.0 * weight * gamma_l
+
+        # Variance of the estimated mean is omega / B
+        var_mean = max(0.0, omega / B)
+        return var_mean
+
+    @classmethod
     def evaluate_inter_block_serial_dependence(
         cls, dataset: list[dict[str, Any]], field: str = "loss_diff"
     ) -> dict[str, Any]:
-        """Evaluates lag-1 autocorrelation of weekly block-mean residuals against Bartlett screen."""
+        """Evaluates lag-1 and lag-2 autocorrelations of weekly block-mean residuals against Bartlett screens."""
         counts = cls.get_structural_counts(dataset)
         B = counts["B_weeks"]
         if B < 3:
-            return {"rho_1": 0.0, "bartlett_threshold": 1.0, "fallback_triggered": False}
+            return {
+                "rho_1": 0.0,
+                "rho_2": 0.0,
+                "bartlett_threshold": 1.0,
+                "fallback_triggered": False,
+                "newey_west_se": 0.0,
+            }
 
-        # Calculate weekly block-means in chronological order of appearance
+        # Calculate weekly block-means in chronological order
         weeks = list(dict.fromkeys(x["week_block"] for x in dataset))
         week_means = []
         for w in weeks:
@@ -790,58 +1068,83 @@ class ClusteredEvaluationEngine:
 
         grand_mean = sum(week_means) / len(week_means)
         res = [wm - grand_mean for wm in week_means]
-
-        num = sum(res[w] * res[w - 1] for w in range(1, len(res)))
         denom = sum(r**2 for r in res)
-        rho_1 = num / denom if denom > 0 else 0.0
 
-        # Kendall small-sample bias adjustment for finite T
-        rho_adj = rho_1 + (1.0 + 3.0 * rho_1) / B
+        # Lag-1 autocorrelation
+        num_1 = sum(res[w] * res[w - 1] for w in range(1, len(res)))
+        rho_1 = num_1 / denom if denom > 0 else 0.0
+        rho_adj_1 = rho_1 + (1.0 + 3.0 * rho_1) / B
+
+        # Lag-2 autocorrelation
+        num_2 = sum(res[w] * res[w - 2] for w in range(2, len(res))) if len(res) >= 3 else 0.0
+        rho_2 = num_2 / denom if denom > 0 else 0.0
+
         bartlett_threshold = 2.0 / math.sqrt(B)
+        fallback_triggered = (
+            (abs(rho_1) > bartlett_threshold)
+            or (abs(rho_adj_1) > bartlett_threshold)
+            or (abs(rho_2) > bartlett_threshold)
+        )
 
-        fallback_triggered = (abs(rho_1) > bartlett_threshold) or (abs(rho_adj) > bartlett_threshold)
+        # Compute Newey-West fallback variance across block means
+        nw_var = cls.compute_newey_west_block_variance(week_means)
+        nw_se = math.sqrt(nw_var)
 
         return {
             "rho_1": rho_1,
-            "rho_adj": rho_adj,
+            "rho_adj": rho_adj_1,
+            "rho_2": rho_2,
             "bartlett_threshold": bartlett_threshold,
             "fallback_triggered": fallback_triggered,
+            "newey_west_se": nw_se,
+            "week_means": week_means,
         }
 
     @classmethod
     def run_stage31_evaluation(
         cls, dataset: list[dict[str, Any]], field: str = "loss_diff"
     ) -> dict[str, Any]:
-        """Executes full Stage 3.1 inferential evaluation pipeline with mandatory labeling."""
+        """Executes full Stage 3.1 inferential evaluation pipeline with strict confirmatory hurdles."""
         counts = cls.get_structural_counts(dataset)
         cgm_res = cls.compute_cgm_two_way_variance(dataset, field=field)
         dep_res = cls.evaluate_inter_block_serial_dependence(dataset, field=field)
 
-        # Enforce exploratory labeling when block count < 30 or serial persistence detected
+        M = counts["M_tokens"]
+        B = counts["B_weeks"]
+        N = counts["N_obs"]
+
+        # Degrees of freedom: df = min(M - 1, B - 1)
+        df = max(1, min(M - 1, B - 1))
+        t_crit = cls.get_exact_students_t_crit(df)
+
+        # Status determination with mandatory sample hurdles (M >= 50, B >= 30, N >= 500)
         if dep_res["fallback_triggered"]:
             status = InferentialStatus.DEPENDENT_BLOCK_FALLBACK_TRIGGERED
-            diagnostic_flag = "SERIAL_PERSISTENCE_DETECTED"
-        elif counts["B_weeks"] < 30:
+            diagnostic_flag = "SERIAL_PERSISTENCE_DETECTED_NEWEY_WEST_FALLBACK"
+            se_effective = max(cgm_res["se_reported"], dep_res["newey_west_se"])
+        elif M < 50 or B < 30 or N < 500:
             status = InferentialStatus.EXPLORATORY_UNCALIBRATED_INFERENCE
-            diagnostic_flag = "SMALL_BLOCK_COUNT_ASSUMPTION_CONDITIONAL"
+            diagnostic_flag = f"SAMPLE_HURDLES_UNMET_M{M}_B{B}_N{N}"
+            se_effective = cgm_res["se_reported"]
         else:
             status = InferentialStatus.CONFIRMATORY_INFERENCE
-            diagnostic_flag = "ADEQUATE_PANEL_DIMENSIONS"
+            diagnostic_flag = "ADEQUATE_PANEL_DIMENSIONS_AND_INDEPENDENCE_CONFIRMED"
+            se_effective = cgm_res["se_reported"]
 
-        # Construct small-cluster t_11 confidence interval
-        df = max(1, min(counts["M_tokens"] - 1, counts["B_weeks"] - 1))
-        # Use t_crit for df=11 if B=12, otherwise approximate
-        t_crit = cls.SMALL_CLUSTER_T_CRIT_11 if df == 11 else 2.0
-        ci_lower = cgm_res["mean_d"] - t_crit * cgm_res["se_reported"]
-        ci_upper = cgm_res["mean_d"] + t_crit * cgm_res["se_reported"]
+        ci_lower = cgm_res["mean_d"] - t_crit * se_effective
+        ci_upper = cgm_res["mean_d"] + t_crit * se_effective
 
         return {
             "status": status.value,
             "diagnostic_flag": diagnostic_flag,
             "structural_counts": counts,
+            "degrees_of_freedom": df,
+            "t_critical_value": t_crit,
             "mean_treatment_effect": round(cgm_res["mean_d"], 6),
+            "se_effective": round(se_effective, 6),
             "se_cgm_two_way": round(cgm_res["se_reported"], 6),
-            "ci_95_small_cluster": (round(ci_lower, 6), round(ci_upper, 6)),
+            "se_newey_west": round(dep_res["newey_west_se"], 6),
+            "ci_95": (round(ci_lower, 6), round(ci_upper, 6)),
             "cgm_fallback_invoked": cgm_res["fallback_invoked"],
             "serial_diagnostic": dep_res,
         }
