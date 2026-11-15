@@ -465,6 +465,35 @@ class TestStage32TwoLegExecutionAndGasMath(unittest.TestCase):
         self.assertEqual(res_venue["gas_buy_usd"], 0.0)
         self.assertEqual(res_venue["gas_sell_usd"], 0.0)
 
+        # Unknown/non-EVM chain ID with UNISWAP_V2 (e.g. chain_id=99999) must fail closed via allowlist
+        ev_v2_unknown = dataclasses.replace(self.entry_v2, chain_id=99999)
+        unknown_chain_entry = PoolStateSnapshot(
+            chain_id=99999,
+            token_address="0x2222222222222222222222222222222222222222",
+            pool_address="0x1111111111111111111111111111111111111111",
+            block_number=19_000_000,
+            block_hash="0x" + "aa" * 32,
+            source_timestamp_utc="2026-11-15T00:00:00Z",
+            venue_type="UNISWAP_V2",
+            evidence_v2=ev_v2_unknown,
+            quote_usd_price=1.0,
+            native_usd_price=3000.0,
+        )
+        unknown_chain_touch = dataclasses.replace(
+            unknown_chain_entry,
+            block_number=19_001_000,
+            block_hash="0x" + "bb" * 32,
+            source_timestamp_utc="2026-11-15T02:00:00Z",
+        )
+        res_unknown = TwoLegExecutionSimulator.simulate_roundtrip(unknown_chain_entry, unknown_chain_touch, tranche_usd=500.0)
+        self.assertEqual(res_unknown["status"], DualTrackTargetStatus.MODELED_ROUNDTRIP_UNRESOLVED_STATE_MISSING.value)
+        self.assertEqual(res_unknown["diagnostic"], "UNSUPPORTED_CHAIN_ID_99999")
+        self.assertIsNone(res_unknown["gas_buy_model_label"])
+        self.assertIsNone(res_unknown["gas_sell_model_label"])
+        self.assertEqual(res_unknown["gas_buy_usd"], 0.0)
+        self.assertEqual(res_unknown["gas_sell_usd"], 0.0)
+        self.assertIsNone(res_unknown["net_return_pct"])
+
     def test_simulate_roundtrip_max_fee_below_base_fee_fails_closed(self):
         """AC-1, AC-7: Max fee below base fee fails closed with ENTRY_MAX_FEE_BELOW_BASE_FEE."""
         base_entry = PoolStateSnapshot(

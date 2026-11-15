@@ -1413,8 +1413,21 @@ class PoolStateSnapshot:
     token0_is_quote: bool = True
 
 
+SUPPORTED_EVM_CHAIN_IDS: set[int] = {
+    1,      # Ethereum Mainnet
+    10,     # OP Mainnet (Optimism)
+    56,     # BNB Smart Chain
+    137,    # Polygon PoS
+    8453,   # Base
+    42161,  # Arbitrum One
+    43114,  # Avalanche C-Chain
+}
+
+
 class TwoLegExecutionSimulator:
     """Simulates two-leg roundtrip execution (Buy at entry, Sell at touch) across capital tranches."""
+
+    SUPPORTED_EVM_CHAIN_IDS = SUPPORTED_EVM_CHAIN_IDS
 
     @classmethod
     def simulate_roundtrip(
@@ -1473,13 +1486,17 @@ class TwoLegExecutionSimulator:
                 "tranche_usd": tranche_usd,
             }
 
-        # 2b. Non-EVM / unsupported chain and venue validation
-        SOLANA_CHAIN_IDS = {101, 102, 103}  # 101: Solana Mainnet, 102: Testnet, 103: Devnet
-        if entry_state.chain_id in SOLANA_CHAIN_IDS or touch_state.chain_id in SOLANA_CHAIN_IDS:
+        # 2b. Explicit supported EVM chain allowlist and venue validation
+        if entry_state.chain_id not in cls.SUPPORTED_EVM_CHAIN_IDS or touch_state.chain_id not in cls.SUPPORTED_EVM_CHAIN_IDS:
+            diag = (
+                f"UNSUPPORTED_NON_EVM_CHAIN_SOLANA_{entry_state.chain_id}"
+                if entry_state.chain_id in {101, 102, 103}
+                else f"UNSUPPORTED_CHAIN_ID_{entry_state.chain_id}"
+            )
             return {
                 "status": DualTrackTargetStatus.MODELED_ROUNDTRIP_UNRESOLVED_STATE_MISSING.value,
                 "net_return_pct": None,
-                "diagnostic": f"UNSUPPORTED_NON_EVM_CHAIN_SOLANA_{entry_state.chain_id}",
+                "diagnostic": diag,
                 "gas_buy_model_label": None,
                 "gas_sell_model_label": None,
                 "gas_buy_usd": 0.0,
