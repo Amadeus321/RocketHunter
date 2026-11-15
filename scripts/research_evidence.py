@@ -92,6 +92,7 @@ UNISWAP_V3_FEE_SPACINGS: Dict[int, int] = {
 class FinalityState(str, enum.Enum):
     """Protocol-level block and assertion settlement states."""
     FINALITY_PENDING = "FINALITY_PENDING"
+    FINALITY_CALLER_ASSERTED_UNVERIFIED = "FINALITY_CALLER_ASSERTED_UNVERIFIED"
     FINALIZED_CANONICAL = "FINALIZED_CANONICAL"
     BLOCK_REORGANIZED_ORPHAN = "BLOCK_REORGANIZED_ORPHAN"
     L1_BATCH_FINALITY_ONLY = "L1_BATCH_FINALITY_ONLY"
@@ -291,18 +292,42 @@ class ProtectedDataVerifier:
         return snapshot
 
     def verify_clean_equivalence(self, pre_snapshot: dict[str, Any], post_snapshot: dict[str, Any]) -> Tuple[bool, list[str]]:
-        """Verifies zero protected files were modified, created, or deleted (fails closed)."""
+        """Verifies zero protected files were modified, created, or deleted (fails closed).
+        Strictly rejects malformed or incomplete snapshots missing required categories.
+        """
         discrepancies = []
+
+        if not isinstance(pre_snapshot, dict) or not isinstance(post_snapshot, dict):
+            return False, ["Malformed snapshot: pre_snapshot and post_snapshot must be dictionaries"]
 
         categories = ["protected_files", "scanner_memory_partitions", "config_files"]
         for cat in categories:
-            pre_dict = pre_snapshot.get(cat, {})
-            post_dict = post_snapshot.get(cat, {})
+            if cat not in pre_snapshot:
+                discrepancies.append(f"Incomplete pre_snapshot: missing required category '{cat}'")
+            elif not isinstance(pre_snapshot[cat], dict):
+                discrepancies.append(f"Malformed pre_snapshot: category '{cat}' must be a dictionary")
 
-            # Detect deletions
+            if cat not in post_snapshot:
+                discrepancies.append(f"Incomplete post_snapshot: missing required category '{cat}'")
+            elif not isinstance(post_snapshot[cat], dict):
+                discrepancies.append(f"Malformed post_snapshot: category '{cat}' must be a dictionary")
+
+        if discrepancies:
+            return False, discrepancies
+
+        for cat in categories:
+            pre_dict = pre_snapshot[cat]
+            post_dict = post_snapshot[cat]
+
+            # Detect deletions and invalid metadata entries
             for path, meta in pre_dict.items():
+                if not isinstance(meta, dict) or "sha256" not in meta:
+                    discrepancies.append(f"Malformed pre_snapshot metadata entry in {cat}: {path}")
+                    continue
                 if path not in post_dict:
                     discrepancies.append(f"Protected item deleted in {cat}: {path}")
+                elif not isinstance(post_dict[path], dict) or "sha256" not in post_dict[path]:
+                    discrepancies.append(f"Malformed post_snapshot metadata entry in {cat}: {path}")
                 elif meta.get("sha256") != post_dict[path].get("sha256"):
                     discrepancies.append(
                         f"Protected file modified in {cat}: {path} ({meta.get('sha256')} -> {post_dict[path].get('sha256')})"
@@ -485,7 +510,10 @@ class RpcProvenanceVerifier:
         else:
             return False, FinalityState.FINALITY_PENDING, "UNSUPPORTED_CHAIN_FINALITY_SPECIFICATION"
 
-        return True, FinalityState.FINALIZED_CANONICAL, "CANONICAL_BLOCK_FINALIZED"
+        # Even when caller-provided proof fields and distinct provider IDs match,
+        # in the absence of in-engine cryptographic proof validation (Merkle/BLS)
+        # and authenticated provider identities, blocks are never promoted to FINALIZED_CANONICAL.
+        return False, FinalityState.FINALITY_CALLER_ASSERTED_UNVERIFIED, "CALLER_ASSERTED_FINALITY_NOT_CRYPTOGRAPHICALLY_VERIFIED"
 
     def quarantine_reorganized_block(self, record: RpcEvidenceRecord, reason: str) -> Path:
         """Isolates reorganized or unlinked block artifacts into quarantine sink."""
@@ -669,8 +697,15 @@ class UniswapV3Evidence:
             return False
 
         # 3. Validate mathematical tick/price relationship:
-        # In Uniswap V3, getTickAtSqrtRatio(sqrtPriceX96) must strictly equal tick
-        if UniswapV3TickMath.get_tick_at_sqrt_ratio(self.sqrt_price_x96) != self.tick:
+        # In Uniswap V3, getTickAtSqrtRatio(sqrtPriceX96) computes the greatest tick t
+        # such that getSqrtRatioAtTick(t) <= sqrtPriceX96.
+        # At an exact boundary where sqrtPriceX96 == getSqrtRatioAtTick(t), a zero-for-one
+        # swap crossing the boundary sets pool tick to step.tickNext - 1 (i.e. t - 1).
+        calc_tick = UniswapV3TickMath.get_tick_at_sqrt_ratio(self.sqrt_price_x96)
+        exact_boundary_ratio = UniswapV3TickMath.get_sqrt_ratio_at_tick(calc_tick)
+        is_exact_boundary = (self.sqrt_price_x96 == exact_boundary_ratio)
+        valid_tick = (self.tick == calc_tick) or (is_exact_boundary and self.tick == calc_tick - 1)
+        if not valid_tick:
             return False
 
         t_min = min(self.tick, target_tick)
@@ -773,10 +808,30 @@ class ValidatedTransactionReceipt:
     effective_gas_price_wei: int
     transfers: list[OnChainTransferEvent]
     raw_receipt_bytes: bytes
+    expected_receipt_sha256: str = ""
+    is_canonical_block: bool = False
+    reconciled_gas_cost: Optional[float] = None
+    reconciled_quote_amount: Optional[float] = None
 
     @property
     def receipt_sha256(self) -> str:
+        if not self.raw_receipt_bytes:
+            return ""
         return hashlib.sha256(self.raw_receipt_bytes).hexdigest().upper()
+
+    def verify_integrity(self) -> Tuple[bool, str]:
+        """Validates raw payload bytes, expected digest, and canonical block confirmation."""
+        if not self.raw_receipt_bytes:
+            return False, "EMPTY_RECEIPT_BYTES"
+        if not self.expected_receipt_sha256:
+            return False, "MISSING_EXPECTED_RECEIPT_SHA256"
+        if self.receipt_sha256 != self.expected_receipt_sha256.upper():
+            return False, "RECEIPT_SHA256_MISMATCH"
+        if not self.is_canonical_block:
+            return False, "NON_CANONICAL_RECEIPT_BLOCK"
+        if not self.block_hash or not self.tx_hash:
+            return False, "MISSING_BLOCK_OR_TX_HASH"
+        return True, "RECEIPT_INTEGRITY_VERIFIED"
 
 
 @dataclasses.dataclass
@@ -899,7 +954,24 @@ class DatasetAReconciliationEngine:
                 contributes_to_verified_pl=False,
             )
 
-        # Check receipt success status
+        # 4a. Verify cryptographic payload integrity and canonical block status
+        entry_ok, _ = entry_receipt.verify_integrity()
+        exit_ok, _ = exit_receipt.verify_integrity()
+        if not (entry_ok and exit_ok):
+            return ReconciledTrancheOutcome(
+                status=EvidenceTier.RECEIPT_VERIFICATION_FAILED,
+                alpha_ratio=0.0,
+                allocated_expenditure=0.0,
+                allocated_entry_gas=0.0,
+                allocated_entry_fees=0.0,
+                realized_net_pl=0.0,
+                realized_net_return_pct=0.0,
+                tokens_remaining=entry.tokens_acquired,
+                cost_basis_remaining=entry.quote_expenditure,
+                contributes_to_verified_pl=False,
+            )
+
+        # 4b. Check receipt success status
         if entry_receipt.status != 1 or exit_receipt.status != 1:
             return ReconciledTrancheOutcome(
                 status=EvidenceTier.EXECUTION_EVIDENCE_INCOMPLETE,
@@ -914,7 +986,7 @@ class DatasetAReconciliationEngine:
                 contributes_to_verified_pl=False,
             )
 
-        # Reconcile receipts against exact chain and transaction hashes
+        # 4c. Reconcile receipts against exact chain and transaction hashes
         if not (
             entry_receipt.chain_id == entry.chain_id
             and entry_receipt.tx_hash.lower() == entry.tx_hash.lower()
@@ -934,14 +1006,16 @@ class DatasetAReconciliationEngine:
                 contributes_to_verified_pl=False,
             )
 
-        # Verify transfer log amounts matching acquired and sold quantities
+        # 4d. Verify transfer log amounts matching acquired and sold quantities with exact token_address
         has_entry_transfer = any(
-            t.to_address.lower() == entry.wallet_address.lower()
+            t.token_address.lower() == entry.token_id.lower()
+            and t.to_address.lower() == entry.wallet_address.lower()
             and math.isclose(t.amount, entry.tokens_acquired, rel_tol=1e-4)
             for t in entry_receipt.transfers
         )
         has_exit_transfer = any(
-            t.from_address.lower() == exit_exec.wallet_address.lower()
+            t.token_address.lower() == exit_exec.token_id.lower()
+            and t.from_address.lower() == exit_exec.wallet_address.lower()
             and math.isclose(t.amount, exit_exec.tokens_sold, rel_tol=1e-4)
             for t in exit_receipt.transfers
         )
@@ -959,6 +1033,71 @@ class DatasetAReconciliationEngine:
                 cost_basis_remaining=entry.quote_expenditure,
                 contributes_to_verified_pl=False,
             )
+
+        # 4e. Reconcile quote proceeds and gas costs to reported costs
+        # Entry gas cost reconciliation
+        if entry_receipt.reconciled_gas_cost is not None:
+            if not math.isclose(entry.entry_gas_cost, entry_receipt.reconciled_gas_cost, rel_tol=1e-2):
+                return ReconciledTrancheOutcome(
+                    status=EvidenceTier.RECEIPT_VERIFICATION_FAILED,
+                    alpha_ratio=0.0,
+                    allocated_expenditure=0.0,
+                    allocated_entry_gas=0.0,
+                    allocated_entry_fees=0.0,
+                    realized_net_pl=0.0,
+                    realized_net_return_pct=0.0,
+                    tokens_remaining=entry.tokens_acquired,
+                    cost_basis_remaining=entry.quote_expenditure,
+                    contributes_to_verified_pl=False,
+                )
+
+        # Entry quote expenditure reconciliation
+        if entry_receipt.reconciled_quote_amount is not None:
+            if not math.isclose(entry.quote_expenditure, entry_receipt.reconciled_quote_amount, rel_tol=1e-2):
+                return ReconciledTrancheOutcome(
+                    status=EvidenceTier.RECEIPT_VERIFICATION_FAILED,
+                    alpha_ratio=0.0,
+                    allocated_expenditure=0.0,
+                    allocated_entry_gas=0.0,
+                    allocated_entry_fees=0.0,
+                    realized_net_pl=0.0,
+                    realized_net_return_pct=0.0,
+                    tokens_remaining=entry.tokens_acquired,
+                    cost_basis_remaining=entry.quote_expenditure,
+                    contributes_to_verified_pl=False,
+                )
+
+        # Exit gas cost reconciliation
+        if exit_receipt.reconciled_gas_cost is not None:
+            if not math.isclose(exit_exec.exit_gas_cost, exit_receipt.reconciled_gas_cost, rel_tol=1e-2):
+                return ReconciledTrancheOutcome(
+                    status=EvidenceTier.RECEIPT_VERIFICATION_FAILED,
+                    alpha_ratio=0.0,
+                    allocated_expenditure=0.0,
+                    allocated_entry_gas=0.0,
+                    allocated_entry_fees=0.0,
+                    realized_net_pl=0.0,
+                    realized_net_return_pct=0.0,
+                    tokens_remaining=entry.tokens_acquired,
+                    cost_basis_remaining=entry.quote_expenditure,
+                    contributes_to_verified_pl=False,
+                )
+
+        # Exit quote proceeds reconciliation
+        if exit_receipt.reconciled_quote_amount is not None:
+            if not math.isclose(exit_exec.gross_proceeds, exit_receipt.reconciled_quote_amount, rel_tol=1e-2):
+                return ReconciledTrancheOutcome(
+                    status=EvidenceTier.RECEIPT_VERIFICATION_FAILED,
+                    alpha_ratio=0.0,
+                    allocated_expenditure=0.0,
+                    allocated_entry_gas=0.0,
+                    allocated_entry_fees=0.0,
+                    realized_net_pl=0.0,
+                    realized_net_return_pct=0.0,
+                    tokens_remaining=entry.tokens_acquired,
+                    cost_basis_remaining=entry.quote_expenditure,
+                    contributes_to_verified_pl=False,
+                )
 
         if exit_exec.tokens_sold <= 0 or entry.tokens_acquired <= 0:
             return ReconciledTrancheOutcome(
@@ -1133,8 +1272,59 @@ class ClusteredEvaluationEngine:
         }
 
     @classmethod
+    def parse_utc_week_index(cls, week_val: Any) -> int:
+        """Parses arbitrary week representations into an integer continuous week index since UTC epoch.
+        Supports:
+        - ISO week strings: 'YYYY-Www', 'YYYY-Ww'
+        - ISO date strings: 'YYYY-MM-DD'
+        - Week block labels: 'week_01', 'week_12'
+        - Unix timestamps (seconds since epoch)
+        - Integers / continuous week counts
+        """
+        s = str(week_val).strip()
+
+        # 1. ISO week: YYYY-Www (e.g. 2026-W05)
+        iso_week_match = re.fullmatch(r"(\d{4})-W(\d{1,2})", s, re.IGNORECASE)
+        if iso_week_match:
+            year = int(iso_week_match.group(1))
+            week = int(iso_week_match.group(2))
+            return dt.date.fromisocalendar(year, week, 1).toordinal() // 7
+
+        # 2. ISO date: YYYY-MM-DD
+        iso_date_match = re.fullmatch(r"(\d{4})-(\d{2})-(\d{2})", s)
+        if iso_date_match:
+            d = dt.date.fromisoformat(s)
+            y, w, _ = d.isocalendar()
+            return dt.date.fromisocalendar(y, w, 1).toordinal() // 7
+
+        # 3. Week prefix: week_01, week_10
+        week_num_match = re.fullmatch(r"week_?(\d+)", s, re.IGNORECASE)
+        if week_num_match:
+            return int(week_num_match.group(1))
+
+        # 4. Unix timestamp or integer
+        try:
+            val = int(s)
+            if val > 1_000_000:
+                return val // (7 * 86400)
+            return val
+        except ValueError:
+            pass
+
+        return int(hashlib.md5(s.encode("utf-8")).hexdigest()[:8], 16)
+
+    @classmethod
+    def _sort_weeks_chronologically(cls, week_keys: list[Any]) -> list[Any]:
+        """Strictly sorts week identifiers in chronological order using UTC week index."""
+        unique_weeks = list(set(week_keys))
+        return sorted(unique_weeks, key=lambda w: (cls.parse_utc_week_index(w), str(w)))
+
+    @classmethod
     def compute_newey_west_block_variance(
-        cls, block_means: list[float], bandwidth: int | None = None
+        cls,
+        block_means: list[float],
+        week_indices: list[int] | None = None,
+        bandwidth: int | None = None,
     ) -> float:
         """Computes Newey-West (1987) / Bartlett kernel time-series variance on weekly block means."""
         B = len(block_means)
@@ -1148,30 +1338,24 @@ class ClusteredEvaluationEngine:
 
         omega = gamma_0
         for l in range(1, min(L + 1, B)):
-            gamma_l = sum(res[t] * res[t - l] for t in range(l, B)) / B
+            if week_indices is not None:
+                pairs = [(i, j) for i in range(B) for j in range(B) if week_indices[i] == week_indices[j] + l]
+                gamma_l = (sum(res[i] * res[j] for i, j in pairs) / B) if pairs else 0.0
+            else:
+                gamma_l = sum(res[t] * res[t - l] for t in range(l, B)) / B
             weight = 1.0 - (l / (L + 1))
             omega += 2.0 * weight * gamma_l
 
         var_mean = max(0.0, omega / B)
         return var_mean
 
-    @staticmethod
-    def _sort_weeks_chronologically(week_keys: list[Any]) -> list[Any]:
-        """Strictly sorts week identifiers in chronological order."""
-        def key_func(w: Any) -> Tuple[int, Any]:
-            w_str = str(w)
-            match = re.search(r"(\d+)", w_str)
-            if match:
-                return (0, int(match.group(1)))
-            return (1, w_str)
-
-        return sorted(list(set(week_keys)), key=key_func)
-
     @classmethod
     def evaluate_inter_block_serial_dependence(
         cls, dataset: list[dict[str, Any]], field: str = "loss_diff"
     ) -> dict[str, Any]:
-        """Evaluates lag-1 and lag-2 autocorrelations of weekly block-mean residuals in chronological order."""
+        """Evaluates lag-1 and lag-2 autocorrelations of weekly block-mean residuals in chronological order,
+        accounting explicitly for missing weeks/gaps.
+        """
         counts = cls.get_structural_counts(dataset)
         B = counts["B_weeks"]
         if B < 3:
@@ -1189,22 +1373,32 @@ class ClusteredEvaluationEngine:
         sorted_weeks = cls._sort_weeks_chronologically(raw_weeks)
 
         week_means = []
+        week_indices = []
         for w in sorted_weeks:
             obs_w = [x[field] for x in dataset if x["week_block"] == w]
             week_means.append(sum(obs_w) / len(obs_w))
+            week_indices.append(cls.parse_utc_week_index(w))
 
         grand_mean = sum(week_means) / len(week_means)
         res = [wm - grand_mean for wm in week_means]
         denom = sum(r**2 for r in res)
 
-        # Lag-1 autocorrelation with Kendall adjustment
-        num_1 = sum(res[w] * res[w - 1] for w in range(1, len(res)))
-        rho_1 = num_1 / denom if denom > 0 else 0.0
-        rho_adj_1 = rho_1 + (1.0 + 3.0 * rho_1) / B
+        # Lag-1 autocorrelation strictly between consecutive calendar weeks (week_idx[i] == week_idx[j] + 1)
+        lag1_pairs = [
+            (i, j) for i in range(len(week_means)) for j in range(len(week_means))
+            if week_indices[i] == week_indices[j] + 1
+        ]
+        num_1 = sum(res[i] * res[j] for i, j in lag1_pairs) if lag1_pairs else 0.0
+        rho_1 = num_1 / denom if denom > 0 and lag1_pairs else 0.0
+        rho_adj_1 = (rho_1 + (1.0 + 3.0 * rho_1) / B) if B > 0 else 0.0
 
-        # Lag-2 autocorrelation
-        num_2 = sum(res[w] * res[w - 2] for w in range(2, len(res))) if len(res) >= 3 else 0.0
-        rho_2 = num_2 / denom if denom > 0 else 0.0
+        # Lag-2 autocorrelation strictly between weeks separated by exactly 2 weeks (week_idx[i] == week_idx[j] + 2)
+        lag2_pairs = [
+            (i, j) for i in range(len(week_means)) for j in range(len(week_means))
+            if week_indices[i] == week_indices[j] + 2
+        ]
+        num_2 = sum(res[i] * res[j] for i, j in lag2_pairs) if lag2_pairs else 0.0
+        rho_2 = num_2 / denom if denom > 0 and lag2_pairs else 0.0
 
         bartlett_threshold = 2.0 / math.sqrt(B)
         fallback_triggered = (
@@ -1213,7 +1407,7 @@ class ClusteredEvaluationEngine:
             or (abs(rho_2) > bartlett_threshold)
         )
 
-        nw_var = cls.compute_newey_west_block_variance(week_means)
+        nw_var = cls.compute_newey_west_block_variance(week_means, week_indices=week_indices)
         nw_se = math.sqrt(nw_var)
 
         return {

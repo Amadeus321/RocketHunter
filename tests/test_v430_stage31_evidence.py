@@ -25,6 +25,7 @@ Exercises and validates all Stage 3.1 acceptance criteria with rigorous adversar
 from __future__ import annotations
 
 import decimal
+import hashlib
 import math
 import random
 import tempfile
@@ -174,6 +175,39 @@ class TestStage31ProtectedDataAndManifest(unittest.TestCase):
         self.assertFalse(is_clean)
         self.assertTrue(any("Unauthorized new file created" in d for d in disc))
 
+    def test_snapshot_missing_category_fails_closed(self):
+        """Validates that incomplete snapshots missing required categories are strictly rejected."""
+        valid_snapshot = self.verifier.snapshot_protected_data()
+
+        # Pre-snapshot missing required category
+        incomplete_pre = {"scanner_memory_partitions": {}, "config_files": {}}
+        is_clean, disc = self.verifier.verify_clean_equivalence(incomplete_pre, valid_snapshot)
+        self.assertFalse(is_clean)
+        self.assertTrue(any("missing required category 'protected_files'" in d for d in disc))
+
+        # Post-snapshot missing required category
+        incomplete_post = {"protected_files": {}, "scanner_memory_partitions": {}}
+        is_clean, disc = self.verifier.verify_clean_equivalence(valid_snapshot, incomplete_post)
+        self.assertFalse(is_clean)
+        self.assertTrue(any("missing required category 'config_files'" in d for d in disc))
+
+        # Completely empty snapshots fail closed
+        is_clean, disc = self.verifier.verify_clean_equivalence({}, {})
+        self.assertFalse(is_clean)
+        self.assertTrue(len(disc) > 0)
+
+    def test_snapshot_malformed_category_type_fails_closed(self):
+        """Validates that snapshots with non-dictionary categories fail closed."""
+        valid_snapshot = self.verifier.snapshot_protected_data()
+        malformed = {
+            "protected_files": ["not_a_dict"],
+            "scanner_memory_partitions": {},
+            "config_files": {},
+        }
+        is_clean, disc = self.verifier.verify_clean_equivalence(malformed, valid_snapshot)
+        self.assertFalse(is_clean)
+        self.assertTrue(any("must be a dictionary" in d for d in disc))
+
 
 class TestStage31RpcProvenanceAndQuarantine(unittest.TestCase):
     """Test three-tiered RPC evidence, downgraded Tier 2 metadata, and distinct-provider Tier 3 finality."""
@@ -248,11 +282,12 @@ class TestStage31RpcProvenanceAndQuarantine(unittest.TestCase):
         self.assertEqual(msg, "QUORUM_REQUIRES_DISTINCT_INDEPENDENT_PROVIDERS")
 
     def test_tier3_chain_specific_finality_ethereum_l1(self):
-        """Validates Ethereum L1 Beacon finalized checkpoint proof verification."""
+        """Validates Ethereum L1 Beacon checkpoint proof evaluation (downgraded to caller-asserted unverified)."""
         rec1 = self._make_record(provider_id="alchemy_primary", block_hash="0x1234")
         rec2 = self._make_record(provider_id="infura_secondary", block_hash="0x1234")
 
-        # Valid Beacon checkpoint proof
+        # Caller-asserted Beacon checkpoint proof matches schema, but in-engine cryptographic
+        # verification does not exist -> remains FINALITY_CALLER_ASSERTED_UNVERIFIED, not FINALIZED_CANONICAL
         proof_valid = {
             "proof_type": "ETHEREUM_BEACON_FINALITY",
             "checkpoint_epoch": 280000,
@@ -260,8 +295,9 @@ class TestStage31RpcProvenanceAndQuarantine(unittest.TestCase):
             "checkpoint_block_hash": "0x1234",
         }
         passed, state, msg = self.verifier.verify_tier3_canonical_quorum(rec1, rec2, finality_proof=proof_valid)
-        self.assertTrue(passed)
-        self.assertEqual(state, FinalityState.FINALIZED_CANONICAL)
+        self.assertFalse(passed)
+        self.assertEqual(state, FinalityState.FINALITY_CALLER_ASSERTED_UNVERIFIED)
+        self.assertEqual(msg, "CALLER_ASSERTED_FINALITY_NOT_CRYPTOGRAPHICALLY_VERIFIED")
 
         # Mismatched checkpoint block hash fails to FINALITY_PENDING
         proof_mismatch = {
@@ -275,11 +311,11 @@ class TestStage31RpcProvenanceAndQuarantine(unittest.TestCase):
         self.assertEqual(state, FinalityState.FINALITY_PENDING)
 
     def test_tier3_chain_specific_finality_arbitrum(self):
-        """Validates Arbitrum Nitro assertion finality proof verification."""
+        """Validates Arbitrum Nitro assertion proof evaluation (downgraded to caller-asserted unverified)."""
         rec1 = self._make_record(chain_id=42161, provider_id="alchemy_arb", block_hash="0xarb")
         rec2 = self._make_record(chain_id=42161, provider_id="quicknode_arb", block_hash="0xarb")
 
-        # Assertion confirmed (elapsed blocks >= 45,818)
+        # Assertion confirmed (elapsed blocks >= 45,818) -> caller-asserted unverified, not FINALIZED_CANONICAL
         proof_arb_canonical = {
             "proof_type": "ARBITRUM_NITRO_ASSERTION",
             "l1_batch_finalized": True,
@@ -289,8 +325,9 @@ class TestStage31RpcProvenanceAndQuarantine(unittest.TestCase):
             "challenge_status": "NONE",
         }
         passed, state, msg = self.verifier.verify_tier3_canonical_quorum(rec1, rec2, finality_proof=proof_arb_canonical)
-        self.assertTrue(passed)
-        self.assertEqual(state, FinalityState.FINALIZED_CANONICAL)
+        self.assertFalse(passed)
+        self.assertEqual(state, FinalityState.FINALITY_CALLER_ASSERTED_UNVERIFIED)
+        self.assertEqual(msg, "CALLER_ASSERTED_FINALITY_NOT_CRYPTOGRAPHICALLY_VERIFIED")
 
         # Assertion window still open -> L1_BATCH_FINALITY_ONLY
         proof_arb_pending = {
@@ -416,6 +453,57 @@ class TestStage31VenueEvidenceAndDualTrackOutcomes(unittest.TestCase):
         )
         self.assertFalse(v3_mismatch.is_complete_for_range(target_tick=204560))
 
+    def test_uniswap_v3_exact_boundary_tick_semantics(self):
+        """Regression: Validates exact-boundary state where pool tick can be tickNext - 1 after zero-for-one crossing."""
+        spacing = UNISWAP_V3_FEE_SPACINGS[100]  # spacing 1
+        t_boundary = 204520
+        sqrt_p_exact = UniswapV3TickMath.get_sqrt_ratio_at_tick(t_boundary)
+
+        w = (t_boundary // spacing) >> 8
+        b = (t_boundary // spacing) % 256
+
+        # 1. Normal state: pool tick == t_boundary
+        v3_normal = UniswapV3Evidence(
+            chain_id=1, pool_address="0xp", token0_address="0xt0", token1_address="0xt1",
+            token0_decimals=6, token1_decimals=18, fee_tier_ppm=100,
+            sqrt_price_x96=sqrt_p_exact, tick=t_boundary, active_liquidity=1000,
+            initialized_ticks={t_boundary: {"liquidityNet": 100, "liquidityGross": 100}},
+            tick_bitmap={w: 1 << b}, block_number=1, block_hash="0xh", parent_hash="0xp",
+        )
+        self.assertTrue(v3_normal.is_complete_for_range(target_tick=t_boundary + 10))
+
+        # 2. Boundary crossing state: pool tick == t_boundary - 1 (step.tickNext - 1)
+        v3_boundary_crossing = UniswapV3Evidence(
+            chain_id=1, pool_address="0xp", token0_address="0xt0", token1_address="0xt1",
+            token0_decimals=6, token1_decimals=18, fee_tier_ppm=100,
+            sqrt_price_x96=sqrt_p_exact, tick=t_boundary - 1, active_liquidity=1000,
+            initialized_ticks={t_boundary: {"liquidityNet": 100, "liquidityGross": 100}},
+            tick_bitmap={w: 1 << b}, block_number=1, block_hash="0xh", parent_hash="0xp",
+        )
+        self.assertTrue(v3_boundary_crossing.is_complete_for_range(target_tick=t_boundary + 10))
+
+        # 3. Mismatched ticks (t_boundary - 2, t_boundary + 1) fail closed
+        v3_too_low = UniswapV3Evidence(
+            chain_id=1, pool_address="0xp", token0_address="0xt0", token1_address="0xt1",
+            token0_decimals=6, token1_decimals=18, fee_tier_ppm=100,
+            sqrt_price_x96=sqrt_p_exact, tick=t_boundary - 2, active_liquidity=1000,
+            initialized_ticks={t_boundary: {"liquidityNet": 100, "liquidityGross": 100}},
+            tick_bitmap={w: 1 << b}, block_number=1, block_hash="0xh", parent_hash="0xp",
+        )
+        self.assertFalse(v3_too_low.is_complete_for_range(target_tick=t_boundary + 10))
+
+        # 4. Non-boundary ratio (interior): tick == calc_tick - 1 must fail
+        sqrt_p_interior = sqrt_p_exact + 100
+        self.assertEqual(UniswapV3TickMath.get_tick_at_sqrt_ratio(sqrt_p_interior), t_boundary)
+        v3_interior_invalid = UniswapV3Evidence(
+            chain_id=1, pool_address="0xp", token0_address="0xt0", token1_address="0xt1",
+            token0_decimals=6, token1_decimals=18, fee_tier_ppm=100,
+            sqrt_price_x96=sqrt_p_interior, tick=t_boundary - 1, active_liquidity=1000,
+            initialized_ticks={t_boundary: {"liquidityNet": 100, "liquidityGross": 100}},
+            tick_bitmap={w: 1 << b}, block_number=1, block_hash="0xh", parent_hash="0xp",
+        )
+        self.assertFalse(v3_interior_invalid.is_complete_for_range(target_tick=t_boundary + 10))
+
     def test_uniswap_v3_regression_bidirectional_bitmap_mismatch(self):
         """Regression: Fails closed when initialized tick is missing from bitmap (Direction A)."""
         spacing = UNISWAP_V3_FEE_SPACINGS[500]
@@ -453,7 +541,21 @@ class TestStage31VenueEvidenceAndDualTrackOutcomes(unittest.TestCase):
 class TestStage31DatasetAReconciliation(unittest.TestCase):
     """Test Dataset A trade journal reconciliation with validated on-chain receipts and volume checks."""
 
-    def _make_receipt(self, chain_id: int, tx_hash: str, from_addr: str, to_addr: str, token: str, amount: float) -> ValidatedTransactionReceipt:
+    def _make_receipt(
+        self,
+        chain_id: int,
+        tx_hash: str,
+        from_addr: str,
+        to_addr: str,
+        token: str,
+        amount: float,
+        is_canonical: bool = True,
+        raw_bytes: bytes = b'{"receipt": true}',
+        reconciled_gas: Optional[float] = None,
+        reconciled_quote: Optional[float] = None,
+        expected_sha256: Optional[str] = None,
+    ) -> ValidatedTransactionReceipt:
+        sha = expected_sha256 if expected_sha256 is not None else hashlib.sha256(raw_bytes).hexdigest().upper()
         return ValidatedTransactionReceipt(
             chain_id=chain_id,
             tx_hash=tx_hash,
@@ -463,11 +565,15 @@ class TestStage31DatasetAReconciliation(unittest.TestCase):
             gas_used=100000,
             effective_gas_price_wei=20000000000,
             transfers=[OnChainTransferEvent(token_address=token, from_address=from_addr, to_address=to_addr, amount=amount)],
-            raw_receipt_bytes=b'{"receipt": true}',
+            raw_receipt_bytes=raw_bytes,
+            expected_receipt_sha256=sha,
+            is_canonical_block=is_canonical,
+            reconciled_gas_cost=reconciled_gas,
+            reconciled_quote_amount=reconciled_quote,
         )
 
     def test_receipt_bound_verified_execution(self):
-        """Validates that receipt/transfer logs matching exact amounts and addresses yield verified status."""
+        """Validates that receipt/transfer logs matching exact amounts, addresses, token, and costs yield verified status."""
         entry = JournalEntryPosition(
             token_id="ethereum:0x1111", chain_id=1, wallet_address="0xUser", tx_hash="0xentrytx",
             quote_expenditure=1000.0, tokens_acquired=10000.0, entry_gas_cost=20.0, entry_venue_fees=3.0,
@@ -477,14 +583,108 @@ class TestStage31DatasetAReconciliation(unittest.TestCase):
             tokens_sold=4000.0, gross_proceeds=600.0, exit_gas_cost=15.0, exit_venue_fees=2.0,
         )
 
-        entry_receipt = self._make_receipt(1, "0xentrytx", "0xpool", "0xUser", "ethereum:0x1111", 10000.0)
-        exit_receipt = self._make_receipt(1, "0xexittx", "0xUser", "0xpool", "ethereum:0x1111", 4000.0)
+        entry_receipt = self._make_receipt(
+            1, "0xentrytx", "0xpool", "0xUser", "ethereum:0x1111", 10000.0,
+            reconciled_gas=20.0, reconciled_quote=1000.0,
+        )
+        exit_receipt = self._make_receipt(
+            1, "0xexittx", "0xUser", "0xpool", "ethereum:0x1111", 4000.0,
+            reconciled_gas=15.0, reconciled_quote=600.0,
+        )
 
         outcome = DatasetAReconciliationEngine.reconcile_tranche(entry, exit_exec, entry_receipt, exit_receipt)
         self.assertEqual(outcome.status, EvidenceTier.INDEPENDENTLY_VERIFIED_EXECUTION)
         self.assertEqual(outcome.alpha_ratio, 0.40)
         self.assertAlmostEqual(outcome.realized_net_pl, 173.8, places=2)
         self.assertTrue(outcome.contributes_to_verified_pl)
+
+    def test_unverified_when_raw_receipt_bytes_digest_mismatches(self):
+        """Adversarial: Validates rejection when expected_receipt_sha256 does not match raw bytes."""
+        entry = JournalEntryPosition("ethereum:0x1111", 1, "0xUser", "0xentrytx", 1000.0, 10000.0, 20.0, 3.0)
+        exit_exec = JournalExitExecution("ethereum:0x1111", 1, "0xUser", "0xexittx", 4000.0, 600.0, 15.0, 2.0)
+
+        entry_receipt = self._make_receipt(
+            1, "0xentrytx", "0xpool", "0xUser", "ethereum:0x1111", 10000.0,
+            expected_sha256="0xBADHASH", reconciled_gas=20.0, reconciled_quote=1000.0,
+        )
+        exit_receipt = self._make_receipt(
+            1, "0xexittx", "0xUser", "0xpool", "ethereum:0x1111", 4000.0,
+            reconciled_gas=15.0, reconciled_quote=600.0,
+        )
+
+        outcome = DatasetAReconciliationEngine.reconcile_tranche(entry, exit_exec, entry_receipt, exit_receipt)
+        self.assertEqual(outcome.status, EvidenceTier.RECEIPT_VERIFICATION_FAILED)
+        self.assertFalse(outcome.contributes_to_verified_pl)
+
+    def test_unverified_when_receipt_block_is_not_canonical(self):
+        """Adversarial: Validates rejection when receipt block is not confirmed canonical."""
+        entry = JournalEntryPosition("ethereum:0x1111", 1, "0xUser", "0xentrytx", 1000.0, 10000.0, 20.0, 3.0)
+        exit_exec = JournalExitExecution("ethereum:0x1111", 1, "0xUser", "0xexittx", 4000.0, 600.0, 15.0, 2.0)
+
+        entry_receipt = self._make_receipt(
+            1, "0xentrytx", "0xpool", "0xUser", "ethereum:0x1111", 10000.0,
+            is_canonical=False, reconciled_gas=20.0, reconciled_quote=1000.0,
+        )
+        exit_receipt = self._make_receipt(
+            1, "0xexittx", "0xUser", "0xpool", "ethereum:0x1111", 4000.0,
+            reconciled_gas=15.0, reconciled_quote=600.0,
+        )
+
+        outcome = DatasetAReconciliationEngine.reconcile_tranche(entry, exit_exec, entry_receipt, exit_receipt)
+        self.assertEqual(outcome.status, EvidenceTier.RECEIPT_VERIFICATION_FAILED)
+        self.assertFalse(outcome.contributes_to_verified_pl)
+
+    def test_unverified_when_transfer_token_address_mismatches(self):
+        """Adversarial: Validates rejection when transfer log token address mismatches traded token."""
+        entry = JournalEntryPosition("ethereum:0x1111", 1, "0xUser", "0xentrytx", 1000.0, 10000.0, 20.0, 3.0)
+        exit_exec = JournalExitExecution("ethereum:0x1111", 1, "0xUser", "0xexittx", 4000.0, 600.0, 15.0, 2.0)
+
+        # Entry transfer is for a different token (0xROGUE instead of 0x1111)
+        entry_receipt = self._make_receipt(
+            1, "0xentrytx", "0xpool", "0xUser", "ethereum:0xROGUE", 10000.0,
+            reconciled_gas=20.0, reconciled_quote=1000.0,
+        )
+        exit_receipt = self._make_receipt(
+            1, "0xexittx", "0xUser", "0xpool", "ethereum:0x1111", 4000.0,
+            reconciled_gas=15.0, reconciled_quote=600.0,
+        )
+
+        outcome = DatasetAReconciliationEngine.reconcile_tranche(entry, exit_exec, entry_receipt, exit_receipt)
+        self.assertEqual(outcome.status, EvidenceTier.RECEIPT_VERIFICATION_FAILED)
+        self.assertFalse(outcome.contributes_to_verified_pl)
+
+    def test_unverified_when_gas_or_proceeds_cost_mismatches(self):
+        """Adversarial: Validates rejection when reported costs differ from reconciled receipt costs."""
+        entry = JournalEntryPosition("ethereum:0x1111", 1, "0xUser", "0xentrytx", 1000.0, 10000.0, 20.0, 3.0)
+        exit_exec = JournalExitExecution("ethereum:0x1111", 1, "0xUser", "0xexittx", 4000.0, 600.0, 15.0, 2.0)
+
+        # Mismatched gas cost (reported 20.0, receipt says 999.0)
+        entry_receipt_bad_gas = self._make_receipt(
+            1, "0xentrytx", "0xpool", "0xUser", "ethereum:0x1111", 10000.0,
+            reconciled_gas=999.0, reconciled_quote=1000.0,
+        )
+        exit_receipt = self._make_receipt(
+            1, "0xexittx", "0xUser", "0xpool", "ethereum:0x1111", 4000.0,
+            reconciled_gas=15.0, reconciled_quote=600.0,
+        )
+
+        outcome = DatasetAReconciliationEngine.reconcile_tranche(entry, exit_exec, entry_receipt_bad_gas, exit_receipt)
+        self.assertEqual(outcome.status, EvidenceTier.RECEIPT_VERIFICATION_FAILED)
+        self.assertFalse(outcome.contributes_to_verified_pl)
+
+        # Mismatched proceeds (reported 600.0, receipt says 50.0)
+        entry_receipt_ok = self._make_receipt(
+            1, "0xentrytx", "0xpool", "0xUser", "ethereum:0x1111", 10000.0,
+            reconciled_gas=20.0, reconciled_quote=1000.0,
+        )
+        exit_receipt_bad_proceeds = self._make_receipt(
+            1, "0xexittx", "0xUser", "0xpool", "ethereum:0x1111", 4000.0,
+            reconciled_gas=15.0, reconciled_quote=50.0,
+        )
+
+        outcome2 = DatasetAReconciliationEngine.reconcile_tranche(entry, exit_exec, entry_receipt_ok, exit_receipt_bad_proceeds)
+        self.assertEqual(outcome2.status, EvidenceTier.RECEIPT_VERIFICATION_FAILED)
+        self.assertFalse(outcome2.contributes_to_verified_pl)
 
     def test_missing_receipt_remains_unverified(self):
         """Validates that caller-asserted records without receipts remain USER_REPORTED_EXECUTION."""
@@ -549,6 +749,44 @@ class TestStage31ClusteredStatisticalInference(unittest.TestCase):
         diag = ClusteredEvaluationEngine.evaluate_inter_block_serial_dependence(dataset, field="loss_diff")
         self.assertEqual(diag["chronological_weeks"], ["week_01", "week_02", "week_03"])
         self.assertEqual(diag["week_means"], [0.1, 0.2, 0.3])
+
+    def test_iso_date_and_cross_year_week_ordering(self):
+        """Validates that explicit UTC week parsing sorts ISO weeks across year boundaries and ISO dates correctly."""
+        # 1. Cross-year ISO weeks (2025-W50, 2025-W52, 2026-W01, 2026-W02)
+        dataset_cross_year = [
+            {"token_id": "T0", "week_block": "2026-W02", "loss_diff": 0.4},
+            {"token_id": "T0", "week_block": "2025-W50", "loss_diff": 0.1},
+            {"token_id": "T0", "week_block": "2026-W01", "loss_diff": 0.3},
+            {"token_id": "T0", "week_block": "2025-W52", "loss_diff": 0.2},
+        ]
+        diag_cross = ClusteredEvaluationEngine.evaluate_inter_block_serial_dependence(dataset_cross_year, field="loss_diff")
+        self.assertEqual(diag_cross["chronological_weeks"], ["2025-W50", "2025-W52", "2026-W01", "2026-W02"])
+        self.assertEqual(diag_cross["week_means"], [0.1, 0.2, 0.3, 0.4])
+
+        # 2. ISO calendar dates (2025-12-15, 2026-01-10, 2026-03-01)
+        dataset_dates = [
+            {"token_id": "T0", "week_block": "2026-03-01", "loss_diff": 0.3},
+            {"token_id": "T0", "week_block": "2025-12-15", "loss_diff": 0.1},
+            {"token_id": "T0", "week_block": "2026-01-10", "loss_diff": 0.2},
+        ]
+        diag_dates = ClusteredEvaluationEngine.evaluate_inter_block_serial_dependence(dataset_dates, field="loss_diff")
+        self.assertEqual(diag_dates["chronological_weeks"], ["2025-12-15", "2026-01-10", "2026-03-01"])
+        self.assertEqual(diag_dates["week_means"], [0.1, 0.2, 0.3])
+
+    def test_missing_weeks_and_gaps_not_treated_as_adjacent_lags(self):
+        """Validates that non-consecutive weeks with gaps are NOT treated as adjacent lag-1 transitions."""
+        # Dataset with missing weeks: week_01, week_03, week_05, week_07 (gap of 2 between all)
+        dataset_gaps = [
+            {"token_id": "T0", "week_block": "week_01", "loss_diff": 1.0},
+            {"token_id": "T0", "week_block": "week_03", "loss_diff": 2.0},
+            {"token_id": "T0", "week_block": "week_05", "loss_diff": 1.0},
+            {"token_id": "T0", "week_block": "week_07", "loss_diff": 2.0},
+        ]
+        diag_gaps = ClusteredEvaluationEngine.evaluate_inter_block_serial_dependence(dataset_gaps, field="loss_diff")
+        # Since week differences are 2 (not 1), no lag-1 pairs exist!
+        self.assertEqual(diag_gaps["rho_1"], 0.0)
+        # But lag-2 pairs DO exist (week 3 - week 1 = 2, week 5 - week 3 = 2, week 7 - week 5 = 2)
+        self.assertNotEqual(diag_gaps["rho_2"], 0.0)
 
     def test_all_inference_labeled_exploratory(self):
         """Validates that confirmatory status is never claimed and results are branded exploratory."""
