@@ -69,6 +69,7 @@ from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 decimal.getcontext().prec = 100
 
 STAGE_31_VERSION = "4.30.0-stage3.1"
+STAGE_32_VERSION = "4.30.0-stage3.2"
 APPROVED_BASELINE_COMMIT = "2bba7cc9cd7db59ce428252050f882b99c581f61"
 CANONICAL_OP_COMMIT = "33f06d2d5e4034125df02264a5ffe84571bd0359"
 CANONICAL_OP_TAG = "op-contracts/v1.6.0"
@@ -76,6 +77,9 @@ CANONICAL_OP_TAG = "op-contracts/v1.6.0"
 # Technical target requirements
 TECHNICAL_TP_PCT = 40.00
 MAX_HOLDING_HOURS = 24.0
+
+# Standard simulation scenario tranches (strictly hypothetical depth probing, NOT actual position sizing)
+SIMULATION_TRANCHES_USD: List[float] = [100.0, 500.0, 1000.0, 2500.0, 5000.0]
 
 # Uniswap V3 canonical fee tier to tick spacing mapping
 UNISWAP_V3_FEE_SPACINGS: Dict[int, int] = {
@@ -113,6 +117,31 @@ class ModeledExecutionStatus(str, enum.Enum):
     """Execution simulation evidence categories. NEVER labeled verified."""
     MODELED_EXECUTION_WITH_ASSUMPTIONS = "MODELED_EXECUTION_WITH_ASSUMPTIONS"
     EXECUTION_UNVERIFIED = "EXECUTION_UNVERIFIED"
+
+
+class DualTrackTargetStatus(str, enum.Enum):
+    """Dual-track technical vs executable target attainment classifications."""
+    # Market price track (unverified telemetry)
+    MARKET_TP40_TOUCHED_UNVERIFIED = "MARKET_TP40_TOUCHED_UNVERIFIED"
+    MARKET_TP_NOT_REACHED = "MARKET_TP_NOT_REACHED"
+    MARKET_TARGET_UNRESOLVED = "MARKET_TARGET_UNRESOLVED"
+
+    # Executable depth simulation track (strictly modeled)
+    MODELED_TP40_EXECUTABLE_WITH_ASSUMPTIONS = "MODELED_TP40_EXECUTABLE_WITH_ASSUMPTIONS"
+    MODELED_TP40_EXECUTION_IMPACT_FAIL = "MODELED_TP40_EXECUTION_IMPACT_FAIL"
+    MODELED_TP40_LIQUIDITY_INSUFFICIENT = "MODELED_TP40_LIQUIDITY_INSUFFICIENT"
+    MODELED_ROUNDTRIP_UNRESOLVED_STATE_MISSING = "MODELED_ROUNDTRIP_UNRESOLVED_STATE_MISSING"
+    MODELED_DEPTH_UNRESOLVED = "MODELED_DEPTH_UNRESOLVED"
+
+
+class LiquidityClassificationStatus(str, enum.Enum):
+    """Liquidity classification status separating fixed-band depth, price markdown, and event removal."""
+    LIQUIDITY_DEPTH_COLLAPSE_OBSERVED_UNVERIFIED = "LIQUIDITY_DEPTH_COLLAPSE_OBSERVED_UNVERIFIED"
+    LP_WITHDRAWAL_COLLAPSE_OBSERVED_UNVERIFIED = "LP_WITHDRAWAL_COLLAPSE_OBSERVED_UNVERIFIED"
+    UNRESOLVED_LIQUIDITY = "UNRESOLVED_LIQUIDITY"
+    LIQUIDITY_DEPTH_DEGRADED_OBSERVED_UNVERIFIED = "LIQUIDITY_DEPTH_DEGRADED_OBSERVED_UNVERIFIED"
+    ASSET_PRICE_DEPRECIATION_OBSERVED_UNVERIFIED = "ASSET_PRICE_DEPRECIATION_OBSERVED_UNVERIFIED"
+    LIQUIDITY_DEPTH_SURVIVED_OBSERVED_UNVERIFIED = "LIQUIDITY_DEPTH_SURVIVED_OBSERVED_UNVERIFIED"
 
 
 class EvidenceTier(str, enum.Enum):
@@ -789,6 +818,695 @@ class UniswapV3Evidence:
                                 return False  # Bit set in bitmap but tick missing from initialized_ticks!
 
         return True
+
+
+class UniswapV3SwapMath:
+    """Exact integer math library replicating Uniswap V3 SqrtPriceMath.sol and SwapMath.sol."""
+
+    @staticmethod
+    def mul_div_rounding_up(a: int, b: int, denominator: int) -> int:
+        """Exact FullMath.mulDivRoundingUp integer operation."""
+        if denominator <= 0:
+            raise ValueError("Denominator must be positive")
+        prod = a * b
+        quotient = prod // denominator
+        if prod % denominator > 0:
+            quotient += 1
+        return quotient
+
+    @staticmethod
+    def get_amount0_delta_round_down(sqrt_ratio_a_x96: int, sqrt_ratio_b_x96: int, liquidity: int) -> int:
+        """Exact integer implementation of SqrtPriceMath.getAmount0Delta(..., roundUp=false).
+        Does NOT subtract two independently rounded reciprocal terms.
+        Canonical operation order: (numerator1 * numerator2 // sqrt_ratio_b_x96) // sqrt_ratio_a_x96.
+        """
+        if sqrt_ratio_a_x96 > sqrt_ratio_b_x96:
+            sqrt_ratio_a_x96, sqrt_ratio_b_x96 = sqrt_ratio_b_x96, sqrt_ratio_a_x96
+        if sqrt_ratio_a_x96 <= 0:
+            return 0
+        numerator1 = liquidity << 96
+        numerator2 = sqrt_ratio_b_x96 - sqrt_ratio_a_x96
+        intermediate = (numerator1 * numerator2) // sqrt_ratio_b_x96
+        return intermediate // sqrt_ratio_a_x96
+
+    @staticmethod
+    def get_amount0_delta_round_up(sqrt_ratio_a_x96: int, sqrt_ratio_b_x96: int, liquidity: int) -> int:
+        """Exact integer implementation of SqrtPriceMath.getAmount0Delta(..., roundUp=true)."""
+        if sqrt_ratio_a_x96 > sqrt_ratio_b_x96:
+            sqrt_ratio_a_x96, sqrt_ratio_b_x96 = sqrt_ratio_b_x96, sqrt_ratio_a_x96
+        if sqrt_ratio_a_x96 <= 0:
+            return 0
+        numerator1 = liquidity << 96
+        numerator2 = sqrt_ratio_b_x96 - sqrt_ratio_a_x96
+        div1 = (numerator1 * numerator2 + sqrt_ratio_b_x96 - 1) // sqrt_ratio_b_x96
+        return (div1 + sqrt_ratio_a_x96 - 1) // sqrt_ratio_a_x96
+
+    @staticmethod
+    def get_amount1_delta_round_down(sqrt_ratio_a_x96: int, sqrt_ratio_b_x96: int, liquidity: int) -> int:
+        """Exact integer implementation of SqrtPriceMath.getAmount1Delta(..., roundUp=false)."""
+        if sqrt_ratio_a_x96 > sqrt_ratio_b_x96:
+            sqrt_ratio_a_x96, sqrt_ratio_b_x96 = sqrt_ratio_b_x96, sqrt_ratio_a_x96
+        return (liquidity * (sqrt_ratio_b_x96 - sqrt_ratio_a_x96)) >> 96
+
+    @staticmethod
+    def get_amount1_delta_round_up(sqrt_ratio_a_x96: int, sqrt_ratio_b_x96: int, liquidity: int) -> int:
+        """Exact integer implementation of SqrtPriceMath.getAmount1Delta(..., roundUp=true)."""
+        if sqrt_ratio_a_x96 > sqrt_ratio_b_x96:
+            sqrt_ratio_a_x96, sqrt_ratio_b_x96 = sqrt_ratio_b_x96, sqrt_ratio_a_x96
+        diff = sqrt_ratio_b_x96 - sqrt_ratio_a_x96
+        return ((liquidity * diff) + (1 << 96) - 1) >> 96
+
+    @classmethod
+    def get_next_sqrt_price_from_input(
+        cls, sqrt_p_x96: int, liquidity: int, amount_in: int, zero_for_one: bool
+    ) -> int:
+        """Calculates next sqrt price from input amount."""
+        if amount_in <= 0:
+            return sqrt_p_x96
+        numerator1 = liquidity << 96
+        if zero_for_one:
+            # token0 in -> price moves down
+            product = amount_in * sqrt_p_x96
+            denominator = numerator1 + product
+            return cls.mul_div_rounding_up(numerator1, sqrt_p_x96, denominator)
+        else:
+            # token1 in -> price moves up
+            quotient = (amount_in << 96) // liquidity
+            return sqrt_p_x96 + quotient
+
+    @classmethod
+    def compute_swap_step(
+        cls,
+        sqrt_ratio_current_x96: int,
+        sqrt_ratio_target_x96: int,
+        liquidity: int,
+        amount_remaining: int,
+        fee_ppm: int,
+    ) -> Tuple[int, int, int, int]:
+        """Computes single swap step matching SwapMath.sol line by line.
+        Returns (sqrt_ratio_next_x96, amount_in, amount_out, fee_amount).
+        """
+        zero_for_one = sqrt_ratio_current_x96 >= sqrt_ratio_target_x96
+        exact_in = amount_remaining >= 0
+
+        if not exact_in:
+            raise NotImplementedError("Exact-out swap step not implemented for research depth simulation")
+
+        amount_remaining_less_fee = (amount_remaining * (1_000_000 - fee_ppm)) // 1_000_000
+        amount_in = (
+            cls.get_amount0_delta_round_up(sqrt_ratio_target_x96, sqrt_ratio_current_x96, liquidity)
+            if zero_for_one
+            else cls.get_amount1_delta_round_up(sqrt_ratio_current_x96, sqrt_ratio_target_x96, liquidity)
+        )
+
+        if amount_remaining_less_fee >= amount_in:
+            sqrt_ratio_next_x96 = sqrt_ratio_target_x96
+        else:
+            sqrt_ratio_next_x96 = cls.get_next_sqrt_price_from_input(
+                sqrt_ratio_current_x96,
+                liquidity,
+                amount_remaining_less_fee,
+                zero_for_one,
+            )
+
+        max_reached = (sqrt_ratio_target_x96 == sqrt_ratio_next_x96)
+
+        if zero_for_one:
+            amount_in = (
+                amount_in
+                if max_reached
+                else cls.get_amount0_delta_round_up(sqrt_ratio_next_x96, sqrt_ratio_current_x96, liquidity)
+            )
+            amount_out = cls.get_amount1_delta_round_down(sqrt_ratio_next_x96, sqrt_ratio_current_x96, liquidity)
+        else:
+            amount_in = (
+                amount_in
+                if max_reached
+                else cls.get_amount1_delta_round_up(sqrt_ratio_current_x96, sqrt_ratio_next_x96, liquidity)
+            )
+            amount_out = cls.get_amount0_delta_round_down(sqrt_ratio_current_x96, sqrt_ratio_next_x96, liquidity)
+
+        if exact_in and not max_reached:
+            fee_amount = amount_remaining - amount_in
+        else:
+            # Boundary-crossing fee rounding up (SwapMath.sol line 57)
+            fee_amount = cls.mul_div_rounding_up(amount_in, fee_ppm, 1_000_000 - fee_ppm)
+
+        return sqrt_ratio_next_x96, amount_in, amount_out, fee_amount
+
+
+class UniswapV3SwapSimulator:
+    """Simulates Uniswap V3 concentrated liquidity swaps walking initialized ticks."""
+
+    @classmethod
+    def simulate_swap(
+        cls,
+        evidence: UniswapV3Evidence,
+        amount_in: int,
+        zero_for_one: bool,
+        target_sqrt_price_x96: Optional[int] = None,
+    ) -> Tuple[bool, int, int, int, str]:
+        """Simulates full tick-by-tick swap across pool initialized ticks.
+        Returns (success, amount_in_consumed, amount_out_yielded, final_sqrt_price_x96, diagnostic).
+        """
+        if amount_in <= 0:
+            return False, 0, 0, evidence.sqrt_price_x96, "NON_POSITIVE_AMOUNT_IN"
+        if evidence.fee_tier_ppm not in UNISWAP_V3_FEE_SPACINGS:
+            return False, 0, 0, evidence.sqrt_price_x96, "UNSUPPORTED_FEE_TIER"
+
+        spacing = UNISWAP_V3_FEE_SPACINGS[evidence.fee_tier_ppm]
+        current_tick = evidence.tick
+        current_sqrt_price = evidence.sqrt_price_x96
+        current_liquidity = evidence.active_liquidity
+
+        if target_sqrt_price_x96 is None:
+            target_sqrt_price_x96 = (
+                UniswapV3TickMath.MIN_SQRT_RATIO + 1
+                if zero_for_one
+                else UniswapV3TickMath.MAX_SQRT_RATIO - 1
+            )
+
+        amount_remaining = amount_in
+        amount_out_total = 0
+
+        # Sort initialized ticks in walking direction
+        sorted_ticks = sorted(evidence.initialized_ticks.keys())
+        if zero_for_one:
+            boundary_ticks = [t for t in sorted_ticks if t <= current_tick]
+            boundary_ticks.reverse()
+        else:
+            boundary_ticks = [t for t in sorted_ticks if t > current_tick]
+
+        tick_idx = 0
+        while amount_remaining > 0 and current_sqrt_price != target_sqrt_price_x96:
+            if current_liquidity <= 0:
+                if tick_idx >= len(boundary_ticks):
+                    return False, amount_in - amount_remaining, amount_out_total, current_sqrt_price, "ZERO_LIQUIDITY_DEPTH_EXHAUSTED"
+
+            if tick_idx < len(boundary_ticks):
+                next_tick = boundary_ticks[tick_idx]
+                next_sqrt_p = UniswapV3TickMath.get_sqrt_ratio_at_tick(next_tick)
+                if zero_for_one:
+                    step_target = max(next_sqrt_p, target_sqrt_price_x96)
+                else:
+                    step_target = min(next_sqrt_p, target_sqrt_price_x96)
+            else:
+                next_tick = None
+                step_target = target_sqrt_price_x96
+
+            # Check bitmap coverage for the path to step_target
+            comp_idx = (next_tick // spacing) if next_tick is not None else (current_tick // spacing)
+            word_pos = comp_idx >> 8
+            if word_pos not in evidence.tick_bitmap:
+                return False, amount_in - amount_remaining, amount_out_total, current_sqrt_price, "MODELED_DEPTH_UNRESOLVED_BITMAP_GAP"
+
+            next_sqrt_price, step_in, step_out, fee_step = UniswapV3SwapMath.compute_swap_step(
+                current_sqrt_price,
+                step_target,
+                current_liquidity,
+                amount_remaining,
+                evidence.fee_tier_ppm,
+            )
+
+            amount_remaining -= (step_in + fee_step)
+            amount_out_total += step_out
+            current_sqrt_price = next_sqrt_price
+
+            # If boundary tick reached, cross tick and adjust liquidity
+            if current_sqrt_price == step_target and next_tick is not None and next_sqrt_price == UniswapV3TickMath.get_sqrt_ratio_at_tick(next_tick):
+                tick_data = evidence.initialized_ticks.get(next_tick)
+                if not tick_data:
+                    return False, amount_in - amount_remaining, amount_out_total, current_sqrt_price, "MODELED_DEPTH_UNRESOLVED_UNINITIALIZED_TICK"
+                liquidity_net = tick_data.get("liquidityNet", 0)
+                if zero_for_one:
+                    current_liquidity -= liquidity_net
+                    current_tick = next_tick - 1
+                else:
+                    current_liquidity += liquidity_net
+                    current_tick = next_tick
+                tick_idx += 1
+            elif current_sqrt_price == target_sqrt_price_x96:
+                break
+
+        consumed = amount_in - amount_remaining
+        return True, consumed, amount_out_total, current_sqrt_price, "SWAP_SUCCESS"
+
+    @classmethod
+    def compute_bidirectional_depth(
+        cls,
+        evidence: UniswapV3Evidence,
+        token0_quote: bool = True,
+    ) -> Dict[str, Any]:
+        """Calculates bidirectional depth within +/- 2.0% price impact band."""
+        p0_sqrt = evidence.sqrt_price_x96
+        sqrt_mult_plus_2pct = int(math.sqrt(1.02) * (1 << 96))
+        sqrt_mult_minus_2pct = int(math.sqrt(0.98) * (1 << 96))
+
+        p_target_plus = (p0_sqrt * sqrt_mult_plus_2pct) >> 96
+        p_target_minus = (p0_sqrt * sqrt_mult_minus_2pct) >> 96
+
+        if token0_quote:
+            ok_ask, q_ask, _, _, _ = cls.simulate_swap(evidence, amount_in=10**24, zero_for_one=True, target_sqrt_price_x96=p_target_minus)
+            ok_bid, _, q_bid, _, _ = cls.simulate_swap(evidence, amount_in=10**24, zero_for_one=False, target_sqrt_price_x96=p_target_plus)
+        else:
+            ok_ask, q_ask, _, _, _ = cls.simulate_swap(evidence, amount_in=10**24, zero_for_one=False, target_sqrt_price_x96=p_target_plus)
+            ok_bid, _, q_bid, _, _ = cls.simulate_swap(evidence, amount_in=10**24, zero_for_one=True, target_sqrt_price_x96=p_target_minus)
+
+        return {
+            "d_ask_plus_2pct": q_ask if ok_ask else 0,
+            "d_bid_minus_2pct": q_bid if ok_bid else 0,
+            "is_depth_complete": bool(ok_ask and ok_bid),
+        }
+
+
+class UniswapV2SwapSimulator:
+    """Exact integer constant-product swap simulator and bidirectional depth engine."""
+
+    @staticmethod
+    def simulate_swap(
+        reserve_in: int,
+        reserve_out: int,
+        amount_in: int,
+        fee_bps: int = 30,
+    ) -> Tuple[bool, int, float, float, int, int]:
+        """Calculates Uniswap V2 integer getAmountOut.
+        Returns (success, amount_out, effective_price, price_impact_pct, new_reserve_in, new_reserve_out).
+        """
+        if reserve_in <= 0 or reserve_out <= 0 or amount_in <= 0:
+            return False, 0, 0.0, 0.0, reserve_in, reserve_out
+
+        amount_in_with_fee = amount_in * (10000 - fee_bps)
+        numerator = amount_in_with_fee * reserve_out
+        denominator = (reserve_in * 10000) + amount_in_with_fee
+        amount_out = numerator // denominator
+
+        if amount_out >= reserve_out or amount_out <= 0:
+            return False, 0, 0.0, 0.0, reserve_in, reserve_out
+
+        new_reserve_in = reserve_in + amount_in
+        new_reserve_out = reserve_out - amount_out
+
+        spot_price_initial = reserve_out / reserve_in
+        effective_price = amount_out / amount_in
+        price_impact_pct = max(0.0, (1.0 - (effective_price / spot_price_initial)) * 100.0)
+
+        return True, amount_out, effective_price, price_impact_pct, new_reserve_in, new_reserve_out
+
+    @staticmethod
+    def compute_bidirectional_depth(
+        reserve_quote: int,
+        reserve_token: int,
+        fee_bps: int = 30,
+    ) -> Dict[str, Any]:
+        """Calculates exact bidirectional depth within +/- 2.0% price impact band.
+        D_ask: Gross quote input to push price +2% (with fee applied to input).
+        D_bid: Quote output yielded at -2% terminal price (NO fee applied to output).
+        token_in: Required token input to reach -2% terminal price (fee applied to input).
+        """
+        if reserve_quote <= 0 or reserve_token <= 0:
+            return {"d_ask_plus_2pct": 0, "d_bid_minus_2pct": 0, "token_in_minus_2pct": 0}
+
+        fee_factor = 1.0 - (fee_bps / 10000.0)
+        d_ask = int((reserve_quote * (math.sqrt(1.02) - 1.0)) / fee_factor)
+        d_bid = int(reserve_quote * (1.0 - math.sqrt(0.98)))
+        token_in = int((reserve_token * (1.0 / math.sqrt(0.98) - 1.0)) / fee_factor)
+
+        return {
+            "d_ask_plus_2pct": d_ask,
+            "d_bid_minus_2pct": d_bid,
+            "token_in_minus_2pct": token_in,
+        }
+
+
+def calculate_evm_gas_cost_usd(
+    gas_used: int,
+    base_fee_wei: int,
+    priority_fee_wei: int,
+    native_usd_price: float,
+) -> Tuple[float, float, str]:
+    """Calculates EVM EIP-1559 gas cost in ETH and USD.
+    Returns (gas_cost_eth, gas_cost_usd, 'MODELED_GAS_COST_WITH_ASSUMPTIONS').
+    """
+    effective_gas_price_wei = base_fee_wei + priority_fee_wei
+    gas_cost_wei = gas_used * effective_gas_price_wei
+    gas_cost_eth = gas_cost_wei / 1e18
+    gas_cost_usd = gas_cost_eth * native_usd_price
+    return gas_cost_eth, gas_cost_usd, "MODELED_GAS_COST_WITH_ASSUMPTIONS"
+
+
+def calculate_solana_tx_fee_lamports(
+    base_signatures: int,
+    compute_unit_limit: int,
+    compute_unit_price_micro_lamports: int,
+) -> int:
+    """Calculates Solana transaction fee using ComputeUnitLimit and ceiling rounding."""
+    base_fee = base_signatures * 5000
+    micro_lamports = compute_unit_limit * compute_unit_price_micro_lamports
+    # Strict ceiling division to round up fractional lamports
+    priority_fee = (micro_lamports + 999_999) // 1_000_000
+    return base_fee + priority_fee
+
+
+def calculate_solana_tx_fee_usd(
+    base_signatures: int,
+    compute_unit_limit: int,
+    compute_unit_price_micro_lamports: int,
+    sol_usd_price: float,
+) -> Tuple[float, float, str]:
+    """Calculates Solana transaction fee in SOL and USD with ceiling rounding.
+    Returns (fee_sol, fee_usd, 'MODELED_GAS_COST_WITH_ASSUMPTIONS').
+    """
+    fee_lamports = calculate_solana_tx_fee_lamports(
+        base_signatures, compute_unit_limit, compute_unit_price_micro_lamports
+    )
+    fee_sol = fee_lamports / 1e9
+    fee_usd = fee_sol * sol_usd_price
+    return fee_sol, fee_usd, "MODELED_GAS_COST_WITH_ASSUMPTIONS"
+
+
+@dataclasses.dataclass
+class PoolStateSnapshot:
+    """Pool state snapshot bound to canonical identity and block provenance."""
+    chain_id: int
+    token_address: str
+    pool_address: str
+    block_number: int
+    block_hash: str
+    source_timestamp_utc: str
+    venue_type: str  # "UNISWAP_V2" or "UNISWAP_V3"
+    evidence_v2: Optional[UniswapV2Evidence] = None
+    evidence_v3: Optional[UniswapV3Evidence] = None
+    quote_usd_price: float = 1.0
+    native_usd_price: float = 3000.0
+    base_fee_per_gas_wei: int = 20_000_000_000  # 20 gwei
+    priority_fee_per_gas_wei: int = 2_000_000_000  # 2 gwei
+    token0_is_quote: bool = True
+
+
+class TwoLegExecutionSimulator:
+    """Simulates two-leg roundtrip execution (Buy at entry, Sell at touch) across capital tranches."""
+
+    @classmethod
+    def simulate_roundtrip(
+        cls,
+        entry_state: Optional[PoolStateSnapshot],
+        touch_state: Optional[PoolStateSnapshot],
+        tranche_usd: float,
+        gas_used_buy: int = 150_000,
+        gas_used_sell: int = 150_000,
+    ) -> Dict[str, Any]:
+        """Executes modeled buy against entry pool state and modeled sell against target touch pool state."""
+        # 1. State availability check
+        if entry_state is None or touch_state is None:
+            return {
+                "status": DualTrackTargetStatus.MODELED_ROUNDTRIP_UNRESOLVED_STATE_MISSING.value,
+                "net_return_pct": None,
+                "diagnostic": "ENTRY_OR_TOUCH_POOL_STATE_MISSING",
+                "tranche_usd": tranche_usd,
+            }
+
+        # 2. Gas calculation
+        _, gas_buy_usd, _ = calculate_evm_gas_cost_usd(
+            gas_used=gas_used_buy,
+            base_fee_wei=entry_state.base_fee_per_gas_wei,
+            priority_fee_wei=entry_state.priority_fee_per_gas_wei,
+            native_usd_price=entry_state.native_usd_price,
+        )
+        _, gas_sell_usd, _ = calculate_evm_gas_cost_usd(
+            gas_used=gas_used_sell,
+            base_fee_wei=touch_state.base_fee_per_gas_wei,
+            priority_fee_wei=touch_state.priority_fee_per_gas_wei,
+            native_usd_price=touch_state.native_usd_price,
+        )
+
+        # 3. Leg 1: Entry Buy
+        q_in = tranche_usd / entry_state.quote_usd_price
+        if entry_state.venue_type == "UNISWAP_V2":
+            ev = entry_state.evidence_v2
+            if not ev or not ev.is_complete():
+                return {"status": DualTrackTargetStatus.MODELED_DEPTH_UNRESOLVED.value, "net_return_pct": None, "diagnostic": "V2_ENTRY_EVIDENCE_INCOMPLETE"}
+            # Assume token1 is quote, token0 is base
+            q_in_raw = int(q_in * (10 ** ev.token1_decimals))
+            ok_buy, tokens_acquired_raw, p_buy, impact_buy, _, _ = UniswapV2SwapSimulator.simulate_swap(
+                reserve_in=ev.raw_reserve1, reserve_out=ev.raw_reserve0, amount_in=q_in_raw, fee_bps=ev.fee_bps
+            )
+            if not ok_buy:
+                return {"status": DualTrackTargetStatus.MODELED_TP40_LIQUIDITY_INSUFFICIENT.value, "net_return_pct": None, "diagnostic": "LEG1_BUY_FAILED_LIQUIDITY"}
+        elif entry_state.venue_type == "UNISWAP_V3":
+            ev3 = entry_state.evidence_v3
+            if not ev3 or not ev3.is_complete():
+                return {"status": DualTrackTargetStatus.MODELED_DEPTH_UNRESOLVED.value, "net_return_pct": None, "diagnostic": "V3_ENTRY_EVIDENCE_INCOMPLETE"}
+            z4o_buy = entry_state.token0_is_quote
+            dec_in = ev3.token0_decimals if z4o_buy else ev3.token1_decimals
+            q_in_raw = int(q_in * (10 ** dec_in))
+            ok_buy, consumed, tokens_acquired_raw, _, diag = UniswapV3SwapSimulator.simulate_swap(
+                ev3, amount_in=q_in_raw, zero_for_one=z4o_buy
+            )
+            if not ok_buy:
+                return {"status": DualTrackTargetStatus.MODELED_TP40_LIQUIDITY_INSUFFICIENT.value, "net_return_pct": None, "diagnostic": f"LEG1_BUY_FAILED_LIQUIDITY_{diag}"}
+        else:
+            return {"status": DualTrackTargetStatus.MODELED_DEPTH_UNRESOLVED.value, "net_return_pct": None, "diagnostic": f"UNSUPPORTED_VENUE_{entry_state.venue_type}"}
+
+        # 4. Leg 2: Target Sell (selling exact tokens acquired)
+        if touch_state.venue_type == "UNISWAP_V2":
+            ev_touch = touch_state.evidence_v2
+            if not ev_touch or not ev_touch.is_complete():
+                return {"status": DualTrackTargetStatus.MODELED_DEPTH_UNRESOLVED.value, "net_return_pct": None, "diagnostic": "V2_TOUCH_EVIDENCE_INCOMPLETE"}
+            ok_sell, q_out_raw, p_sell, impact_sell, _, _ = UniswapV2SwapSimulator.simulate_swap(
+                reserve_in=ev_touch.raw_reserve0, reserve_out=ev_touch.raw_reserve1, amount_in=tokens_acquired_raw, fee_bps=ev_touch.fee_bps
+            )
+            if not ok_sell:
+                return {"status": DualTrackTargetStatus.MODELED_TP40_LIQUIDITY_INSUFFICIENT.value, "net_return_pct": None, "diagnostic": "LEG2_SELL_FAILED_LIQUIDITY"}
+            gross_proceeds_usd = (q_out_raw / (10 ** ev_touch.token1_decimals)) * touch_state.quote_usd_price
+        elif touch_state.venue_type == "UNISWAP_V3":
+            ev3_touch = touch_state.evidence_v3
+            if not ev3_touch or not ev3_touch.is_complete():
+                return {"status": DualTrackTargetStatus.MODELED_DEPTH_UNRESOLVED.value, "net_return_pct": None, "diagnostic": "V3_TOUCH_EVIDENCE_INCOMPLETE"}
+            z4o_sell = not touch_state.token0_is_quote
+            ok_sell, consumed, q_out_raw, _, diag = UniswapV3SwapSimulator.simulate_swap(
+                ev3_touch, amount_in=tokens_acquired_raw, zero_for_one=z4o_sell
+            )
+            if not ok_sell:
+                return {"status": DualTrackTargetStatus.MODELED_TP40_LIQUIDITY_INSUFFICIENT.value, "net_return_pct": None, "diagnostic": f"LEG2_SELL_FAILED_LIQUIDITY_{diag}"}
+            dec_out = ev3_touch.token0_decimals if touch_state.token0_is_quote else ev3_touch.token1_decimals
+            gross_proceeds_usd = (q_out_raw / (10 ** dec_out)) * touch_state.quote_usd_price
+        else:
+            return {"status": DualTrackTargetStatus.MODELED_DEPTH_UNRESOLVED.value, "net_return_pct": None, "diagnostic": f"UNSUPPORTED_VENUE_{touch_state.venue_type}"}
+
+        # 5. Net Proceeds & Decision
+        net_proceeds_usd = gross_proceeds_usd - gas_buy_usd - gas_sell_usd
+        net_return_pct = ((net_proceeds_usd - tranche_usd) / tranche_usd) * 100.0
+
+        if net_return_pct >= TECHNICAL_TP_PCT:
+            status = DualTrackTargetStatus.MODELED_TP40_EXECUTABLE_WITH_ASSUMPTIONS
+        else:
+            status = DualTrackTargetStatus.MODELED_TP40_EXECUTION_IMPACT_FAIL
+
+        return {
+            "status": status.value,
+            "net_return_pct": round(net_return_pct, 4),
+            "gross_proceeds_usd": round(gross_proceeds_usd, 4),
+            "gas_buy_usd": round(gas_buy_usd, 4),
+            "gas_sell_usd": round(gas_sell_usd, 4),
+            "tranche_usd": tranche_usd,
+            "tokens_acquired": tokens_acquired_raw,
+        }
+
+    @classmethod
+    def simulate_multi_size(
+        cls,
+        entry_state: Optional[PoolStateSnapshot],
+        touch_state: Optional[PoolStateSnapshot],
+        tranches_usd: Optional[List[float]] = None,
+    ) -> Dict[str, Any]:
+        """Simulates all 5 standard scenarios ($100-$5,000) for depth probing."""
+        if tranches_usd is None:
+            tranches_usd = SIMULATION_TRANCHES_USD
+
+        results = {}
+        for tranche in tranches_usd:
+            results[f"tranche_{int(tranche)}"] = cls.simulate_roundtrip(entry_state, touch_state, tranche_usd=tranche)
+
+        return {
+            "modeled_scenario_type": "HYPOTHETICAL_DEPTH_PROBING_ONLY_NOT_POSITION_SIZING",
+            "tranches": results,
+        }
+
+
+@dataclasses.dataclass
+class LiquidityObservationRecord:
+    """Observation record for liquidity trajectory bound to exact block provenance."""
+    chain_id: int
+    token_mint: str
+    pool_address: str
+    block_number: int
+    block_hash: str
+    source_event_timestamp_utc: str
+    local_ingestion_timestamp_utc: str
+    d_ask_plus_2pct: int
+    d_bid_minus_2pct: int
+    liquidity_usd: float
+    has_lp_burn_event: bool = False
+    is_authenticated_chain_proof: bool = False
+
+
+class LiquidityClassificationEngine:
+    """Evaluates 4-tier liquidity classification hierarchy separating depth collapse from price depreciation."""
+
+    @classmethod
+    def evaluate_liquidity_trajectory(
+        cls,
+        records: List[LiquidityObservationRecord],
+        initial_t0_utc: str,
+    ) -> Dict[str, Any]:
+        """Evaluates 24-hour liquidity trajectory respecting collapse precedence."""
+        if not records:
+            return {
+                "status": LiquidityClassificationStatus.UNRESOLVED_LIQUIDITY.value,
+                "diagnostic": "NO_LIQUIDITY_RECORDS_AVAILABLE",
+                "liquidity_end_usd_observed_unverified": None,
+                "liquidity_end_usd_authenticated_verified": None,
+                "recovery_observed_after_collapse": False,
+                "recovery_confirmed_at_window_end": False,
+            }
+
+        rec0 = records[0]
+        initial_ask = rec0.d_ask_plus_2pct
+        initial_bid = rec0.d_bid_minus_2pct
+        initial_usd = rec0.liquidity_usd
+
+        if initial_ask <= 0 or initial_bid <= 0:
+            return {
+                "status": LiquidityClassificationStatus.UNRESOLVED_LIQUIDITY.value,
+                "diagnostic": "INITIAL_DEPTH_NON_POSITIVE",
+                "liquidity_end_usd_observed_unverified": None,
+                "liquidity_end_usd_authenticated_verified": None,
+                "recovery_observed_after_collapse": False,
+                "recovery_confirmed_at_window_end": False,
+            }
+
+        # Priority 1: Check for LP burn events or depth collapse (< 20% on either side)
+        min_depth_ratio = 1.0
+        depth_collapse_detected = False
+        depth_min_timestamp = None
+        has_lp_burn = False
+
+        for r in records:
+            if r.has_lp_burn_event:
+                has_lp_burn = True
+
+            ratio_ask = r.d_ask_plus_2pct / initial_ask
+            ratio_bid = r.d_bid_minus_2pct / initial_bid
+            r_depth = min(ratio_ask, ratio_bid)
+
+            if r_depth < min_depth_ratio:
+                min_depth_ratio = r_depth
+                depth_min_timestamp = r.source_event_timestamp_utc
+
+            if r_depth < 0.20:
+                depth_collapse_detected = True
+
+        # Recovery checks after collapse
+        recovery_observed = False
+        if depth_collapse_detected and depth_min_timestamp:
+            for r in records:
+                if r.source_event_timestamp_utc > depth_min_timestamp:
+                    r_depth = min(r.d_ask_plus_2pct / initial_ask, r.d_bid_minus_2pct / initial_bid)
+                    if r_depth >= 0.80:
+                        recovery_observed = True
+                        break
+
+        # Check terminal window [t0 + 23.5h, t0 + 24.0h]
+        t0_dt = dt.datetime.fromisoformat(initial_t0_utc.replace("Z", "+00:00"))
+        t_term_start = t0_dt + dt.timedelta(hours=23.5)
+        t_term_end = t0_dt + dt.timedelta(hours=24.0)
+
+        terminal_rec = None
+        for r in reversed(records):
+            r_dt = dt.datetime.fromisoformat(r.source_event_timestamp_utc.replace("Z", "+00:00"))
+            if t_term_start <= r_dt <= t_term_end:
+                terminal_rec = r
+                break
+
+        liquidity_end_usd_unverified = terminal_rec.liquidity_usd if terminal_rec else None
+        liquidity_end_usd_verified = None  # Strictly None in Stage 3.2
+
+        recovery_confirmed_end = False
+        if terminal_rec:
+            r_end_depth = min(terminal_rec.d_ask_plus_2pct / initial_ask, terminal_rec.d_bid_minus_2pct / initial_bid)
+            if r_end_depth >= 0.80:
+                recovery_confirmed_end = True
+
+        # Priority 1: Event-level LP removal or depth collapse
+        if has_lp_burn:
+            return {
+                "status": LiquidityClassificationStatus.LP_WITHDRAWAL_COLLAPSE_OBSERVED_UNVERIFIED.value,
+                "min_depth_ratio": round(min_depth_ratio, 4),
+                "depth_min_timestamp_utc": depth_min_timestamp,
+                "recovery_observed_after_collapse": recovery_observed,
+                "recovery_confirmed_at_window_end": recovery_confirmed_end,
+                "liquidity_end_usd_observed_unverified": liquidity_end_usd_unverified,
+                "liquidity_end_usd_authenticated_verified": None,
+            }
+
+        if depth_collapse_detected:
+            return {
+                "status": LiquidityClassificationStatus.LIQUIDITY_DEPTH_COLLAPSE_OBSERVED_UNVERIFIED.value,
+                "min_depth_ratio": round(min_depth_ratio, 4),
+                "depth_min_timestamp_utc": depth_min_timestamp,
+                "recovery_observed_after_collapse": recovery_observed,
+                "recovery_confirmed_at_window_end": recovery_confirmed_end,
+                "liquidity_end_usd_observed_unverified": liquidity_end_usd_unverified,
+                "liquidity_end_usd_authenticated_verified": None,
+            }
+
+        # Priority 2: Missing observations (gap > 6 hours)
+        has_gap = False
+        for i in range(len(records) - 1):
+            t1 = dt.datetime.fromisoformat(records[i].source_event_timestamp_utc.replace("Z", "+00:00"))
+            t2 = dt.datetime.fromisoformat(records[i + 1].source_event_timestamp_utc.replace("Z", "+00:00"))
+            if (t2 - t1).total_seconds() > 6 * 3600:
+                has_gap = True
+                break
+
+        if has_gap:
+            return {
+                "status": LiquidityClassificationStatus.UNRESOLVED_LIQUIDITY.value,
+                "min_depth_ratio": round(min_depth_ratio, 4),
+                "diagnostic": "MID_WINDOW_GAP_EXCEEDS_6_HOURS",
+                "recovery_observed_after_collapse": False,
+                "recovery_confirmed_at_window_end": recovery_confirmed_end,
+                "liquidity_end_usd_observed_unverified": liquidity_end_usd_unverified,
+                "liquidity_end_usd_authenticated_verified": None,
+            }
+
+        # Priority 3: Degraded (0.20 <= min_depth_ratio < 0.80)
+        if min_depth_ratio < 0.80:
+            return {
+                "status": LiquidityClassificationStatus.LIQUIDITY_DEPTH_DEGRADED_OBSERVED_UNVERIFIED.value,
+                "min_depth_ratio": round(min_depth_ratio, 4),
+                "recovery_observed_after_collapse": False,
+                "recovery_confirmed_at_window_end": recovery_confirmed_end,
+                "liquidity_end_usd_observed_unverified": liquidity_end_usd_unverified,
+                "liquidity_end_usd_authenticated_verified": None,
+            }
+
+        # Priority 4: Survived or Asset Price Depreciation
+        min_usd_ratio = min((r.liquidity_usd / initial_usd) for r in records)
+        if min_usd_ratio < 0.20:
+            status = LiquidityClassificationStatus.ASSET_PRICE_DEPRECIATION_OBSERVED_UNVERIFIED
+        else:
+            status = LiquidityClassificationStatus.LIQUIDITY_DEPTH_SURVIVED_OBSERVED_UNVERIFIED
+
+        return {
+            "status": status.value,
+            "min_depth_ratio": round(min_depth_ratio, 4),
+            "min_usd_ratio": round(min_usd_ratio, 4),
+            "recovery_observed_after_collapse": False,
+            "recovery_confirmed_at_window_end": recovery_confirmed_end,
+            "liquidity_end_usd_observed_unverified": liquidity_end_usd_unverified,
+            "liquidity_end_usd_authenticated_verified": None,
+        }
 
 
 class DualTrackOutcomeEvaluator:
