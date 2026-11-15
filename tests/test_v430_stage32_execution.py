@@ -318,6 +318,44 @@ class TestStage32TwoLegExecutionAndGasMath(unittest.TestCase):
         # Expected sell gas: 150,000 * 13 gwei = 0.00195 ETH * 3000 = $5.85
         self.assertAlmostEqual(result["gas_buy_usd"], 5.40, places=2)
         self.assertAlmostEqual(result["gas_sell_usd"], 5.85, places=2)
+        self.assertEqual(result["gas_buy_model_label"], "MODELED_GAS_COST_CANONICAL_EIP1559")
+        self.assertEqual(result["gas_sell_model_label"], "MODELED_GAS_COST_CANONICAL_EIP1559")
+
+    def test_simulate_roundtrip_propagates_uncapped_legacy_gas_label(self):
+        """AC-7, AC-11: Surfaces MODELED_GAS_COST_UNCAPPED_LEGACY_ASSUMPTION so uncapped assumptions cannot be hidden."""
+        entry_snapshot = PoolStateSnapshot(
+            chain_id=1,
+            token_address="0x2222222222222222222222222222222222222222",
+            pool_address="0x1111111111111111111111111111111111111111",
+            block_number=19_000_000,
+            block_hash="0x" + "aa" * 32,
+            source_timestamp_utc="2026-11-15T00:00:00Z",
+            venue_type="UNISWAP_V2",
+            evidence_v2=self.entry_v2,
+            quote_usd_price=1.0,
+            native_usd_price=3000.0,
+            base_fee_per_gas_wei=10_000_000_000,
+            priority_fee_per_gas_wei=1_000_000_000,
+            max_fee_per_gas_wei=None,  # Uncapped legacy assumption!
+        )
+        touch_snapshot = PoolStateSnapshot(
+            chain_id=1,
+            token_address="0x2222222222222222222222222222222222222222",
+            pool_address="0x1111111111111111111111111111111111111111",
+            block_number=19_001_000,
+            block_hash="0x" + "bb" * 32,
+            source_timestamp_utc="2026-11-15T04:00:00Z",
+            venue_type="UNISWAP_V2",
+            evidence_v2=self.touch_v2_high,
+            quote_usd_price=1.0,
+            native_usd_price=3000.0,
+            base_fee_per_gas_wei=10_000_000_000,
+            priority_fee_per_gas_wei=1_000_000_000,
+            max_fee_per_gas_wei=20_000_000_000,
+        )
+        result = TwoLegExecutionSimulator.simulate_roundtrip(entry_snapshot, touch_snapshot, 500.0)
+        self.assertEqual(result["gas_buy_model_label"], "MODELED_GAS_COST_UNCAPPED_LEGACY_ASSUMPTION")
+        self.assertEqual(result["gas_sell_model_label"], "MODELED_GAS_COST_CANONICAL_EIP1559")
 
     def test_simulate_roundtrip_fails_closed_on_identity_and_provenance_mismatches(self):
         """AC-1: Mismatched chain_id, token, pool, block order, or embedded evidence fails closed."""
@@ -835,26 +873,40 @@ class TestBidirectionalDepthAndLiquidityHierarchy(unittest.TestCase):
     """Test suite covering AC-8, AC-9, AC-11, AC-12, AC-13."""
 
     def test_bidirectional_depth_exact_v2_pool_equations(self):
-        """AC-8: Asserts V2 bidirectional depth equations where fee applies to input only, not quote proceeds."""
+        """AC-8: Asserts V2 bidirectional depth uses integer swap accounting and reaches exact spot-price boundary."""
         rq = 1_000_000
         rb = 1_000
         fee_bps = 30
 
         depth = UniswapV2SwapSimulator.compute_bidirectional_depth(rq, rb, fee_bps)
 
-        # Expected D_ask exact integer: rq_target = isqrt((102 * rq^2) // 100) = 1,009,950
-        # delta_q = 9,950; d_ask = (9950 * 10000) // 9970 = 9979
-        self.assertEqual(depth["d_ask_plus_2pct"], 9979)
+        # Exact integer swap accounting values
+        self.assertEqual(depth["d_ask_plus_2pct"], 10132)
+        self.assertEqual(depth["d_bid_minus_2pct"], 10848)
+        self.assertEqual(depth["token_in_minus_2pct"], 11)
 
-        # Expected D_bid exact integer: rq_target = isqrt((98 * rq^2) // 100) = 989,949
-        # d_bid = 1,000,000 - 989,949 = 10,051 (NO fee multiplier on proceeds)
-        self.assertEqual(depth["d_bid_minus_2pct"], 10051)
+        # 1. Assert d_ask meets the +2% boundary and d_ask - 1 fails
+        d_ask = depth["d_ask_plus_2pct"]
+        ok, out, _, _, n_rq1, n_rb1 = UniswapV2SwapSimulator.simulate_swap(rq, rb, d_ask, fee_bps)
+        self.assertTrue(ok)
+        self.assertTrue(100 * n_rq1 * rb >= 102 * rq * n_rb1)
 
-        # Expected token input required: rb_target = isqrt((100 * rb^2) // 98) = 1010
-        # token_in = (10 * 10000) // 9970 = 10
-        self.assertEqual(depth["token_in_minus_2pct"], 10)
+        ok0, out0, _, _, n_rq0, n_rb0 = UniswapV2SwapSimulator.simulate_swap(rq, rb, d_ask - 1, fee_bps)
+        self.assertTrue(ok0)
+        self.assertTrue(100 * n_rq0 * rb < 102 * rq * n_rb0)
 
-        # Asymmetry check: Proceeds yielded > Input required due to constant product curve slope
+        # 2. Assert token_in meets the -2% boundary and token_in - 1 fails
+        token_in = depth["token_in_minus_2pct"]
+        ok, out, _, _, n_rb1, n_rq1 = UniswapV2SwapSimulator.simulate_swap(rb, rq, token_in, fee_bps)
+        self.assertTrue(ok)
+        self.assertEqual(out, depth["d_bid_minus_2pct"])
+        self.assertTrue(100 * n_rq1 * rb <= 98 * rq * n_rb1)
+
+        ok0, out0, _, _, n_rb0, n_rq0 = UniswapV2SwapSimulator.simulate_swap(rb, rq, token_in - 1, fee_bps)
+        self.assertTrue(ok0)
+        self.assertTrue(100 * n_rq0 * rb > 98 * rq * n_rb0)
+
+        # Asymmetry check: Bid quote output > Ask quote input due to fee and curve geometry
         self.assertGreater(depth["d_bid_minus_2pct"], depth["d_ask_plus_2pct"])
 
     def test_bidirectional_depth_asymmetric_v3_fixture(self):
@@ -1437,7 +1489,7 @@ class TestBidirectionalDepthAndLiquidityHierarchy(unittest.TestCase):
         self.assertEqual(outcome["window_end_status"], "WINDOW_END_RESOLVED_UNVERIFIED")
 
     def test_v2_bidirectional_depth_exact_integers_large_reserves(self):
-        """AC-8: Asserts V2 depth calculations use exact integer arithmetic with zero floating-point drift."""
+        """AC-8: Asserts V2 depth calculations use exact integer arithmetic and meet boundaries on large reserves."""
         # Large reserves: 10^24 wei USDC quote (~$1T), 10^21 wei WETH
         rq = 10**24
         rb = 10**21
@@ -1445,16 +1497,71 @@ class TestBidirectionalDepthAndLiquidityHierarchy(unittest.TestCase):
 
         depth = UniswapV2SwapSimulator.compute_bidirectional_depth(rq, rb, fee_bps)
 
-        # Exact integer derivation without fixed-scale truncation
-        expected_rq_ask = math.isqrt((102 * rq * rq) // 100)
-        expected_d_ask = ((expected_rq_ask - rq) * 10000) // (10000 - fee_bps)
-        self.assertEqual(depth["d_ask_plus_2pct"], expected_d_ask)
-
-        expected_rq_bid = math.isqrt((98 * rq * rq) // 100)
-        expected_d_bid = rq - expected_rq_bid
-        self.assertEqual(depth["d_bid_minus_2pct"], expected_d_bid)
+        self.assertEqual(depth["d_ask_plus_2pct"], 9965442109995826223976)
+        self.assertEqual(depth["d_bid_minus_2pct"], 10035559565346099920344)
+        self.assertEqual(depth["token_in_minus_2pct"], 10167796361891734777)
         self.assertIsInstance(depth["d_ask_plus_2pct"], int)
         self.assertIsInstance(depth["d_bid_minus_2pct"], int)
+        self.assertIsInstance(depth["token_in_minus_2pct"], int)
+
+        # 1. d_ask meets boundary, d_ask - 1 fails
+        d_ask = depth["d_ask_plus_2pct"]
+        ok, _, _, _, n_rq1, n_rb1 = UniswapV2SwapSimulator.simulate_swap(rq, rb, d_ask, fee_bps)
+        self.assertTrue(ok)
+        self.assertTrue(100 * n_rq1 * rb >= 102 * rq * n_rb1)
+
+        ok0, _, _, _, n_rq0, n_rb0 = UniswapV2SwapSimulator.simulate_swap(rq, rb, d_ask - 1, fee_bps)
+        self.assertTrue(ok0)
+        self.assertTrue(100 * n_rq0 * rb < 102 * rq * n_rb0)
+
+        # 2. token_in meets boundary, token_in - 1 fails
+        token_in = depth["token_in_minus_2pct"]
+        ok, out, _, _, n_rb1, n_rq1 = UniswapV2SwapSimulator.simulate_swap(rb, rq, token_in, fee_bps)
+        self.assertTrue(ok)
+        self.assertEqual(out, depth["d_bid_minus_2pct"])
+        self.assertTrue(100 * n_rq1 * rb <= 98 * rq * n_rb1)
+
+        ok0, _, _, _, n_rb0, n_rq0 = UniswapV2SwapSimulator.simulate_swap(rb, rq, token_in - 1, fee_bps)
+        self.assertTrue(ok0)
+        self.assertTrue(100 * n_rq0 * rb > 98 * rq * n_rb0)
+
+    def test_v2_bidirectional_depth_boundary_and_immediately_smaller_input(self):
+        """AC-8: Asserts resulting reserves meet the boundary and immediately smaller input fails across fee/reserve cases."""
+        test_cases = [
+            (100_000, 50, 10),      # Low fee (10 bps)
+            (100_000, 50, 30),      # Standard fee (30 bps)
+            (100_000, 50, 100),     # High fee (100 bps)
+            (10_000_000 * 10**6, 5_000 * 10**18, 30), # Production-scale reserves
+        ]
+
+        for rq, rb, fee_bps in test_cases:
+            depth = UniswapV2SwapSimulator.compute_bidirectional_depth(rq, rb, fee_bps)
+            d_ask = depth["d_ask_plus_2pct"]
+            d_bid = depth["d_bid_minus_2pct"]
+            token_in = depth["token_in_minus_2pct"]
+
+            # Ask side: d_ask meets boundary, d_ask - 1 fails
+            ok1, _, _, _, n_rq1, n_rb1 = UniswapV2SwapSimulator.simulate_swap(rq, rb, d_ask, fee_bps)
+            self.assertTrue(ok1)
+            self.assertTrue(100 * n_rq1 * rb >= 102 * rq * n_rb1, f"Failed at rq={rq}, rb={rb}, fee={fee_bps}")
+            if d_ask > 1:
+                ok0, out0, _, _, n_rq0, n_rb0 = UniswapV2SwapSimulator.simulate_swap(rq, rb, d_ask - 1, fee_bps)
+                if ok0:
+                    self.assertTrue(100 * n_rq0 * rb < 102 * rq * n_rb0, f"d_ask-1 unexpectedly met boundary at rq={rq}")
+                else:
+                    self.assertEqual(out0, 0)  # Zero output yielded: boundary cannot be reached
+
+            # Bid side: token_in meets boundary, token_in - 1 fails
+            ok1, out_bid, _, _, n_rb1, n_rq1 = UniswapV2SwapSimulator.simulate_swap(rb, rq, token_in, fee_bps)
+            self.assertTrue(ok1)
+            self.assertEqual(out_bid, d_bid)
+            self.assertTrue(100 * n_rq1 * rb <= 98 * rq * n_rb1, f"Failed at rq={rq}, rb={rb}, fee={fee_bps}")
+            if token_in > 1:
+                ok0, out0, _, _, n_rb0, n_rq0 = UniswapV2SwapSimulator.simulate_swap(rb, rq, token_in - 1, fee_bps)
+                if ok0:
+                    self.assertTrue(100 * n_rq0 * rb > 98 * rq * n_rb0, f"token_in-1 unexpectedly met boundary at rq={rq}")
+                else:
+                    self.assertEqual(out0, 0)  # Zero output yielded: boundary cannot be reached
 
 
 class TestMultiSizeAndIdentityConstraints(unittest.TestCase):

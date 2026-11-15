@@ -1119,38 +1119,102 @@ class UniswapV2SwapSimulator:
 
         return True, amount_out, effective_price, price_impact_pct, new_reserve_in, new_reserve_out
 
-    @staticmethod
+    @classmethod
     def compute_bidirectional_depth(
+        cls,
         reserve_quote: int,
         reserve_token: int,
         fee_bps: int = 30,
     ) -> Dict[str, Any]:
-        """Calculates exact integer bidirectional depth within +/- 2.0% price impact band.
-        Uses exact integer constant-product derivation (math.isqrt on integer square products)
-        with zero fixed-scale truncation and zero floating-point drift:
-        - At +2% spot price: R_q' = isqrt((102 * R_q^2) // 100).
-          Delta q_eff = R_q' - R_q.
-          D_ask = (Delta q_eff * 10000) // (10000 - fee_bps).
-        - At -2% spot price: R_q' = isqrt((98 * R_q^2) // 100).
-          D_bid = R_q - R_q' (no fee on quote proceeds).
-        - Base token input to reach -2% terminal price:
-          R_b' = isqrt((100 * R_b^2) // 98).
-          token_in = ((R_b' - R_b) * 10000) // (10000 - fee_bps).
+        """Calculates exact integer bidirectional depth within +/- 2.0% price impact band
+        using canonical Uniswap V2 swap accounting and exact integer spot-price boundary search.
+
+        Uniswap V2 adds the full gross input to reserveIn, using fee-adjusted input solely
+        to compute amountOut:
+          new_reserve_in = reserve_in + amount_in
+          new_reserve_out = reserve_out - amount_out
+
+        Ask Depth (+2% spot price boundary):
+          Searches for the smallest integer quote_in such that:
+          100 * (reserve_quote + quote_in) * reserve_token >= 102 * reserve_quote * (reserve_token - token_out).
+          D_ask = quote_in.
+
+        Bid Depth (-2% spot price boundary):
+          Searches for the smallest integer token_in such that:
+          100 * (reserve_quote - quote_out) * reserve_token <= 98 * reserve_quote * (reserve_token + token_in).
+          token_in_minus_2pct = token_in.
+          D_bid = quote_out (actual quote proceeds yielded by the swap).
         """
         if reserve_quote <= 0 or reserve_token <= 0:
             return {"d_ask_plus_2pct": 0, "d_bid_minus_2pct": 0, "token_in_minus_2pct": 0}
 
-        # Exact integer square root on scaled reserve square (zero intermediate scale truncation)
-        rq_target_ask = math.isqrt((102 * reserve_quote * reserve_quote) // 100)
-        delta_q_ask = rq_target_ask - reserve_quote
-        d_ask = (delta_q_ask * 10000) // (10000 - fee_bps)
+        # 1. Ask Depth (+2% terminal spot price): search for smallest quote_in reaching boundary
+        high = max(1, (reserve_quote * 3) // 100)
+        while True:
+            ok, out, _, _, n_rq, n_rb = cls.simulate_swap(
+                reserve_in=reserve_quote,
+                reserve_out=reserve_token,
+                amount_in=high,
+                fee_bps=fee_bps,
+            )
+            if not ok or high >= reserve_quote:
+                high = max(high, reserve_quote)
+                break
+            if 100 * n_rq * reserve_token >= 102 * reserve_quote * n_rb:
+                break
+            high *= 2
 
-        rq_target_bid = math.isqrt((98 * reserve_quote * reserve_quote) // 100)
-        d_bid = reserve_quote - rq_target_bid
+        low = 1
+        while low < high:
+            mid = (low + high) // 2
+            ok, out, _, _, n_rq, n_rb = cls.simulate_swap(
+                reserve_in=reserve_quote,
+                reserve_out=reserve_token,
+                amount_in=mid,
+                fee_bps=fee_bps,
+            )
+            if ok and (100 * n_rq * reserve_token >= 102 * reserve_quote * n_rb):
+                high = mid
+            else:
+                low = mid + 1
+        d_ask = low
 
-        rb_target_bid = math.isqrt((100 * reserve_token * reserve_token) // 98)
-        delta_b_in = rb_target_bid - reserve_token
-        token_in = (delta_b_in * 10000) // (10000 - fee_bps)
+        # 2. Bid Depth (-2% terminal spot price): search for smallest token_in reaching boundary
+        high = max(1, (reserve_token * 3) // 100)
+        while True:
+            ok, out, _, _, n_rb, n_rq = cls.simulate_swap(
+                reserve_in=reserve_token,
+                reserve_out=reserve_quote,
+                amount_in=high,
+                fee_bps=fee_bps,
+            )
+            if not ok or high >= reserve_token:
+                high = max(high, reserve_token)
+                break
+            if 100 * n_rq * reserve_token <= 98 * reserve_quote * n_rb:
+                break
+            high *= 2
+
+        low = 1
+        while low < high:
+            mid = (low + high) // 2
+            ok, out, _, _, n_rb, n_rq = cls.simulate_swap(
+                reserve_in=reserve_token,
+                reserve_out=reserve_quote,
+                amount_in=mid,
+                fee_bps=fee_bps,
+            )
+            if ok and (100 * n_rq * reserve_token <= 98 * reserve_quote * n_rb):
+                high = mid
+            else:
+                low = mid + 1
+        token_in = low
+        ok_bid, d_bid, _, _, _, _ = cls.simulate_swap(
+            reserve_in=reserve_token,
+            reserve_out=reserve_quote,
+            amount_in=token_in,
+            fee_bps=fee_bps,
+        )
 
         return {
             "d_ask_plus_2pct": d_ask,
@@ -1363,6 +1427,8 @@ class TwoLegExecutionSimulator:
                 "status": DualTrackTargetStatus.MODELED_ROUNDTRIP_UNRESOLVED_STATE_MISSING.value,
                 "net_return_pct": None,
                 "diagnostic": "ENTRY_MAX_FEE_BELOW_BASE_FEE",
+                "gas_buy_model_label": buy_gas_status,
+                "gas_sell_model_label": None,
                 "tranche_usd": tranche_usd,
             }
 
@@ -1378,6 +1444,8 @@ class TwoLegExecutionSimulator:
                 "status": DualTrackTargetStatus.MODELED_ROUNDTRIP_UNRESOLVED_STATE_MISSING.value,
                 "net_return_pct": None,
                 "diagnostic": "TOUCH_MAX_FEE_BELOW_BASE_FEE",
+                "gas_buy_model_label": buy_gas_status,
+                "gas_sell_model_label": sell_gas_status,
                 "tranche_usd": tranche_usd,
             }
 
@@ -1386,7 +1454,13 @@ class TwoLegExecutionSimulator:
         if entry_state.venue_type == "UNISWAP_V2":
             ev = entry_state.evidence_v2
             if not ev or not ev.is_complete():
-                return {"status": DualTrackTargetStatus.MODELED_DEPTH_UNRESOLVED.value, "net_return_pct": None, "diagnostic": "V2_ENTRY_EVIDENCE_INCOMPLETE"}
+                return {
+                    "status": DualTrackTargetStatus.MODELED_DEPTH_UNRESOLVED.value,
+                    "net_return_pct": None,
+                    "diagnostic": "V2_ENTRY_EVIDENCE_INCOMPLETE",
+                    "gas_buy_model_label": buy_gas_status,
+                    "gas_sell_model_label": sell_gas_status,
+                }
 
             canon_target = canonicalize_token_address(entry_state.token_address)
             canon_t0 = canonicalize_token_address(ev.token0_address)
@@ -1405,14 +1479,32 @@ class TwoLegExecutionSimulator:
                     reserve_in=ev.raw_reserve0, reserve_out=ev.raw_reserve1, amount_in=q_in_raw, fee_bps=ev.fee_bps
                 )
             else:
-                return {"status": DualTrackTargetStatus.MODELED_ROUNDTRIP_UNRESOLVED_STATE_MISSING.value, "net_return_pct": None, "diagnostic": "V2_TARGET_TOKEN_NOT_IN_PAIR"}
+                return {
+                    "status": DualTrackTargetStatus.MODELED_ROUNDTRIP_UNRESOLVED_STATE_MISSING.value,
+                    "net_return_pct": None,
+                    "diagnostic": "V2_TARGET_TOKEN_NOT_IN_PAIR",
+                    "gas_buy_model_label": buy_gas_status,
+                    "gas_sell_model_label": sell_gas_status,
+                }
 
             if not ok_buy:
-                return {"status": DualTrackTargetStatus.MODELED_TP40_LIQUIDITY_INSUFFICIENT.value, "net_return_pct": None, "diagnostic": "LEG1_BUY_FAILED_LIQUIDITY"}
+                return {
+                    "status": DualTrackTargetStatus.MODELED_TP40_LIQUIDITY_INSUFFICIENT.value,
+                    "net_return_pct": None,
+                    "diagnostic": "LEG1_BUY_FAILED_LIQUIDITY",
+                    "gas_buy_model_label": buy_gas_status,
+                    "gas_sell_model_label": sell_gas_status,
+                }
         elif entry_state.venue_type == "UNISWAP_V3":
             ev3 = entry_state.evidence_v3
             if not ev3 or not ev3.is_complete():
-                return {"status": DualTrackTargetStatus.MODELED_DEPTH_UNRESOLVED.value, "net_return_pct": None, "diagnostic": "V3_ENTRY_EVIDENCE_INCOMPLETE"}
+                return {
+                    "status": DualTrackTargetStatus.MODELED_DEPTH_UNRESOLVED.value,
+                    "net_return_pct": None,
+                    "diagnostic": "V3_ENTRY_EVIDENCE_INCOMPLETE",
+                    "gas_buy_model_label": buy_gas_status,
+                    "gas_sell_model_label": sell_gas_status,
+                }
 
             canon_target = canonicalize_token_address(entry_state.token_address)
             canon_t0 = canonicalize_token_address(ev3.token0_address)
@@ -1420,31 +1512,67 @@ class TwoLegExecutionSimulator:
 
             if canon_target == canon_t0:
                 if entry_state.token0_is_quote:
-                    return {"status": DualTrackTargetStatus.MODELED_ROUNDTRIP_UNRESOLVED_STATE_MISSING.value, "net_return_pct": None, "diagnostic": "V3_ORIENTATION_CONFLICT_TOKEN0_BASE_BUT_FLAG_TRUE"}
+                    return {
+                        "status": DualTrackTargetStatus.MODELED_ROUNDTRIP_UNRESOLVED_STATE_MISSING.value,
+                        "net_return_pct": None,
+                        "diagnostic": "V3_ORIENTATION_CONFLICT_TOKEN0_BASE_BUT_FLAG_TRUE",
+                        "gas_buy_model_label": buy_gas_status,
+                        "gas_sell_model_label": sell_gas_status,
+                    }
                 z4o_buy = False
                 dec_in = ev3.token1_decimals
             elif canon_target == canon_t1:
                 if not entry_state.token0_is_quote:
-                    return {"status": DualTrackTargetStatus.MODELED_ROUNDTRIP_UNRESOLVED_STATE_MISSING.value, "net_return_pct": None, "diagnostic": "V3_ORIENTATION_CONFLICT_TOKEN1_BASE_BUT_FLAG_FALSE"}
+                    return {
+                        "status": DualTrackTargetStatus.MODELED_ROUNDTRIP_UNRESOLVED_STATE_MISSING.value,
+                        "net_return_pct": None,
+                        "diagnostic": "V3_ORIENTATION_CONFLICT_TOKEN1_BASE_BUT_FLAG_FALSE",
+                        "gas_buy_model_label": buy_gas_status,
+                        "gas_sell_model_label": sell_gas_status,
+                    }
                 z4o_buy = True
                 dec_in = ev3.token0_decimals
             else:
-                return {"status": DualTrackTargetStatus.MODELED_ROUNDTRIP_UNRESOLVED_STATE_MISSING.value, "net_return_pct": None, "diagnostic": "V3_ENTRY_TOKEN_NOT_IN_POOL"}
+                return {
+                    "status": DualTrackTargetStatus.MODELED_ROUNDTRIP_UNRESOLVED_STATE_MISSING.value,
+                    "net_return_pct": None,
+                    "diagnostic": "V3_ENTRY_TOKEN_NOT_IN_POOL",
+                    "gas_buy_model_label": buy_gas_status,
+                    "gas_sell_model_label": sell_gas_status,
+                }
 
             q_in_raw = int(q_in * (10 ** dec_in))
             ok_buy, consumed, tokens_acquired_raw, _, diag = UniswapV3SwapSimulator.simulate_swap(
                 ev3, amount_in=q_in_raw, zero_for_one=z4o_buy
             )
             if not ok_buy:
-                return {"status": DualTrackTargetStatus.MODELED_TP40_LIQUIDITY_INSUFFICIENT.value, "net_return_pct": None, "diagnostic": f"LEG1_BUY_FAILED_LIQUIDITY_{diag}"}
+                return {
+                    "status": DualTrackTargetStatus.MODELED_TP40_LIQUIDITY_INSUFFICIENT.value,
+                    "net_return_pct": None,
+                    "diagnostic": f"LEG1_BUY_FAILED_LIQUIDITY_{diag}",
+                    "gas_buy_model_label": buy_gas_status,
+                    "gas_sell_model_label": sell_gas_status,
+                }
         else:
-            return {"status": DualTrackTargetStatus.MODELED_DEPTH_UNRESOLVED.value, "net_return_pct": None, "diagnostic": f"UNSUPPORTED_VENUE_{entry_state.venue_type}"}
+            return {
+                "status": DualTrackTargetStatus.MODELED_DEPTH_UNRESOLVED.value,
+                "net_return_pct": None,
+                "diagnostic": f"UNSUPPORTED_VENUE_{entry_state.venue_type}",
+                "gas_buy_model_label": buy_gas_status,
+                "gas_sell_model_label": sell_gas_status,
+            }
 
         # 5. Leg 2: Target Sell (selling exact tokens acquired)
         if touch_state.venue_type == "UNISWAP_V2":
             ev_touch = touch_state.evidence_v2
             if not ev_touch or not ev_touch.is_complete():
-                return {"status": DualTrackTargetStatus.MODELED_DEPTH_UNRESOLVED.value, "net_return_pct": None, "diagnostic": "V2_TOUCH_EVIDENCE_INCOMPLETE"}
+                return {
+                    "status": DualTrackTargetStatus.MODELED_DEPTH_UNRESOLVED.value,
+                    "net_return_pct": None,
+                    "diagnostic": "V2_TOUCH_EVIDENCE_INCOMPLETE",
+                    "gas_buy_model_label": buy_gas_status,
+                    "gas_sell_model_label": sell_gas_status,
+                }
 
             canon_target = canonicalize_token_address(touch_state.token_address)
             canon_t0 = canonicalize_token_address(ev_touch.token0_address)
@@ -1456,7 +1584,13 @@ class TwoLegExecutionSimulator:
                     reserve_in=ev_touch.raw_reserve0, reserve_out=ev_touch.raw_reserve1, amount_in=tokens_acquired_raw, fee_bps=ev_touch.fee_bps
                 )
                 if not ok_sell:
-                    return {"status": DualTrackTargetStatus.MODELED_TP40_LIQUIDITY_INSUFFICIENT.value, "net_return_pct": None, "diagnostic": "LEG2_SELL_FAILED_LIQUIDITY"}
+                    return {
+                        "status": DualTrackTargetStatus.MODELED_TP40_LIQUIDITY_INSUFFICIENT.value,
+                        "net_return_pct": None,
+                        "diagnostic": "LEG2_SELL_FAILED_LIQUIDITY",
+                        "gas_buy_model_label": buy_gas_status,
+                        "gas_sell_model_label": sell_gas_status,
+                    }
                 gross_proceeds_usd = (q_out_raw / (10 ** ev_touch.token1_decimals)) * touch_state.quote_usd_price
             elif canon_target == canon_t1:
                 # Selling token1 for quote token0
@@ -1464,14 +1598,32 @@ class TwoLegExecutionSimulator:
                     reserve_in=ev_touch.raw_reserve1, reserve_out=ev_touch.raw_reserve0, amount_in=tokens_acquired_raw, fee_bps=ev_touch.fee_bps
                 )
                 if not ok_sell:
-                    return {"status": DualTrackTargetStatus.MODELED_TP40_LIQUIDITY_INSUFFICIENT.value, "net_return_pct": None, "diagnostic": "LEG2_SELL_FAILED_LIQUIDITY"}
+                    return {
+                        "status": DualTrackTargetStatus.MODELED_TP40_LIQUIDITY_INSUFFICIENT.value,
+                        "net_return_pct": None,
+                        "diagnostic": "LEG2_SELL_FAILED_LIQUIDITY",
+                        "gas_buy_model_label": buy_gas_status,
+                        "gas_sell_model_label": sell_gas_status,
+                    }
                 gross_proceeds_usd = (q_out_raw / (10 ** ev_touch.token0_decimals)) * touch_state.quote_usd_price
             else:
-                return {"status": DualTrackTargetStatus.MODELED_ROUNDTRIP_UNRESOLVED_STATE_MISSING.value, "net_return_pct": None, "diagnostic": "V2_TOUCH_TARGET_TOKEN_NOT_IN_PAIR"}
+                return {
+                    "status": DualTrackTargetStatus.MODELED_ROUNDTRIP_UNRESOLVED_STATE_MISSING.value,
+                    "net_return_pct": None,
+                    "diagnostic": "V2_TOUCH_TARGET_TOKEN_NOT_IN_PAIR",
+                    "gas_buy_model_label": buy_gas_status,
+                    "gas_sell_model_label": sell_gas_status,
+                }
         elif touch_state.venue_type == "UNISWAP_V3":
             ev3_touch = touch_state.evidence_v3
             if not ev3_touch or not ev3_touch.is_complete():
-                return {"status": DualTrackTargetStatus.MODELED_DEPTH_UNRESOLVED.value, "net_return_pct": None, "diagnostic": "V3_TOUCH_EVIDENCE_INCOMPLETE"}
+                return {
+                    "status": DualTrackTargetStatus.MODELED_DEPTH_UNRESOLVED.value,
+                    "net_return_pct": None,
+                    "diagnostic": "V3_TOUCH_EVIDENCE_INCOMPLETE",
+                    "gas_buy_model_label": buy_gas_status,
+                    "gas_sell_model_label": sell_gas_status,
+                }
 
             canon_target = canonicalize_token_address(touch_state.token_address)
             canon_t0 = canonicalize_token_address(ev3_touch.token0_address)
@@ -1479,25 +1631,55 @@ class TwoLegExecutionSimulator:
 
             if canon_target == canon_t0:
                 if touch_state.token0_is_quote:
-                    return {"status": DualTrackTargetStatus.MODELED_ROUNDTRIP_UNRESOLVED_STATE_MISSING.value, "net_return_pct": None, "diagnostic": "V3_TOUCH_ORIENTATION_CONFLICT"}
+                    return {
+                        "status": DualTrackTargetStatus.MODELED_ROUNDTRIP_UNRESOLVED_STATE_MISSING.value,
+                        "net_return_pct": None,
+                        "diagnostic": "V3_TOUCH_ORIENTATION_CONFLICT",
+                        "gas_buy_model_label": buy_gas_status,
+                        "gas_sell_model_label": sell_gas_status,
+                    }
                 z4o_sell = True
                 dec_out = ev3_touch.token1_decimals
             elif canon_target == canon_t1:
                 if not touch_state.token0_is_quote:
-                    return {"status": DualTrackTargetStatus.MODELED_ROUNDTRIP_UNRESOLVED_STATE_MISSING.value, "net_return_pct": None, "diagnostic": "V3_TOUCH_ORIENTATION_CONFLICT"}
+                    return {
+                        "status": DualTrackTargetStatus.MODELED_ROUNDTRIP_UNRESOLVED_STATE_MISSING.value,
+                        "net_return_pct": None,
+                        "diagnostic": "V3_TOUCH_ORIENTATION_CONFLICT",
+                        "gas_buy_model_label": buy_gas_status,
+                        "gas_sell_model_label": sell_gas_status,
+                    }
                 z4o_sell = False
                 dec_out = ev3_touch.token0_decimals
             else:
-                return {"status": DualTrackTargetStatus.MODELED_ROUNDTRIP_UNRESOLVED_STATE_MISSING.value, "net_return_pct": None, "diagnostic": "V3_TOUCH_TOKEN_NOT_IN_POOL"}
+                return {
+                    "status": DualTrackTargetStatus.MODELED_ROUNDTRIP_UNRESOLVED_STATE_MISSING.value,
+                    "net_return_pct": None,
+                    "diagnostic": "V3_TOUCH_TOKEN_NOT_IN_POOL",
+                    "gas_buy_model_label": buy_gas_status,
+                    "gas_sell_model_label": sell_gas_status,
+                }
 
             ok_sell, consumed, q_out_raw, _, diag = UniswapV3SwapSimulator.simulate_swap(
                 ev3_touch, amount_in=tokens_acquired_raw, zero_for_one=z4o_sell
             )
             if not ok_sell:
-                return {"status": DualTrackTargetStatus.MODELED_TP40_LIQUIDITY_INSUFFICIENT.value, "net_return_pct": None, "diagnostic": f"LEG2_SELL_FAILED_LIQUIDITY_{diag}"}
+                return {
+                    "status": DualTrackTargetStatus.MODELED_TP40_LIQUIDITY_INSUFFICIENT.value,
+                    "net_return_pct": None,
+                    "diagnostic": f"LEG2_SELL_FAILED_LIQUIDITY_{diag}",
+                    "gas_buy_model_label": buy_gas_status,
+                    "gas_sell_model_label": sell_gas_status,
+                }
             gross_proceeds_usd = (q_out_raw / (10 ** dec_out)) * touch_state.quote_usd_price
         else:
-            return {"status": DualTrackTargetStatus.MODELED_DEPTH_UNRESOLVED.value, "net_return_pct": None, "diagnostic": f"UNSUPPORTED_VENUE_{touch_state.venue_type}"}
+            return {
+                "status": DualTrackTargetStatus.MODELED_DEPTH_UNRESOLVED.value,
+                "net_return_pct": None,
+                "diagnostic": f"UNSUPPORTED_VENUE_{touch_state.venue_type}",
+                "gas_buy_model_label": buy_gas_status,
+                "gas_sell_model_label": sell_gas_status,
+            }
 
         # 5. Net Proceeds & Decision
         net_proceeds_usd = gross_proceeds_usd - gas_buy_usd - gas_sell_usd
@@ -1514,6 +1696,8 @@ class TwoLegExecutionSimulator:
             "gross_proceeds_usd": round(gross_proceeds_usd, 4),
             "gas_buy_usd": round(gas_buy_usd, 4),
             "gas_sell_usd": round(gas_sell_usd, 4),
+            "gas_buy_model_label": buy_gas_status,
+            "gas_sell_model_label": sell_gas_status,
             "tranche_usd": tranche_usd,
             "tokens_acquired": tokens_acquired_raw,
         }
