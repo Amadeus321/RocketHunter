@@ -208,6 +208,53 @@ class TestStage31ProtectedDataAndManifest(unittest.TestCase):
         self.assertFalse(is_clean)
         self.assertTrue(any("must be a dictionary" in d for d in disc))
 
+    def test_matching_malformed_hashes_fail_closed(self):
+        """Validates that matching but malformed, None, or non-hex digests fail closed."""
+        # 1. Matching malformed/non-hex string (e.g. "BADHASH")
+        snap_malformed_1 = {
+            "protected_files": {"user_positions_journal.json": {"sha256": "BADHASH", "size_bytes": 10}},
+            "scanner_memory_partitions": {},
+            "config_files": {},
+        }
+        snap_malformed_2 = {
+            "protected_files": {"user_positions_journal.json": {"sha256": "BADHASH", "size_bytes": 10}},
+            "scanner_memory_partitions": {},
+            "config_files": {},
+        }
+        is_clean, disc = self.verifier.verify_clean_equivalence(snap_malformed_1, snap_malformed_2)
+        self.assertFalse(is_clean)
+        self.assertTrue(any("Malformed or invalid SHA-256 digest" in d for d in disc))
+
+        # 2. Matching None hash
+        snap_none_1 = {
+            "protected_files": {"user_positions_journal.json": {"sha256": None, "size_bytes": 10}},
+            "scanner_memory_partitions": {},
+            "config_files": {},
+        }
+        snap_none_2 = {
+            "protected_files": {"user_positions_journal.json": {"sha256": None, "size_bytes": 10}},
+            "scanner_memory_partitions": {},
+            "config_files": {},
+        }
+        is_clean, disc = self.verifier.verify_clean_equivalence(snap_none_1, snap_none_2)
+        self.assertFalse(is_clean)
+        self.assertTrue(any("Malformed or invalid SHA-256 digest" in d for d in disc))
+
+        # 3. Matching truncated 32-char hex (e.g. MD5 length instead of 64-char SHA-256)
+        snap_md5_1 = {
+            "protected_files": {"user_positions_journal.json": {"sha256": "a" * 32, "size_bytes": 10}},
+            "scanner_memory_partitions": {},
+            "config_files": {},
+        }
+        snap_md5_2 = {
+            "protected_files": {"user_positions_journal.json": {"sha256": "a" * 32, "size_bytes": 10}},
+            "scanner_memory_partitions": {},
+            "config_files": {},
+        }
+        is_clean, disc = self.verifier.verify_clean_equivalence(snap_md5_1, snap_md5_2)
+        self.assertFalse(is_clean)
+        self.assertTrue(any("Malformed or invalid SHA-256 digest" in d for d in disc))
+
 
 class TestStage31RpcProvenanceAndQuarantine(unittest.TestCase):
     """Test three-tiered RPC evidence, downgraded Tier 2 metadata, and distinct-provider Tier 3 finality."""
@@ -385,7 +432,7 @@ class TestStage31MultiChainFinality(unittest.TestCase):
         )
         self.assertEqual(status_delay, FinalityState.DISPUTE_GAME_RESOLVED_DEFENDER)
 
-        # Defender win finalized
+        # Defender win finalized (elapsed delay -> caller-asserted unverified, not L2_OUTPUT_FINALIZED_CANONICAL)
         status_final = MultiChainFinalityEngine.evaluate_op_stack(
             l1_batch_finalized=True,
             proposal_game_type=1,
@@ -395,7 +442,42 @@ class TestStage31MultiChainFinality(unittest.TestCase):
             current_l1_timestamp=1000 + 302400,
             dispute_game_finality_delay_seconds=302400,
         )
-        self.assertEqual(status_final, FinalityState.L2_OUTPUT_FINALIZED_CANONICAL)
+        self.assertEqual(status_final, FinalityState.FINALITY_CALLER_ASSERTED_UNVERIFIED)
+
+    def test_direct_multichain_finality_engine_downgrades_to_unverified(self):
+        """Validates that direct evaluation on Arbitrum, OP Stack, and Solana NEVER returns canonical finality."""
+        # Arbitrum Nitro: elapsed >= confirm_period_blocks -> FINALITY_CALLER_ASSERTED_UNVERIFIED
+        arb_state = MultiChainFinalityEngine.evaluate_arbitrum(
+            l1_batch_finalized=True,
+            assertion_created_l1_block=1000,
+            current_finalized_l1_block=1000 + 50000,
+            confirm_period_blocks=45818,
+            challenge_status="NONE",
+        )
+        self.assertEqual(arb_state, FinalityState.FINALITY_CALLER_ASSERTED_UNVERIFIED)
+        self.assertNotEqual(arb_state, FinalityState.FINALIZED_CANONICAL)
+
+        # OP Stack: defender wins and delay elapsed -> FINALITY_CALLER_ASSERTED_UNVERIFIED
+        op_state = MultiChainFinalityEngine.evaluate_op_stack(
+            l1_batch_finalized=True,
+            proposal_game_type=1,
+            respected_game_type=1,
+            game_status=2,  # DEFENDER_WINS
+            resolved_at=1000,
+            current_l1_timestamp=1000 + 400000,
+            dispute_game_finality_delay_seconds=302400,
+        )
+        self.assertEqual(op_state, FinalityState.FINALITY_CALLER_ASSERTED_UNVERIFIED)
+        self.assertNotEqual(op_state, FinalityState.L2_OUTPUT_FINALIZED_CANONICAL)
+        self.assertNotEqual(op_state, FinalityState.FINALIZED_CANONICAL)
+
+        # Solana: finalized commitment and rooted -> FINALITY_CALLER_ASSERTED_UNVERIFIED
+        sol_state = MultiChainFinalityEngine.evaluate_solana(
+            commitment="finalized",
+            is_rooted=True,
+        )
+        self.assertEqual(sol_state, FinalityState.FINALITY_CALLER_ASSERTED_UNVERIFIED)
+        self.assertNotEqual(sol_state, FinalityState.FINALIZED_CANONICAL)
 
 
 class TestStage31VenueEvidenceAndDualTrackOutcomes(unittest.TestCase):

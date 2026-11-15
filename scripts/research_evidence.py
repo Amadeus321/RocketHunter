@@ -6,24 +6,25 @@ Authoritatively implements Stage 3.1 architectural components with independent r
    - Enforces SHA-256 pre/post-run integrity of protected project data:
      `user_positions_journal.json`, `ai_learning_engine.json`, `notification_config.json`,
      `config/` files, and `scanner-memory/` partitions.
+   - Strictly validates all SHA-256 digests as 64-character hexadecimal strings (fails closed).
    - Detects file modifications, deletions, and unauthorized newly created files (fails closed).
 2. Three-Tiered RPC Evidence Preservation & Provenance Engine:
    - Tier 1: Payload Integrity with persistent raw wire request/response disk retention
      and independent expected SHA-256 digest validation (non-tautological).
    - Tier 2 (Downgraded): Categorized strictly as caller-asserted metadata (`ENDPOINT_METADATA_UNVERIFIED`);
      does not claim cryptographic TLS authentication without documented CA/pin verification proofs.
-   - Tier 3: Canonical Blockchain Verification requiring:
-     a) Distinct independent providers (`record.provider_id != peer.provider_id`).
-     b) Dual-provider consensus on chain ID, block number, block hash, parent hash, state root.
-     c) Chain-specific canonical finality proof:
-        - Ethereum L1: Cryptographic Beacon Chain finalized checkpoint proof.
-        - Arbitrum: Dynamic Nitro assertion confirmation period evaluation.
-        - OP Stack / Base: Dispute game resolution and airgap finality delay evaluation.
-        - Solana: Rooted Tower BFT finalized commitment.
-     Fails closed to `FINALITY_PENDING` on any missing proof or unfinalized state; quarantines reorgs.
+   - Tier 3 (Caller-Asserted / Unverified): Dual-provider consensus verification and chain-specific finality
+     evaluations (Ethereum Beacon checkpoint, Arbitrum Nitro assertion confirm window, OP Stack dispute games,
+     and Solana rooted slots) evaluate caller-supplied metadata and delay thresholds. In the absence of
+     on-chain cryptographic proof validation (e.g. BLS signatures, Merkle inclusion proofs, authenticated
+     provider identities), blocks and assertions are classified as `FINALITY_CALLER_ASSERTED_UNVERIFIED`
+     and are never promoted to `FINALIZED_CANONICAL`. Discrepancies fail closed to `FINALITY_PENDING` or
+     `BLOCK_REORGANIZED_ORPHAN`.
 3. Configuration-Driven Multi-Chain Finality State Machine:
-   - Ethereum L1, Arbitrum Nitro, OP Stack (op-contracts/v1.6.0 commit `33f06d2d5e4034125df02264a5ffe84571bd0359`),
-     and Solana rooted slot evaluations.
+   - Evaluates caller-supplied state transition metadata and delay parameters for Arbitrum Nitro,
+     OP Stack (op-contracts/v1.6.0 commit `33f06d2d5e4034125df02264a5ffe84571bd0359`), and Solana.
+     Direct public evaluations emit caller-asserted/unverified statuses (`FINALITY_CALLER_ASSERTED_UNVERIFIED`)
+     rather than canonical finality status when dispute or confirmation delays elapse.
 4. Venue-Specific Execution Evidence Data Structures:
    - Uniswap V2: Chain ID, pool, token0 != token1, fee bounds (0 < fee <= 10000 bps), positive reserves.
    - Uniswap V3: Validates canonical fee tiers and tick spacings, mathematical tick/price consistency
@@ -294,6 +295,7 @@ class ProtectedDataVerifier:
     def verify_clean_equivalence(self, pre_snapshot: dict[str, Any], post_snapshot: dict[str, Any]) -> Tuple[bool, list[str]]:
         """Verifies zero protected files were modified, created, or deleted (fails closed).
         Strictly rejects malformed or incomplete snapshots missing required categories.
+        Validates all SHA-256 digests as strictly 64-character hexadecimal strings.
         """
         discrepancies = []
 
@@ -315,23 +317,38 @@ class ProtectedDataVerifier:
         if discrepancies:
             return False, discrepancies
 
+        hex_64_pattern = re.compile(r"^[0-9A-Fa-f]{64}$")
+
         for cat in categories:
             pre_dict = pre_snapshot[cat]
             post_dict = post_snapshot[cat]
 
-            # Detect deletions and invalid metadata entries
+            # Detect deletions, invalid metadata entries, and malformed digests
             for path, meta in pre_dict.items():
                 if not isinstance(meta, dict) or "sha256" not in meta:
                     discrepancies.append(f"Malformed pre_snapshot metadata entry in {cat}: {path}")
                     continue
+
+                pre_sha256 = meta.get("sha256")
+                if not isinstance(pre_sha256, str) or not hex_64_pattern.match(pre_sha256):
+                    discrepancies.append(
+                        f"Malformed or invalid SHA-256 digest in pre_snapshot {cat}: {path} ({pre_sha256!r})"
+                    )
+
                 if path not in post_dict:
                     discrepancies.append(f"Protected item deleted in {cat}: {path}")
                 elif not isinstance(post_dict[path], dict) or "sha256" not in post_dict[path]:
                     discrepancies.append(f"Malformed post_snapshot metadata entry in {cat}: {path}")
-                elif meta.get("sha256") != post_dict[path].get("sha256"):
-                    discrepancies.append(
-                        f"Protected file modified in {cat}: {path} ({meta.get('sha256')} -> {post_dict[path].get('sha256')})"
-                    )
+                else:
+                    post_sha256 = post_dict[path].get("sha256")
+                    if not isinstance(post_sha256, str) or not hex_64_pattern.match(post_sha256):
+                        discrepancies.append(
+                            f"Malformed or invalid SHA-256 digest in post_snapshot {cat}: {path} ({post_sha256!r})"
+                        )
+                    if pre_sha256 != post_sha256:
+                        discrepancies.append(
+                            f"Protected file modified in {cat}: {path} ({pre_sha256} -> {post_sha256})"
+                        )
 
             # Detect unauthorized creations
             for path in post_dict:
@@ -481,7 +498,7 @@ class RpcProvenanceVerifier:
                 confirm_period_blocks=finality_proof.get("confirm_period_blocks", 45818),
                 challenge_status=finality_proof.get("challenge_status", "NONE"),
             )
-            if state != FinalityState.FINALIZED_CANONICAL:
+            if state != FinalityState.FINALITY_CALLER_ASSERTED_UNVERIFIED:
                 return False, state, "ARBITRUM_ASSERTION_NOT_FINALIZED"
 
         # OP Stack / Base (chain_id == 8453): Fault proof dispute game resolution and finality delay
@@ -497,15 +514,19 @@ class RpcProvenanceVerifier:
                 current_l1_timestamp=finality_proof.get("current_l1_timestamp", 0),
                 dispute_game_finality_delay_seconds=finality_proof.get("dispute_game_finality_delay_seconds", 302400),
             )
-            if state != FinalityState.L2_OUTPUT_FINALIZED_CANONICAL:
+            if state != FinalityState.FINALITY_CALLER_ASSERTED_UNVERIFIED:
                 return False, state, "OP_STACK_OUTPUT_ROOT_NOT_CANONICAL"
 
         # Solana (chain_id == 101): Rooted Tower BFT commitment
         elif record.chain_id == 101:
             if proof_type != "SOLANA_TOWER_BFT":
                 return False, FinalityState.FINALITY_PENDING, "INVALID_PROOF_TYPE_FOR_SOLANA"
-            if not (finality_proof.get("commitment") == "finalized" and finality_proof.get("is_rooted") is True):
-                return False, FinalityState.FINALITY_PENDING, "SOLANA_SLOT_NOT_ROOTED_FINALIZED"
+            state = MultiChainFinalityEngine.evaluate_solana(
+                commitment=finality_proof.get("commitment", ""),
+                is_rooted=finality_proof.get("is_rooted", False),
+            )
+            if state != FinalityState.FINALITY_CALLER_ASSERTED_UNVERIFIED:
+                return False, state, "SOLANA_SLOT_NOT_ROOTED_FINALIZED"
 
         else:
             return False, FinalityState.FINALITY_PENDING, "UNSUPPORTED_CHAIN_FINALITY_SPECIFICATION"
@@ -542,7 +563,12 @@ class RpcProvenanceVerifier:
 # ==============================================================================
 
 class MultiChainFinalityEngine:
-    """Evaluates protocol finality using dynamic on-chain configuration readers."""
+    """Evaluates protocol finality state transitions from caller-provided metadata and delay parameters.
+    
+    In the absence of on-chain cryptographic proofs (e.g. Merkle inclusion proofs, BLS signature verification,
+    or authenticated provider identities), evaluations on caller-provided scalars/booleans return
+    `FINALITY_CALLER_ASSERTED_UNVERIFIED` rather than promoting to canonical finality.
+    """
 
     @staticmethod
     def evaluate_arbitrum(
@@ -552,7 +578,11 @@ class MultiChainFinalityEngine:
         confirm_period_blocks: int,
         challenge_status: str = "NONE",
     ) -> FinalityState:
-        """Evaluates Arbitrum Nitro assertion finality against dynamic confirmPeriodBlocks()."""
+        """Evaluates Arbitrum Nitro assertion finality against dynamic confirmPeriodBlocks().
+        
+        Returns FINALITY_CALLER_ASSERTED_UNVERIFIED when the dispute window has elapsed,
+        as on-chain assertion state is caller-provided and not cryptographically proven.
+        """
         if not l1_batch_finalized:
             return FinalityState.FINALITY_PENDING
 
@@ -561,7 +591,7 @@ class MultiChainFinalityEngine:
 
         elapsed_blocks = current_finalized_l1_block - assertion_created_l1_block
         if elapsed_blocks >= confirm_period_blocks and challenge_status == "NONE":
-            return FinalityState.FINALIZED_CANONICAL
+            return FinalityState.FINALITY_CALLER_ASSERTED_UNVERIFIED
 
         # L1 batch is finalized, but dispute window is still open
         return FinalityState.L1_BATCH_FINALITY_ONLY
@@ -576,7 +606,11 @@ class MultiChainFinalityEngine:
         current_l1_timestamp: int,
         dispute_game_finality_delay_seconds: int,
     ) -> FinalityState:
-        """Evaluates OP Stack fault-proof output root states (op-contracts/v1.6.0)."""
+        """Evaluates OP Stack fault-proof output root states (op-contracts/v1.6.0).
+        
+        Returns FINALITY_CALLER_ASSERTED_UNVERIFIED when the dispute game is resolved and
+        the airgap finality delay has elapsed, as caller-provided scalars lack cryptographic verification.
+        """
         # Proposal invalidated by challenger win
         if game_status == 1:  # CHALLENGER_WINS
             return FinalityState.PROPOSAL_INVALIDATED_QUARANTINE
@@ -594,9 +628,9 @@ class MultiChainFinalityEngine:
             if current_l1_timestamp < resolved_at + dispute_game_finality_delay_seconds:
                 return FinalityState.DISPUTE_GAME_RESOLVED_DEFENDER  # in finality airgap delay
 
-            # Delay elapsed and L1 DA finalized => canonical L2 output root
+            # Delay elapsed and L1 DA finalized => caller-asserted unverified output root
             if l1_batch_finalized:
-                return FinalityState.L2_OUTPUT_FINALIZED_CANONICAL
+                return FinalityState.FINALITY_CALLER_ASSERTED_UNVERIFIED
             return FinalityState.DISPUTE_GAME_FINALIZED
 
         return FinalityState.FINALITY_PENDING
@@ -614,9 +648,13 @@ class MultiChainFinalityEngine:
 
     @staticmethod
     def evaluate_solana(commitment: str, is_rooted: bool) -> FinalityState:
-        """Evaluates Solana slot commitment using rooted Tower BFT criteria."""
+        """Evaluates Solana slot commitment using rooted Tower BFT criteria.
+        
+        Returns FINALITY_CALLER_ASSERTED_UNVERIFIED for finalized and rooted slots
+        in the absence of authenticated cluster voting proofs.
+        """
         if commitment == "finalized" and is_rooted:
-            return FinalityState.FINALIZED_CANONICAL
+            return FinalityState.FINALITY_CALLER_ASSERTED_UNVERIFIED
         return FinalityState.FINALITY_PENDING
 
 
