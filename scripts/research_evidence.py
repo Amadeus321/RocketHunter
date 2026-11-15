@@ -979,6 +979,7 @@ class UniswapV3SwapSimulator:
         current_sqrt_price = evidence.sqrt_price_x96
         current_liquidity = evidence.active_liquidity
 
+        has_explicit_target = target_sqrt_price_x96 is not None
         if target_sqrt_price_x96 is None:
             target_sqrt_price_x96 = (
                 UniswapV3TickMath.MIN_SQRT_RATIO + 1
@@ -1049,6 +1050,8 @@ class UniswapV3SwapSimulator:
                 break
 
         consumed = amount_in - amount_remaining
+        if has_explicit_target and current_sqrt_price != target_sqrt_price_x96:
+            return False, consumed, amount_out_total, current_sqrt_price, "TARGET_PRICE_NOT_REACHED_INSUFFICIENT_INPUT_OR_DEPTH"
         return True, consumed, amount_out_total, current_sqrt_price, "SWAP_SUCCESS"
 
     @classmethod
@@ -1118,7 +1121,8 @@ class UniswapV2SwapSimulator:
         reserve_token: int,
         fee_bps: int = 30,
     ) -> Dict[str, Any]:
-        """Calculates exact bidirectional depth within +/- 2.0% price impact band.
+        """Calculates exact integer bidirectional depth within +/- 2.0% price impact band.
+        Uses pure integer arithmetic (math.isqrt with 10^18 fixed-point scale) with zero floating-point drift.
         D_ask: Gross quote input to push price +2% (with fee applied to input).
         D_bid: Quote output yielded at -2% terminal price (NO fee applied to output).
         token_in: Required token input to reach -2% terminal price (fee applied to input).
@@ -1126,10 +1130,24 @@ class UniswapV2SwapSimulator:
         if reserve_quote <= 0 or reserve_token <= 0:
             return {"d_ask_plus_2pct": 0, "d_bid_minus_2pct": 0, "token_in_minus_2pct": 0}
 
-        fee_factor = 1.0 - (fee_bps / 10000.0)
-        d_ask = int((reserve_quote * (math.sqrt(1.02) - 1.0)) / fee_factor)
-        d_bid = int(reserve_quote * (1.0 - math.sqrt(0.98)))
-        token_in = int((reserve_token * (1.0 / math.sqrt(0.98) - 1.0)) / fee_factor)
+        scale = 10**18
+        # Sqrt(1.02) scaled: sqrt(102/100 * scale^2)
+        sqrt_102 = math.isqrt(102 * scale * scale // 100)
+        # Sqrt(0.98) scaled: sqrt(98/100 * scale^2)
+        sqrt_98 = math.isqrt(98 * scale * scale // 100)
+        # Sqrt(1/0.98) scaled: sqrt(100/98 * scale^2)
+        sqrt_recip_98 = math.isqrt(scale * scale * 100 // 98)
+
+        denom_fee = scale * (10000 - fee_bps)
+
+        # D_ask = Rq * (sqrt(1.02) - 1) / (1 - f)
+        d_ask = (reserve_quote * (sqrt_102 - scale) * 10000) // denom_fee
+
+        # D_bid = Rq * (1 - sqrt(0.98))  [No fee multiplier on output]
+        d_bid = (reserve_quote * (scale - sqrt_98)) // scale
+
+        # token_in = Rb * (1/sqrt(0.98) - 1) / (1 - f)  [Fee applied to required input]
+        token_in = (reserve_token * (sqrt_recip_98 - scale) * 10000) // denom_fee
 
         return {
             "d_ask_plus_2pct": d_ask,
@@ -1143,11 +1161,17 @@ def calculate_evm_gas_cost_usd(
     base_fee_wei: int,
     priority_fee_wei: int,
     native_usd_price: float,
+    max_fee_per_gas_wei: Optional[int] = None,
 ) -> Tuple[float, float, str]:
-    """Calculates EVM EIP-1559 gas cost in ETH and USD.
+    """Calculates EVM EIP-1559 gas cost in ETH and USD using canonical effective gas price formula:
+    effective_gas_price = base_fee + min(priority_fee, max_fee - base_fee).
     Returns (gas_cost_eth, gas_cost_usd, 'MODELED_GAS_COST_WITH_ASSUMPTIONS').
     """
-    effective_gas_price_wei = base_fee_wei + priority_fee_wei
+    if max_fee_per_gas_wei is not None:
+        effective_tip = min(priority_fee_wei, max(0, max_fee_per_gas_wei - base_fee_wei))
+    else:
+        effective_tip = priority_fee_wei
+    effective_gas_price_wei = base_fee_wei + effective_tip
     gas_cost_wei = gas_used * effective_gas_price_wei
     gas_cost_eth = gas_cost_wei / 1e18
     gas_cost_usd = gas_cost_eth * native_usd_price
@@ -1200,6 +1224,7 @@ class PoolStateSnapshot:
     native_usd_price: float = 3000.0
     base_fee_per_gas_wei: int = 20_000_000_000  # 20 gwei
     priority_fee_per_gas_wei: int = 2_000_000_000  # 2 gwei
+    max_fee_per_gas_wei: Optional[int] = None
     token0_is_quote: bool = True
 
 
@@ -1225,21 +1250,108 @@ class TwoLegExecutionSimulator:
                 "tranche_usd": tranche_usd,
             }
 
-        # 2. Gas calculation
+        # 2. Strict provenance & identity binding validation
+        canon_entry_token = canonicalize_token_address(entry_state.token_address)
+        canon_touch_token = canonicalize_token_address(touch_state.token_address)
+        canon_entry_pool = canonicalize_token_address(entry_state.pool_address)
+        canon_touch_pool = canonicalize_token_address(touch_state.pool_address)
+
+        if entry_state.chain_id != touch_state.chain_id:
+            return {
+                "status": DualTrackTargetStatus.MODELED_ROUNDTRIP_UNRESOLVED_STATE_MISSING.value,
+                "net_return_pct": None,
+                "diagnostic": f"CHAIN_ID_MISMATCH_ENTRY_{entry_state.chain_id}_TOUCH_{touch_state.chain_id}",
+                "tranche_usd": tranche_usd,
+            }
+
+        if canon_entry_token != canon_touch_token:
+            return {
+                "status": DualTrackTargetStatus.MODELED_ROUNDTRIP_UNRESOLVED_STATE_MISSING.value,
+                "net_return_pct": None,
+                "diagnostic": f"TOKEN_MISMATCH_ENTRY_{canon_entry_token}_TOUCH_{canon_touch_token}",
+                "tranche_usd": tranche_usd,
+            }
+
+        if canon_entry_pool != canon_touch_pool:
+            return {
+                "status": DualTrackTargetStatus.MODELED_ROUNDTRIP_UNRESOLVED_STATE_MISSING.value,
+                "net_return_pct": None,
+                "diagnostic": f"POOL_MISMATCH_ENTRY_{canon_entry_pool}_TOUCH_{canon_touch_pool}",
+                "tranche_usd": tranche_usd,
+            }
+
+        if touch_state.block_number < entry_state.block_number:
+            return {
+                "status": DualTrackTargetStatus.MODELED_ROUNDTRIP_UNRESOLVED_STATE_MISSING.value,
+                "net_return_pct": None,
+                "diagnostic": f"BLOCK_ORDER_INVALID_TOUCH_{touch_state.block_number}_LT_ENTRY_{entry_state.block_number}",
+                "tranche_usd": tranche_usd,
+            }
+
+        # Validate embedded evidence matches snapshot provenance
+        if entry_state.venue_type == "UNISWAP_V2":
+            ev = entry_state.evidence_v2
+            if not ev or not ev.is_complete():
+                return {"status": DualTrackTargetStatus.MODELED_DEPTH_UNRESOLVED.value, "net_return_pct": None, "diagnostic": "V2_ENTRY_EVIDENCE_INCOMPLETE", "tranche_usd": tranche_usd}
+            if ev.chain_id != entry_state.chain_id or canonicalize_token_address(ev.pool_address) != canon_entry_pool:
+                return {"status": DualTrackTargetStatus.MODELED_ROUNDTRIP_UNRESOLVED_STATE_MISSING.value, "net_return_pct": None, "diagnostic": "ENTRY_EVIDENCE_POOL_IDENTITY_MISMATCH", "tranche_usd": tranche_usd}
+            if ev.block_number != entry_state.block_number or ev.block_hash.lower() != entry_state.block_hash.lower():
+                return {"status": DualTrackTargetStatus.MODELED_ROUNDTRIP_UNRESOLVED_STATE_MISSING.value, "net_return_pct": None, "diagnostic": "ENTRY_EVIDENCE_BLOCK_PROVENANCE_MISMATCH", "tranche_usd": tranche_usd}
+            ev_tokens = [canonicalize_token_address(ev.token0_address), canonicalize_token_address(ev.token1_address)]
+            if canon_entry_token not in ev_tokens:
+                return {"status": DualTrackTargetStatus.MODELED_ROUNDTRIP_UNRESOLVED_STATE_MISSING.value, "net_return_pct": None, "diagnostic": "ENTRY_EVIDENCE_TOKEN_NOT_IN_PAIR", "tranche_usd": tranche_usd}
+        elif entry_state.venue_type == "UNISWAP_V3":
+            ev3 = entry_state.evidence_v3
+            if not ev3 or not ev3.is_complete():
+                return {"status": DualTrackTargetStatus.MODELED_DEPTH_UNRESOLVED.value, "net_return_pct": None, "diagnostic": "V3_ENTRY_EVIDENCE_INCOMPLETE", "tranche_usd": tranche_usd}
+            if ev3.chain_id != entry_state.chain_id or canonicalize_token_address(ev3.pool_address) != canon_entry_pool:
+                return {"status": DualTrackTargetStatus.MODELED_ROUNDTRIP_UNRESOLVED_STATE_MISSING.value, "net_return_pct": None, "diagnostic": "ENTRY_V3_EVIDENCE_POOL_IDENTITY_MISMATCH", "tranche_usd": tranche_usd}
+            if ev3.block_number != entry_state.block_number or ev3.block_hash.lower() != entry_state.block_hash.lower():
+                return {"status": DualTrackTargetStatus.MODELED_ROUNDTRIP_UNRESOLVED_STATE_MISSING.value, "net_return_pct": None, "diagnostic": "ENTRY_V3_EVIDENCE_BLOCK_PROVENANCE_MISMATCH", "tranche_usd": tranche_usd}
+            ev3_tokens = [canonicalize_token_address(ev3.token0_address), canonicalize_token_address(ev3.token1_address)]
+            if canon_entry_token not in ev3_tokens:
+                return {"status": DualTrackTargetStatus.MODELED_ROUNDTRIP_UNRESOLVED_STATE_MISSING.value, "net_return_pct": None, "diagnostic": "ENTRY_V3_EVIDENCE_TOKEN_NOT_IN_POOL", "tranche_usd": tranche_usd}
+
+        if touch_state.venue_type == "UNISWAP_V2":
+            ev_touch = touch_state.evidence_v2
+            if not ev_touch or not ev_touch.is_complete():
+                return {"status": DualTrackTargetStatus.MODELED_DEPTH_UNRESOLVED.value, "net_return_pct": None, "diagnostic": "V2_TOUCH_EVIDENCE_INCOMPLETE", "tranche_usd": tranche_usd}
+            if ev_touch.chain_id != touch_state.chain_id or canonicalize_token_address(ev_touch.pool_address) != canon_touch_pool:
+                return {"status": DualTrackTargetStatus.MODELED_ROUNDTRIP_UNRESOLVED_STATE_MISSING.value, "net_return_pct": None, "diagnostic": "TOUCH_EVIDENCE_POOL_IDENTITY_MISMATCH", "tranche_usd": tranche_usd}
+            if ev_touch.block_number != touch_state.block_number or ev_touch.block_hash.lower() != touch_state.block_hash.lower():
+                return {"status": DualTrackTargetStatus.MODELED_ROUNDTRIP_UNRESOLVED_STATE_MISSING.value, "net_return_pct": None, "diagnostic": "TOUCH_EVIDENCE_BLOCK_PROVENANCE_MISMATCH", "tranche_usd": tranche_usd}
+            ev_touch_tokens = [canonicalize_token_address(ev_touch.token0_address), canonicalize_token_address(ev_touch.token1_address)]
+            if canon_touch_token not in ev_touch_tokens:
+                return {"status": DualTrackTargetStatus.MODELED_ROUNDTRIP_UNRESOLVED_STATE_MISSING.value, "net_return_pct": None, "diagnostic": "TOUCH_EVIDENCE_TOKEN_NOT_IN_PAIR", "tranche_usd": tranche_usd}
+        elif touch_state.venue_type == "UNISWAP_V3":
+            ev3_touch = touch_state.evidence_v3
+            if not ev3_touch or not ev3_touch.is_complete():
+                return {"status": DualTrackTargetStatus.MODELED_DEPTH_UNRESOLVED.value, "net_return_pct": None, "diagnostic": "V3_TOUCH_EVIDENCE_INCOMPLETE", "tranche_usd": tranche_usd}
+            if ev3_touch.chain_id != touch_state.chain_id or canonicalize_token_address(ev3_touch.pool_address) != canon_touch_pool:
+                return {"status": DualTrackTargetStatus.MODELED_ROUNDTRIP_UNRESOLVED_STATE_MISSING.value, "net_return_pct": None, "diagnostic": "TOUCH_V3_EVIDENCE_POOL_IDENTITY_MISMATCH", "tranche_usd": tranche_usd}
+            if ev3_touch.block_number != touch_state.block_number or ev3_touch.block_hash.lower() != touch_state.block_hash.lower():
+                return {"status": DualTrackTargetStatus.MODELED_ROUNDTRIP_UNRESOLVED_STATE_MISSING.value, "net_return_pct": None, "diagnostic": "TOUCH_V3_EVIDENCE_BLOCK_PROVENANCE_MISMATCH", "tranche_usd": tranche_usd}
+            ev3_touch_tokens = [canonicalize_token_address(ev3_touch.token0_address), canonicalize_token_address(ev3_touch.token1_address)]
+            if canon_touch_token not in ev3_touch_tokens:
+                return {"status": DualTrackTargetStatus.MODELED_ROUNDTRIP_UNRESOLVED_STATE_MISSING.value, "net_return_pct": None, "diagnostic": "TOUCH_V3_EVIDENCE_TOKEN_NOT_IN_POOL", "tranche_usd": tranche_usd}
+
+        # 3. Gas calculation
         _, gas_buy_usd, _ = calculate_evm_gas_cost_usd(
             gas_used=gas_used_buy,
             base_fee_wei=entry_state.base_fee_per_gas_wei,
             priority_fee_wei=entry_state.priority_fee_per_gas_wei,
             native_usd_price=entry_state.native_usd_price,
+            max_fee_per_gas_wei=entry_state.max_fee_per_gas_wei,
         )
         _, gas_sell_usd, _ = calculate_evm_gas_cost_usd(
             gas_used=gas_used_sell,
             base_fee_wei=touch_state.base_fee_per_gas_wei,
             priority_fee_wei=touch_state.priority_fee_per_gas_wei,
             native_usd_price=touch_state.native_usd_price,
+            max_fee_per_gas_wei=touch_state.max_fee_per_gas_wei,
         )
 
-        # 3. Leg 1: Entry Buy
+        # 4. Leg 1: Entry Buy
         q_in = tranche_usd / entry_state.quote_usd_price
         if entry_state.venue_type == "UNISWAP_V2":
             ev = entry_state.evidence_v2
@@ -1267,7 +1379,7 @@ class TwoLegExecutionSimulator:
         else:
             return {"status": DualTrackTargetStatus.MODELED_DEPTH_UNRESOLVED.value, "net_return_pct": None, "diagnostic": f"UNSUPPORTED_VENUE_{entry_state.venue_type}"}
 
-        # 4. Leg 2: Target Sell (selling exact tokens acquired)
+        # 5. Leg 2: Target Sell (selling exact tokens acquired)
         if touch_state.venue_type == "UNISWAP_V2":
             ev_touch = touch_state.evidence_v2
             if not ev_touch or not ev_touch.is_complete():
@@ -1364,6 +1476,7 @@ class LiquidityClassificationEngine:
             return {
                 "status": LiquidityClassificationStatus.UNRESOLVED_LIQUIDITY.value,
                 "diagnostic": "NO_LIQUIDITY_RECORDS_AVAILABLE",
+                "window_end_status": "WINDOW_END_UNRESOLVED",
                 "liquidity_end_usd_observed_unverified": None,
                 "liquidity_end_usd_authenticated_verified": None,
                 "recovery_observed_after_collapse": False,
@@ -1379,11 +1492,44 @@ class LiquidityClassificationEngine:
             return {
                 "status": LiquidityClassificationStatus.UNRESOLVED_LIQUIDITY.value,
                 "diagnostic": "INITIAL_DEPTH_NON_POSITIVE",
+                "window_end_status": "WINDOW_END_UNRESOLVED",
                 "liquidity_end_usd_observed_unverified": None,
                 "liquidity_end_usd_authenticated_verified": None,
                 "recovery_observed_after_collapse": False,
                 "recovery_confirmed_at_window_end": False,
             }
+
+        # Check window boundaries
+        t0_dt = dt.datetime.fromisoformat(initial_t0_utc.replace("Z", "+00:00"))
+        t_init_end = t0_dt + dt.timedelta(hours=0.5)
+        t_term_start = t0_dt + dt.timedelta(hours=23.5)
+        t_term_end = t0_dt + dt.timedelta(hours=24.0)
+
+        # Initial sample check: [t0, t0 + 0.5h]
+        initial_rec = None
+        for r in records:
+            r_dt = dt.datetime.fromisoformat(r.source_event_timestamp_utc.replace("Z", "+00:00"))
+            if t0_dt <= r_dt <= t_init_end:
+                initial_rec = r
+                break
+
+        # Terminal sample check: [t0 + 23.5h, t0 + 24.0h]
+        terminal_rec = None
+        for r in reversed(records):
+            r_dt = dt.datetime.fromisoformat(r.source_event_timestamp_utc.replace("Z", "+00:00"))
+            if t_term_start <= r_dt <= t_term_end:
+                terminal_rec = r
+                break
+
+        window_end_status = "WINDOW_END_RESOLVED_UNVERIFIED" if terminal_rec is not None else "WINDOW_END_UNRESOLVED"
+        liquidity_end_usd_unverified = terminal_rec.liquidity_usd if terminal_rec else None
+        liquidity_end_usd_verified = None  # Strictly None in Stage 3.2
+
+        recovery_confirmed_end = False
+        if terminal_rec:
+            r_end_depth = min(terminal_rec.d_ask_plus_2pct / initial_ask, terminal_rec.d_bid_minus_2pct / initial_bid)
+            if r_end_depth >= 0.80:
+                recovery_confirmed_end = True
 
         # Priority 1: Check for LP burn events or depth collapse (< 20% on either side)
         min_depth_ratio = 1.0
@@ -1416,31 +1562,11 @@ class LiquidityClassificationEngine:
                         recovery_observed = True
                         break
 
-        # Check terminal window [t0 + 23.5h, t0 + 24.0h]
-        t0_dt = dt.datetime.fromisoformat(initial_t0_utc.replace("Z", "+00:00"))
-        t_term_start = t0_dt + dt.timedelta(hours=23.5)
-        t_term_end = t0_dt + dt.timedelta(hours=24.0)
-
-        terminal_rec = None
-        for r in reversed(records):
-            r_dt = dt.datetime.fromisoformat(r.source_event_timestamp_utc.replace("Z", "+00:00"))
-            if t_term_start <= r_dt <= t_term_end:
-                terminal_rec = r
-                break
-
-        liquidity_end_usd_unverified = terminal_rec.liquidity_usd if terminal_rec else None
-        liquidity_end_usd_verified = None  # Strictly None in Stage 3.2
-
-        recovery_confirmed_end = False
-        if terminal_rec:
-            r_end_depth = min(terminal_rec.d_ask_plus_2pct / initial_ask, terminal_rec.d_bid_minus_2pct / initial_bid)
-            if r_end_depth >= 0.80:
-                recovery_confirmed_end = True
-
         # Priority 1: Event-level LP removal or depth collapse
         if has_lp_burn:
             return {
                 "status": LiquidityClassificationStatus.LP_WITHDRAWAL_COLLAPSE_OBSERVED_UNVERIFIED.value,
+                "window_end_status": window_end_status,
                 "min_depth_ratio": round(min_depth_ratio, 4),
                 "depth_min_timestamp_utc": depth_min_timestamp,
                 "recovery_observed_after_collapse": recovery_observed,
@@ -1452,6 +1578,7 @@ class LiquidityClassificationEngine:
         if depth_collapse_detected:
             return {
                 "status": LiquidityClassificationStatus.LIQUIDITY_DEPTH_COLLAPSE_OBSERVED_UNVERIFIED.value,
+                "window_end_status": window_end_status,
                 "min_depth_ratio": round(min_depth_ratio, 4),
                 "depth_min_timestamp_utc": depth_min_timestamp,
                 "recovery_observed_after_collapse": recovery_observed,
@@ -1460,7 +1587,31 @@ class LiquidityClassificationEngine:
                 "liquidity_end_usd_authenticated_verified": None,
             }
 
-        # Priority 2: Missing observations (gap > 6 hours)
+        # Priority 2: Missing observations & boundary coverage
+        if initial_rec is None:
+            return {
+                "status": LiquidityClassificationStatus.UNRESOLVED_LIQUIDITY.value,
+                "diagnostic": "INITIAL_SAMPLE_MISSING",
+                "window_end_status": window_end_status,
+                "min_depth_ratio": round(min_depth_ratio, 4),
+                "recovery_observed_after_collapse": False,
+                "recovery_confirmed_at_window_end": recovery_confirmed_end,
+                "liquidity_end_usd_observed_unverified": liquidity_end_usd_unverified,
+                "liquidity_end_usd_authenticated_verified": None,
+            }
+
+        if terminal_rec is None:
+            return {
+                "status": LiquidityClassificationStatus.UNRESOLVED_LIQUIDITY.value,
+                "diagnostic": "TERMINAL_SAMPLE_MISSING",
+                "window_end_status": "WINDOW_END_UNRESOLVED",
+                "min_depth_ratio": round(min_depth_ratio, 4),
+                "recovery_observed_after_collapse": False,
+                "recovery_confirmed_at_window_end": False,
+                "liquidity_end_usd_observed_unverified": None,
+                "liquidity_end_usd_authenticated_verified": None,
+            }
+
         has_gap = False
         for i in range(len(records) - 1):
             t1 = dt.datetime.fromisoformat(records[i].source_event_timestamp_utc.replace("Z", "+00:00"))
@@ -1472,8 +1623,9 @@ class LiquidityClassificationEngine:
         if has_gap:
             return {
                 "status": LiquidityClassificationStatus.UNRESOLVED_LIQUIDITY.value,
-                "min_depth_ratio": round(min_depth_ratio, 4),
                 "diagnostic": "MID_WINDOW_GAP_EXCEEDS_6_HOURS",
+                "window_end_status": window_end_status,
+                "min_depth_ratio": round(min_depth_ratio, 4),
                 "recovery_observed_after_collapse": False,
                 "recovery_confirmed_at_window_end": recovery_confirmed_end,
                 "liquidity_end_usd_observed_unverified": liquidity_end_usd_unverified,
@@ -1484,6 +1636,7 @@ class LiquidityClassificationEngine:
         if min_depth_ratio < 0.80:
             return {
                 "status": LiquidityClassificationStatus.LIQUIDITY_DEPTH_DEGRADED_OBSERVED_UNVERIFIED.value,
+                "window_end_status": window_end_status,
                 "min_depth_ratio": round(min_depth_ratio, 4),
                 "recovery_observed_after_collapse": False,
                 "recovery_confirmed_at_window_end": recovery_confirmed_end,
@@ -1500,6 +1653,7 @@ class LiquidityClassificationEngine:
 
         return {
             "status": status.value,
+            "window_end_status": window_end_status,
             "min_depth_ratio": round(min_depth_ratio, 4),
             "min_usd_ratio": round(min_usd_ratio, 4),
             "recovery_observed_after_collapse": False,

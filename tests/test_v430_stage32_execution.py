@@ -11,6 +11,7 @@ Comprehensive unit and adversarial test suite for Rocket Hunter v4.30 Stage 3.2:
 - Protected data ledger SHA-256 equivalence preservation
 """
 
+import dataclasses
 import datetime as dt
 import hashlib
 import math
@@ -228,6 +229,130 @@ class TestStage32TwoLegExecutionAndGasMath(unittest.TestCase):
         self.assertAlmostEqual(usd_cost, 12.21, places=4)
         self.assertEqual(label, "MODELED_GAS_COST_WITH_ASSUMPTIONS")
 
+    def test_eip1559_gas_calculation_with_max_fee_capped(self):
+        """AC-7: EIP-1559 effective gas price formula caps tip: baseFee + min(priorityFee, maxFee - baseFee)."""
+        gas_used = 100_000
+        base_fee_wei = 20_000_000_000     # 20 gwei
+        priority_fee_wei = 5_000_000_000  # 5 gwei
+        max_fee_wei = 23_000_000_000      # 23 gwei (caps tip to 23 - 20 = 3 gwei)
+        native_usd = 3000.0
+
+        eth_cost, usd_cost, label = calculate_evm_gas_cost_usd(
+            gas_used=gas_used,
+            base_fee_wei=base_fee_wei,
+            priority_fee_wei=priority_fee_wei,
+            native_usd_price=native_usd,
+            max_fee_per_gas_wei=max_fee_wei,
+        )
+
+        # Effective gas price = 20 gwei + min(5, 23 - 20) = 23 gwei
+        # Total cost wei = 100,000 * 23 gwei = 2,300,000 gwei = 0.0023 ETH
+        # Total cost USD = 0.0023 * $3,000 = $6.90
+        self.assertAlmostEqual(eth_cost, 0.0023, places=8)
+        self.assertAlmostEqual(usd_cost, 6.90, places=4)
+        self.assertEqual(label, "MODELED_GAS_COST_WITH_ASSUMPTIONS")
+
+    def test_simulate_roundtrip_passes_max_fee_through_both_legs(self):
+        """AC-1, AC-7: Passes max_fee_per_gas_wei through both legs and reflects capped effective gas."""
+        entry_snapshot = PoolStateSnapshot(
+            chain_id=1,
+            token_address="0x2222222222222222222222222222222222222222",
+            pool_address="0x1111111111111111111111111111111111111111",
+            block_number=19_000_000,
+            block_hash="0x" + "aa" * 32,
+            source_timestamp_utc="2026-11-15T00:00:00Z",
+            venue_type="UNISWAP_V2",
+            evidence_v2=self.entry_v2,
+            quote_usd_price=1.0,
+            native_usd_price=3000.0,
+            base_fee_per_gas_wei=10_000_000_000,     # 10 gwei
+            priority_fee_per_gas_wei=5_000_000_000,  # 5 gwei
+            max_fee_per_gas_wei=12_000_000_000,      # Capped to 12 gwei (tip=2 gwei)
+        )
+
+        touch_snapshot = PoolStateSnapshot(
+            chain_id=1,
+            token_address="0x2222222222222222222222222222222222222222",
+            pool_address="0x1111111111111111111111111111111111111111",
+            block_number=19_001_000,
+            block_hash="0x" + "bb" * 32,
+            source_timestamp_utc="2026-11-15T04:00:00Z",
+            venue_type="UNISWAP_V2",
+            evidence_v2=self.touch_v2_high,
+            quote_usd_price=1.0,
+            native_usd_price=3000.0,
+            base_fee_per_gas_wei=10_000_000_000,
+            priority_fee_per_gas_wei=5_000_000_000,
+            max_fee_per_gas_wei=13_000_000_000,      # Capped to 13 gwei (tip=3 gwei)
+        )
+
+        result = TwoLegExecutionSimulator.simulate_roundtrip(
+            entry_state=entry_snapshot,
+            touch_state=touch_snapshot,
+            tranche_usd=500.0,
+            gas_used_buy=150_000,
+            gas_used_sell=150_000,
+        )
+
+        # Expected buy gas: 150,000 * 12 gwei = 0.0018 ETH * 3000 = $5.40
+        # Expected sell gas: 150,000 * 13 gwei = 0.00195 ETH * 3000 = $5.85
+        self.assertAlmostEqual(result["gas_buy_usd"], 5.40, places=2)
+        self.assertAlmostEqual(result["gas_sell_usd"], 5.85, places=2)
+
+    def test_simulate_roundtrip_fails_closed_on_identity_and_provenance_mismatches(self):
+        """AC-1: Mismatched chain_id, token, pool, block order, or embedded evidence fails closed."""
+        base_entry = PoolStateSnapshot(
+            chain_id=1,
+            token_address="0x2222222222222222222222222222222222222222",
+            pool_address="0x1111111111111111111111111111111111111111",
+            block_number=19_000_000,
+            block_hash="0x" + "aa" * 32,
+            source_timestamp_utc="2026-11-15T00:00:00Z",
+            venue_type="UNISWAP_V2",
+            evidence_v2=self.entry_v2,
+        )
+        base_touch = PoolStateSnapshot(
+            chain_id=1,
+            token_address="0x2222222222222222222222222222222222222222",
+            pool_address="0x1111111111111111111111111111111111111111",
+            block_number=19_001_000,
+            block_hash="0x" + "bb" * 32,
+            source_timestamp_utc="2026-11-15T04:00:00Z",
+            venue_type="UNISWAP_V2",
+            evidence_v2=self.touch_v2_high,
+        )
+
+        # 1. Chain ID mismatch
+        touch_bad_chain = dataclasses.replace(base_touch, chain_id=42161)
+        res1 = TwoLegExecutionSimulator.simulate_roundtrip(base_entry, touch_bad_chain, 500.0)
+        self.assertEqual(res1["status"], DualTrackTargetStatus.MODELED_ROUNDTRIP_UNRESOLVED_STATE_MISSING.value)
+        self.assertIn("CHAIN_ID_MISMATCH", res1["diagnostic"])
+
+        # 2. Token mismatch
+        touch_bad_token = dataclasses.replace(base_touch, token_address="0x9999999999999999999999999999999999999999")
+        res2 = TwoLegExecutionSimulator.simulate_roundtrip(base_entry, touch_bad_token, 500.0)
+        self.assertEqual(res2["status"], DualTrackTargetStatus.MODELED_ROUNDTRIP_UNRESOLVED_STATE_MISSING.value)
+        self.assertIn("TOKEN_MISMATCH", res2["diagnostic"])
+
+        # 3. Pool mismatch
+        touch_bad_pool = dataclasses.replace(base_touch, pool_address="0x8888888888888888888888888888888888888888")
+        res3 = TwoLegExecutionSimulator.simulate_roundtrip(base_entry, touch_bad_pool, 500.0)
+        self.assertEqual(res3["status"], DualTrackTargetStatus.MODELED_ROUNDTRIP_UNRESOLVED_STATE_MISSING.value)
+        self.assertIn("POOL_MISMATCH", res3["diagnostic"])
+
+        # 4. Block order invalid (touch before entry)
+        touch_bad_block = dataclasses.replace(base_touch, block_number=18_999_999)
+        res4 = TwoLegExecutionSimulator.simulate_roundtrip(base_entry, touch_bad_block, 500.0)
+        self.assertEqual(res4["status"], DualTrackTargetStatus.MODELED_ROUNDTRIP_UNRESOLVED_STATE_MISSING.value)
+        self.assertIn("BLOCK_ORDER_INVALID", res4["diagnostic"])
+
+        # 5. Evidence block mismatch
+        ev_bad_block = dataclasses.replace(self.entry_v2, block_number=18_000_000)
+        entry_bad_ev = dataclasses.replace(base_entry, evidence_v2=ev_bad_block)
+        res5 = TwoLegExecutionSimulator.simulate_roundtrip(entry_bad_ev, base_touch, 500.0)
+        self.assertEqual(res5["status"], DualTrackTargetStatus.MODELED_ROUNDTRIP_UNRESOLVED_STATE_MISSING.value)
+        self.assertIn("BLOCK_PROVENANCE_MISMATCH", res5["diagnostic"])
+
     def test_solana_priority_fee_uses_limit_and_ceiling_rounding(self):
         """AC-7: Asserts Solana priority fee uses ComputeUnitLimit and rounds UP on fractional lamports."""
         base_sigs = 1
@@ -384,6 +509,82 @@ class TestUniswapV3ExactMathAndSimulation(unittest.TestCase):
 
         self.assertFalse(ok)
         self.assertEqual(diag, "MODELED_DEPTH_UNRESOLVED_BITMAP_GAP")
+
+    def test_v3_swap_insufficient_input_fails_target_attainment(self):
+        """AC-4: Swap with explicit target fails with TARGET_PRICE_NOT_REACHED when input exhausts early."""
+        spacing = 60
+        initial_tick = 50
+        initial_p = UniswapV3TickMath.get_sqrt_ratio_at_tick(initial_tick)
+        target_p = UniswapV3TickMath.get_sqrt_ratio_at_tick(350)
+
+        bitmap = {}
+        for t in [50, 100, 200, 300]:
+            w = (t // spacing) >> 8
+            bitmap[w] = 1
+
+        evidence = UniswapV3Evidence(
+            chain_id=1,
+            pool_address="0x" + "33" * 20,
+            token0_address="0x" + "11" * 20,
+            token1_address="0x" + "22" * 20,
+            token0_decimals=18,
+            token1_decimals=6,
+            fee_tier_ppm=3000,
+            sqrt_price_x96=initial_p,
+            tick=initial_tick,
+            active_liquidity=10_000_000,
+            initialized_ticks={
+                100: {"liquidityNet": 2_000_000},
+                200: {"liquidityNet": -1_000_000},
+                300: {"liquidityNet": 5_000_000},
+            },
+            tick_bitmap=bitmap,
+            block_number=19_000_000,
+            block_hash="0x" + "aa" * 32,
+            parent_hash="0x" + "00" * 32,
+        )
+
+        # Input of 10 wei is far too small to reach tick 350
+        ok, consumed, yielded, final_p, diag = UniswapV3SwapSimulator.simulate_swap(
+            evidence=evidence,
+            amount_in=10,
+            zero_for_one=False,
+            target_sqrt_price_x96=target_p,
+        )
+
+        self.assertFalse(ok)
+        self.assertEqual(diag, "TARGET_PRICE_NOT_REACHED_INSUFFICIENT_INPUT_OR_DEPTH")
+        self.assertNotEqual(final_p, target_p)
+
+    def test_v3_bidirectional_depth_incomplete_on_insufficient_input_or_depth(self):
+        """AC-8: compute_bidirectional_depth returns is_depth_complete=False when target band cannot be reached."""
+        spacing = 60
+        initial_tick = 50
+        initial_p = UniswapV3TickMath.get_sqrt_ratio_at_tick(initial_tick)
+
+        # Pool with NO liquidity above spot (liquidity = 0) and no ticks initialized above
+        bitmap = {(initial_tick // spacing) >> 8: 1}
+        evidence = UniswapV3Evidence(
+            chain_id=1,
+            pool_address="0x" + "33" * 20,
+            token0_address="0x" + "11" * 20,
+            token1_address="0x" + "22" * 20,
+            token0_decimals=18,
+            token1_decimals=6,
+            fee_tier_ppm=3000,
+            sqrt_price_x96=initial_p,
+            tick=initial_tick,
+            active_liquidity=0,  # Zero liquidity
+            initialized_ticks={},
+            tick_bitmap=bitmap,
+            block_number=19_000_000,
+            block_hash="0x" + "aa" * 32,
+            parent_hash="0x" + "00" * 32,
+        )
+
+        depth = UniswapV3SwapSimulator.compute_bidirectional_depth(evidence, token0_quote=True)
+        self.assertFalse(depth["is_depth_complete"])
+        self.assertEqual(depth["d_ask_plus_2pct"], 0)
 
 
 class TestBidirectionalDepthAndLiquidityHierarchy(unittest.TestCase):
@@ -637,8 +838,56 @@ class TestBidirectionalDepthAndLiquidityHierarchy(unittest.TestCase):
                 chain_id=1,
                 token_mint="0x" + "22" * 20,
                 pool_address="0x" + "11" * 20,
-                block_number=19_004_000,
+                block_number=19_001_000,
+                block_hash="0x" + "bb" * 32,
+                source_event_timestamp_utc="2026-11-15T05:00:00Z",
+                local_ingestion_timestamp_utc="2026-11-15T05:00:05Z",
+                d_ask_plus_2pct=98_000,
+                d_bid_minus_2pct=98_000,
+                liquidity_usd=980_000.0,
+            ),
+            LiquidityObservationRecord(
+                chain_id=1,
+                token_mint="0x" + "22" * 20,
+                pool_address="0x" + "11" * 20,
+                block_number=19_002_000,
+                block_hash="0x" + "cc" * 32,
+                source_event_timestamp_utc="2026-11-15T10:00:00Z",
+                local_ingestion_timestamp_utc="2026-11-15T10:00:05Z",
+                d_ask_plus_2pct=97_000,
+                d_bid_minus_2pct=97_000,
+                liquidity_usd=970_000.0,
+            ),
+            LiquidityObservationRecord(
+                chain_id=1,
+                token_mint="0x" + "22" * 20,
+                pool_address="0x" + "11" * 20,
+                block_number=19_003_000,
                 block_hash="0x" + "dd" * 32,
+                source_event_timestamp_utc="2026-11-15T15:00:00Z",
+                local_ingestion_timestamp_utc="2026-11-15T15:00:05Z",
+                d_ask_plus_2pct=96_000,
+                d_bid_minus_2pct=96_000,
+                liquidity_usd=960_000.0,
+            ),
+            LiquidityObservationRecord(
+                chain_id=1,
+                token_mint="0x" + "22" * 20,
+                pool_address="0x" + "11" * 20,
+                block_number=19_004_000,
+                block_hash="0x" + "ee" * 32,
+                source_event_timestamp_utc="2026-11-15T20:00:00Z",
+                local_ingestion_timestamp_utc="2026-11-15T20:00:05Z",
+                d_ask_plus_2pct=95_000,
+                d_bid_minus_2pct=95_000,
+                liquidity_usd=950_000.0,
+            ),
+            LiquidityObservationRecord(
+                chain_id=1,
+                token_mint="0x" + "22" * 20,
+                pool_address="0x" + "11" * 20,
+                block_number=19_005_000,
+                block_hash="0x" + "ff" * 32,
                 source_event_timestamp_utc="2026-11-15T23:48:00Z",  # +23.8 hours
                 local_ingestion_timestamp_utc="2026-11-15T23:48:05Z",
                 d_ask_plus_2pct=95_000,
@@ -650,7 +899,130 @@ class TestBidirectionalDepthAndLiquidityHierarchy(unittest.TestCase):
         outcome = LiquidityClassificationEngine.evaluate_liquidity_trajectory(records, t0)
         self.assertEqual(outcome["liquidity_end_usd_observed_unverified"], 950_000.0)
         self.assertIsNone(outcome["liquidity_end_usd_authenticated_verified"])
+        self.assertEqual(outcome["window_end_status"], "WINDOW_END_RESOLVED_UNVERIFIED")
         self.assertTrue(outcome["recovery_confirmed_at_window_end"])
+
+    def test_liquidity_missing_initial_sample_fails_unresolved(self):
+        """AC-9, AC-12: Trajectory missing sample in initial window [t0, t0 + 0.5h] fails to UNRESOLVED_LIQUIDITY."""
+        t0 = "2026-11-15T00:00:00Z"
+        # First sample starts at hour 2.0 (outside [t0, t0 + 0.5h])
+        records = [
+            LiquidityObservationRecord(
+                chain_id=1,
+                token_mint="0x" + "22" * 20,
+                pool_address="0x" + "11" * 20,
+                block_number=19_000_500,
+                block_hash="0x" + "aa" * 32,
+                source_event_timestamp_utc="2026-11-15T02:00:00Z",  # +2 hours late
+                local_ingestion_timestamp_utc="2026-11-15T02:00:05Z",
+                d_ask_plus_2pct=100_000,
+                d_bid_minus_2pct=100_000,
+                liquidity_usd=1_000_000.0,
+            ),
+            LiquidityObservationRecord(
+                chain_id=1,
+                token_mint="0x" + "22" * 20,
+                pool_address="0x" + "11" * 20,
+                block_number=19_004_000,
+                block_hash="0x" + "dd" * 32,
+                source_event_timestamp_utc="2026-11-15T23:48:00Z",
+                local_ingestion_timestamp_utc="2026-11-15T23:48:05Z",
+                d_ask_plus_2pct=95_000,
+                d_bid_minus_2pct=95_000,
+                liquidity_usd=950_000.0,
+            ),
+        ]
+
+        outcome = LiquidityClassificationEngine.evaluate_liquidity_trajectory(records, t0)
+        self.assertEqual(outcome["status"], LiquidityClassificationStatus.UNRESOLVED_LIQUIDITY.value)
+        self.assertEqual(outcome["diagnostic"], "INITIAL_SAMPLE_MISSING")
+
+    def test_liquidity_missing_terminal_sample_fails_unresolved(self):
+        """AC-9, AC-12: Trajectory missing terminal record in [t0 + 23.5h, t0 + 24.0h] cannot claim survival."""
+        t0 = "2026-11-15T00:00:00Z"
+        # Records with intact depth but stopping at hour 15 (no terminal record)
+        records = [
+            LiquidityObservationRecord(
+                chain_id=1,
+                token_mint="0x" + "22" * 20,
+                pool_address="0x" + "11" * 20,
+                block_number=19_000_000,
+                block_hash="0x" + "aa" * 32,
+                source_event_timestamp_utc="2026-11-15T00:00:00Z",
+                local_ingestion_timestamp_utc="2026-11-15T00:00:05Z",
+                d_ask_plus_2pct=100_000,
+                d_bid_minus_2pct=100_000,
+                liquidity_usd=1_000_000.0,
+            ),
+            LiquidityObservationRecord(
+                chain_id=1,
+                token_mint="0x" + "22" * 20,
+                pool_address="0x" + "11" * 20,
+                block_number=19_001_000,
+                block_hash="0x" + "bb" * 32,
+                source_event_timestamp_utc="2026-11-15T05:00:00Z",
+                local_ingestion_timestamp_utc="2026-11-15T05:00:05Z",
+                d_ask_plus_2pct=100_000,
+                d_bid_minus_2pct=100_000,
+                liquidity_usd=1_000_000.0,
+            ),
+            LiquidityObservationRecord(
+                chain_id=1,
+                token_mint="0x" + "22" * 20,
+                pool_address="0x" + "11" * 20,
+                block_number=19_002_000,
+                block_hash="0x" + "cc" * 32,
+                source_event_timestamp_utc="2026-11-15T10:00:00Z",
+                local_ingestion_timestamp_utc="2026-11-15T10:00:05Z",
+                d_ask_plus_2pct=100_000,
+                d_bid_minus_2pct=100_000,
+                liquidity_usd=1_000_000.0,
+            ),
+            LiquidityObservationRecord(
+                chain_id=1,
+                token_mint="0x" + "22" * 20,
+                pool_address="0x" + "11" * 20,
+                block_number=19_003_000,
+                block_hash="0x" + "dd" * 32,
+                source_event_timestamp_utc="2026-11-15T15:00:00Z",
+                local_ingestion_timestamp_utc="2026-11-15T15:00:05Z",
+                d_ask_plus_2pct=100_000,
+                d_bid_minus_2pct=100_000,
+                liquidity_usd=1_000_000.0,
+            ),
+        ]
+
+        outcome = LiquidityClassificationEngine.evaluate_liquidity_trajectory(records, t0)
+        self.assertEqual(outcome["status"], LiquidityClassificationStatus.UNRESOLVED_LIQUIDITY.value)
+        self.assertEqual(outcome["diagnostic"], "TERMINAL_SAMPLE_MISSING")
+        self.assertEqual(outcome["window_end_status"], "WINDOW_END_UNRESOLVED")
+        self.assertIsNone(outcome["liquidity_end_usd_observed_unverified"])
+
+    def test_window_end_status_returned_for_all_outcomes(self):
+        """AC-11, AC-12: Enforces window_end_status is present in collapse, degraded, and survived results."""
+        t0 = "2026-11-15T00:00:00Z"
+        empty_outcome = LiquidityClassificationEngine.evaluate_liquidity_trajectory([], t0)
+        self.assertEqual(empty_outcome["window_end_status"], "WINDOW_END_UNRESOLVED")
+
+    def test_v2_bidirectional_depth_exact_integers_large_reserves(self):
+        """AC-8: Asserts V2 depth calculations use exact integer arithmetic with zero floating-point drift."""
+        # Large reserves: 10^24 wei USDC quote (~$1T), 10^21 wei WETH
+        rq = 10**24
+        rb = 10**21
+        fee_bps = 30
+
+        depth = UniswapV2SwapSimulator.compute_bidirectional_depth(rq, rb, fee_bps)
+
+        scale = 10**18
+        expected_sqrt_102 = math.isqrt(102 * scale * scale // 100)
+        expected_d_ask = (rq * (expected_sqrt_102 - scale) * 10000) // (scale * 9970)
+        self.assertEqual(depth["d_ask_plus_2pct"], expected_d_ask)
+
+        expected_sqrt_98 = math.isqrt(98 * scale * scale // 100)
+        expected_d_bid = (rq * (scale - expected_sqrt_98)) // scale
+        self.assertEqual(depth["d_bid_minus_2pct"], expected_d_bid)
+        self.assertIsInstance(depth["d_ask_plus_2pct"], int)
+        self.assertIsInstance(depth["d_bid_minus_2pct"], int)
 
 
 class TestMultiSizeAndIdentityConstraints(unittest.TestCase):
