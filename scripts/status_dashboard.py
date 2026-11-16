@@ -429,7 +429,7 @@ def _scan_history(runs_root: Path) -> list[dict[str, Any]]:
 
         # Stale & Dead Run Auto-Resolution:
         # A scan process cannot remain IN_PROGRESS if its process has terminated or if no files
-        # have been touched in >10 minutes (maximum scanner runtime is 170 minutes).
+        # have been touched in >10 minutes (maximum scanner runtime is 180 minutes).
         if status == "IN_PROGRESS" or not finished:
             pid = None
             pid_file = run_dir / "scan-pid.txt"

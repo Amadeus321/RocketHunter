@@ -91,7 +91,7 @@ def start_scan() -> None:
     monitor_script = SCRIPTS_DIR / "monitor_scan.py"
 
     # Start scan process
-    scan_cmd = [py_exe, str(scan_script), "--outdir", str(outdir), "--max-runtime-minutes", "170"]
+    scan_cmd = [py_exe, str(scan_script), "--outdir", str(outdir), "--max-runtime-minutes", "180"]
     subprocess.Popen(scan_cmd, cwd=str(ROOT), creationflags=subprocess.CREATE_NEW_CONSOLE if os.name == "nt" else 0)
 
     # Give it 2 seconds to initialize status

@@ -140,7 +140,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--resume", action="store_true", help="reuse successful checkpoint responses that are still fresh")
     p.add_argument("--resume-max-age-seconds", type=int, default=900)
     p.add_argument("--birdeye", action="store_true", help="enable Birdeye only when BIRDEYE_API_KEY is present")
-    p.add_argument("--max-runtime-minutes", type=float, default=170.0,
+    p.add_argument("--max-runtime-minutes", type=float, default=180.0,
                    help="hard end-to-end deadline; must be <=180 minutes, with discovery stopped before finalization reserve")
     p.add_argument("--defer-completion", action="store_true",
                    help="leave status IN_PROGRESS for a workflow that has additional final pipeline stages")
@@ -243,8 +243,11 @@ def main(argv=None):
         print("Birdeye requested but BIRDEYE_API_KEY is missing; Birdeye will be skipped and logged as unavailable.",
               file=sys.stderr, flush=True)
     scan_cmd = build_scan_command(args, outdir)
-    reserve = min(30.0, max(5.0, args.max_runtime_minutes * 0.18)) * 60.0
-    scan_deadline = min(deadline - reserve, time.monotonic() + max(1.0, args.max_runtime_minutes * 0.82 * 60.0))
+    if args.defer_completion:
+        scan_deadline = deadline - 60.0  # Retain full discovery budget minus 1-minute process teardown margin
+    else:
+        reserve = min(30.0, max(5.0, args.max_runtime_minutes * 0.18)) * 60.0
+        scan_deadline = min(deadline - reserve, time.monotonic() + max(1.0, args.max_runtime_minutes * 0.82 * 60.0))
     scan_result = _run_bounded(scan_cmd, ROOT, scan_deadline)
     report_path = outdir / "rocket-hunt.json"
     if scan_result.returncode == 124:

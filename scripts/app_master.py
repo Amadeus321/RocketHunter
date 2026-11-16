@@ -601,7 +601,7 @@ def launch_new_scan() -> str:
 
     log_handle = log_file_path.open("a", encoding="utf-8")
     proc = subprocess.Popen(
-        [py_exe, str(scan_script), "--outdir", str(outdir), "--max-runtime-minutes", "170"],
+        [py_exe, str(scan_script), "--outdir", str(outdir), "--max-runtime-minutes", "180"],
         cwd=str(ROOT),
         creationflags=flags,
         stdout=log_handle,

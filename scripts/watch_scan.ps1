@@ -7,7 +7,7 @@ param(
     [string]$PythonPath,
 
     [ValidateRange(1, 180)]
-    [int]$MaxRuntimeMinutes = 170,
+    [int]$MaxRuntimeMinutes = 180,
 
     [switch]$Birdeye
 )

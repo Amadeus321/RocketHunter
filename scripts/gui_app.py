@@ -482,7 +482,7 @@ class RocketHunterGUI(tk.Tk):
 
         # Launch scanner in separate process
         subprocess.Popen(
-            [py_exe, str(scan_script), "--outdir", str(outdir), "--max-runtime-minutes", "170"],
+            [py_exe, str(scan_script), "--outdir", str(outdir), "--max-runtime-minutes", "180"],
             cwd=str(ROOT),
             creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
         )

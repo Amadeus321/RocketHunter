@@ -18,15 +18,15 @@ from datetime import datetime, timezone
 from typing import Any
 
 HARD_MAX_RUNTIME_MINUTES = 180.0
-DEFAULT_LOCAL_TARGET_MINUTES = 170.0
-SAFETY_RESERVE_MINUTES = 10.0
+DEFAULT_LOCAL_TARGET_MINUTES = 180.0
+SAFETY_RESERVE_MINUTES = 5.0
 
 DEFAULT_PHASE_ALLOCATIONS = {
-    "preflight_and_registries": 5.0,
-    "global_multichain_discovery": 100.0,
-    "candidate_enrichment": 20.0,
-    "deep_verification_safety": 30.0,
-    "finalization_and_reports": 15.0,
+    "preflight_and_registries": 3.0,
+    "global_multichain_discovery": 120.0,
+    "candidate_enrichment": 12.0,
+    "deep_verification_safety": 35.0,
+    "finalization_and_reports": 5.0,
 }
 
 

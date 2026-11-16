@@ -455,7 +455,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--outdir", type=Path, required=True, help="unique output directory for this run")
     p.add_argument("--memory-dir", type=Path, default=DEFAULT_MEMORY, help="persistent local learning memory")
-    p.add_argument("--max-runtime-minutes", type=float, default=170,
+    p.add_argument("--max-runtime-minutes", type=float, default=180.0,
                    help="whole local run deadline; maximum 180 minutes")
     p.add_argument("--gecko-pages", type=int, default=3,
                    help="GeckoTerminal pages per list (1-3; default 3)")
@@ -547,7 +547,7 @@ def main(argv: list[str] | None = None) -> int:
         disc_allowance = budget_mgr.start_phase("global_multichain_discovery")
         # Discovery must leave at least 25 minutes for enrichment, verification, and finalization
         disc_deadline = min(deadline - (25.0 * 60.0), time.monotonic() + disc_allowance)
-        base_budget = max(1.0, min(150.0, disc_allowance / 60.0))
+        base_budget = max(1.0, min(175.0, disc_allowance / 60.0))
         cmds = [build_scan_command(args, outdir, base_budget)]
         state["unified_budget"] = budget_mgr.get_summary()
         status_path.write_text(json.dumps(state, indent=2) + "\n", encoding="utf-8")
@@ -557,7 +557,7 @@ def main(argv: list[str] | None = None) -> int:
         budget_mgr.end_phase("global_multichain_discovery")
 
         enrich_allowance = budget_mgr.start_phase("candidate_enrichment")
-        enrich_deadline = min(deadline - (20.0 * 60.0), time.monotonic() + enrich_allowance)
+        enrich_deadline = min(deadline - (40.0 * 60.0), time.monotonic() + enrich_allowance)
         state["unified_budget"] = budget_mgr.get_summary()
         status_path.write_text(json.dumps(state, indent=2) + "\n", encoding="utf-8")
 
@@ -577,7 +577,7 @@ def main(argv: list[str] | None = None) -> int:
         budget_mgr.end_phase("candidate_enrichment")
 
         deep_allowance = budget_mgr.start_phase("deep_verification_safety")
-        deep_deadline = min(deadline - (12.0 * 60.0), time.monotonic() + deep_allowance)
+        deep_deadline = min(deadline - (5.0 * 60.0), time.monotonic() + deep_allowance)
         state["unified_budget"] = budget_mgr.get_summary()
         status_path.write_text(json.dumps(state, indent=2) + "\n", encoding="utf-8")
 

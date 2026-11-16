@@ -238,13 +238,13 @@ class LocalRunMemoryTests(unittest.TestCase):
     def test_local_scan_base_budget_aligned_with_discovery_allowance(self):
         """Verifies that run_local_scan calculates discovery base budget from UnifiedBudgetManager allowance."""
         from scripts.unified_budget_manager import UnifiedBudgetManager
-        mgr = UnifiedBudgetManager(170.0)
+        mgr = UnifiedBudgetManager(180.0)
         mgr.start_phase("preflight_and_registries")
         disc_allowance = mgr.start_phase("global_multichain_discovery")
-        base_budget = max(1.0, min(150.0, disc_allowance / 60.0))
-        # Total usable budget is 160 minutes; downstream phases reserve 61.18m, leaving ~98.82m for discovery
-        self.assertAlmostEqual(base_budget, 98.82, delta=1.0)
-        self.assertLessEqual(base_budget, 100.0)
+        base_budget = max(1.0, min(175.0, disc_allowance / 60.0))
+        # Total usable budget is 175 minutes (180m total - 5m reserve); downstream phases reserve 52m, leaving 120-123m for discovery
+        self.assertAlmostEqual(base_budget, 123.0, delta=1.0)
+        self.assertGreaterEqual(base_budget, 120.0)
 
 
 if __name__ == "__main__":
