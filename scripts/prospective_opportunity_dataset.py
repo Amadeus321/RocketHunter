@@ -15,6 +15,8 @@ import math
 import os
 from pathlib import Path
 import time
+from collections.abc import Mapping
+from types import MappingProxyType
 from typing import Any
 
 try:
@@ -43,6 +45,44 @@ def _clean_str(val: Any) -> str | None:
     return s if s else None
 
 
+class _FrozenList(list):
+    def _immutable(self, *_args, **_kwargs):
+        raise TypeError("prospective evidence snapshots are immutable")
+
+    __setitem__ = _immutable
+    __delitem__ = _immutable
+    __iadd__ = _immutable
+    __imul__ = _immutable
+    append = _immutable
+    clear = _immutable
+    extend = _immutable
+    insert = _immutable
+    pop = _immutable
+    remove = _immutable
+    reverse = _immutable
+    sort = _immutable
+
+
+def _freeze(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        return MappingProxyType({key: _freeze(item) for key, item in value.items()})
+    if isinstance(value, (list, tuple)):
+        return _FrozenList(_freeze(item) for item in value)
+    if isinstance(value, (set, frozenset)):
+        return frozenset(_freeze(item) for item in value)
+    return value
+
+
+def _plain(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        return {key: _plain(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_plain(item) for item in value]
+    if isinstance(value, (set, frozenset)):
+        return sorted((_plain(item) for item in value), key=repr)
+    return value
+
+
 class ProspectiveOpportunityDataset:
     """Manages immutable prospective opportunity snapshots across candidate discovery."""
 
@@ -59,6 +99,8 @@ class ProspectiveOpportunityDataset:
     ) -> dict[str, Any]:
         """Capture an immutable 22-field observation-time prospective snapshot."""
         now = snapshot_time or dt.datetime.now(dt.timezone.utc)
+        if now.tzinfo is None:
+            raise ValueError("snapshot_time must be timezone-aware")
         snapshot_utc = now.isoformat(timespec="seconds").replace("+00:00", "Z")
 
         chain = _clean_str(candidate.get("chain")) or "unknown"
@@ -178,6 +220,30 @@ class ProspectiveOpportunityDataset:
 
         # 18. Local retrieval timestamp
         local_retrieval_utc = candidate.get("retrieved_utc") or snapshot_utc
+        coverage_pct = _clean_num(candidate.get("evidence_coverage_pct"))
+        retrieval_dt = None
+        try:
+            retrieval_dt = dt.datetime.fromisoformat(str(local_retrieval_utc).replace("Z", "+00:00"))
+            if retrieval_dt.tzinfo is None:
+                retrieval_dt = None
+        except (TypeError, ValueError):
+            retrieval_dt = None
+        freshness_pct = None
+        if retrieval_dt is not None:
+            age_seconds = (now.astimezone(dt.timezone.utc) - retrieval_dt.astimezone(dt.timezone.utc)).total_seconds()
+            freshness_pct = 100.0 if 0.0 <= age_seconds <= 3600.0 else 0.0
+        measurement_completeness = (
+            round(coverage_pct * freshness_pct / 100.0, 2)
+            if coverage_pct is not None and 0.0 <= coverage_pct <= 100.0 and freshness_pct is not None
+            else None
+        )
+        provenance_metadata_present = bool(
+            _clean_str(candidate.get("source") or candidate.get("provider"))
+            and _clean_str(candidate.get("source_url") or candidate.get("source_ref"))
+            and _clean_str(candidate.get("source_timestamp_utc") or candidate.get("dexpaprika_provider_timestamp"))
+            and _clean_str(candidate.get("retrieved_utc"))
+            and _clean_str(candidate.get("response_content_hash") or candidate.get("content_hash"))
+        )
 
         # 19. Scanner version
         # 20. Configuration fingerprint
@@ -214,6 +280,12 @@ class ProspectiveOpportunityDataset:
             "lp_and_wallet_evidence_status": lp_wallet_status,
             "source_provider_timestamps": source_provider_timestamps,
             "local_retrieval_timestamp_utc": local_retrieval_utc,
+            "measurement_completeness_pct": measurement_completeness,
+            "measurement_completeness_semantics": "Coverage multiplied by 60-minute retrieval freshness; not predictive confidence.",
+            "source_provenance_status": (
+                "ATTRIBUTED_INTEGRITY_METADATA_PRESENT" if provenance_metadata_present else "MISSING_OR_INCOMPLETE"
+            ),
+            "blockchain_cryptographic_authentication_status": "UNVERIFIED",
             "scanner_version": scanner_version,
             "configuration_fingerprint": configuration_fingerprint,
             "signal_score_and_components": signal_data,
@@ -227,19 +299,38 @@ class ProspectiveOpportunityDataset:
             if k not in {"raw_source_evidence"} and not str(k).startswith("_")
         }
 
-        return {
+        deterministic_measurements = {
+            key: value for key, value in normalized_data.items()
+            if key not in {
+                "source_provider_timestamps", "local_retrieval_timestamp_utc",
+                "scanner_version", "configuration_fingerprint",
+            }
+        }
+        measurement_fingerprint = hashlib.sha256(
+            json.dumps(deterministic_measurements, sort_keys=True, separators=(",", ":"), allow_nan=False).encode("utf-8")
+        ).hexdigest()
+
+        return _freeze({
             "schema": PROSPECTIVE_SCHEMA,
             "schema_version": PROSPECTIVE_DATASET_VERSION,
             "snapshot_id": snapshot_id,
             "run_id": str(run_id),
             "snapshot_utc": snapshot_utc,
+            "measurement_fingerprint": measurement_fingerprint,
+            "fingerprint_scope": "Deterministic normalized measurements only; decision/run timestamps are separate metadata.",
             "market_key": market_key,
             "identity": candidate.get("identity") or f"dex:{chain}:{token_contract}",
             "is_rejected_candidate": qualification_status != "QUALIFIED",
             "qualification_status": qualification_status,
+            "run_metadata": {
+                "run_id": str(run_id),
+                "snapshot_utc": snapshot_utc,
+                "scanner_version": scanner_version,
+                "configuration_fingerprint": configuration_fingerprint,
+            },
             "normalized_record": normalized_data,
             "raw_source_evidence": raw_source_evidence,
-        }
+        })
 
     @staticmethod
     def append_snapshots(
@@ -297,7 +388,7 @@ class ProspectiveOpportunityDataset:
                 else:
                     if sid:
                         seen_ids.add(sid)
-                    line_str = json.dumps(snapshot, sort_keys=True, separators=(",", ":"), allow_nan=False)
+                    line_str = json.dumps(_plain(snapshot), sort_keys=True, separators=(",", ":"), allow_nan=False)
                     unique_to_append.append(line_str)
 
             if unique_to_append:

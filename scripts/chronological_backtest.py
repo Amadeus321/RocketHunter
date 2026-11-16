@@ -18,6 +18,7 @@ import hashlib
 import json
 import math
 from pathlib import Path
+from collections.abc import Mapping
 from typing import Any
 from urllib.parse import urlparse
 
@@ -86,6 +87,52 @@ CANDLE_INTERVAL_SECONDS = {
     "4h": 14400,
     "1d": 86400,
 }
+OUTCOME_HORIZON_SECONDS = 24 * 60 * 60
+MAX_SOURCE_RETRIEVAL_LAG_SECONDS = 15 * 60
+
+
+class _FrozenEvidence(dict):
+    def __init__(self, value: Mapping[str, Any]):
+        dict.__init__(self, {key: _freeze_evidence(item) for key, item in value.items()})
+
+    def _immutable(self, *_args, **_kwargs):
+        raise TypeError("backtest evidence records are immutable")
+
+    __setitem__ = _immutable
+    __delitem__ = _immutable
+    clear = _immutable
+    pop = _immutable
+    popitem = _immutable
+    setdefault = _immutable
+    update = _immutable
+
+
+class _FrozenEvidenceList(list):
+    def _immutable(self, *_args, **_kwargs):
+        raise TypeError("backtest evidence records are immutable")
+
+    __setitem__ = _immutable
+    __delitem__ = _immutable
+    __iadd__ = _immutable
+    __imul__ = _immutable
+    append = _immutable
+    clear = _immutable
+    extend = _immutable
+    insert = _immutable
+    pop = _immutable
+    remove = _immutable
+    reverse = _immutable
+    sort = _immutable
+
+
+def _freeze_evidence(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        return _FrozenEvidence(value)
+    if isinstance(value, (list, tuple)):
+        return _FrozenEvidenceList(_freeze_evidence(item) for item in value)
+    if isinstance(value, (set, frozenset)):
+        return frozenset(_freeze_evidence(item) for item in value)
+    return value
 
 CANDLE_TRACE_SCHEMA = {
     "required_fields": [
@@ -359,7 +406,7 @@ class ChronologicalBacktestEvaluator:
     """Evaluates predictive models using chronological walk-forward out-of-sample windows."""
 
     def __init__(self, records: list[dict[str, Any]], *, config_fingerprint: str = "default"):
-        self.records = records or []
+        self.records = tuple(_freeze_evidence(record) for record in (records or []))
         self.config_fingerprint = config_fingerprint
         self.diagnostics: dict[str, Any] = {
             "total_historical_records": len(self.records),
@@ -1121,7 +1168,7 @@ class ChronologicalBacktestEvaluator:
         # A trace containing only metadata and a claimed 24h end timestamp must NEVER qualify as verified evidence.
         # Self-reported coverage percentage is never trusted without actual candles.
         raw_candles = trace.get("candles")
-        if not isinstance(raw_candles, list) or len(raw_candles) == 0:
+        if not isinstance(raw_candles, (list, tuple)) or len(raw_candles) == 0:
             self.diagnostics["unresolved_outcomes"] += 1
             return False, {
                 "outcome_classification": "INCOMPLETE_OBSERVATION",
@@ -1139,6 +1186,7 @@ class ChronologicalBacktestEvaluator:
         # 8. Parse and Validate Every Individual Candle
         parsed_candles: list[dict[str, Any]] = []
         seen_timestamps: set[dt.datetime] = set()
+        previous_candle_dt: dt.datetime | None = None
 
         for idx, c in enumerate(raw_candles):
             if not isinstance(c, dict):
@@ -1221,6 +1269,21 @@ class ChronologicalBacktestEvaluator:
                     "execution_net_return_pct": None,
                 }, None
             seen_timestamps.add(c_dt)
+            if previous_candle_dt is not None and c_dt < previous_candle_dt:
+                self.diagnostics["unresolved_outcomes"] += 1
+                return False, {
+                    "outcome_classification": "OUT_OF_ORDER_CANDLE_TIMESTAMP",
+                    "target_reached": None,
+                    "market_target_reached": None,
+                    "mfe_pct": mfe_pct,
+                    "mae_pct": None,
+                    "hours_to_target": None,
+                    "is_evaluated": False,
+                    "resolution_reason": f"OUT_OF_ORDER_CANDLE_TIMESTAMP: candle at index {idx} precedes the prior observation",
+                    "execution_status": exec_status,
+                    "execution_net_return_pct": None,
+                }, None
+            previous_candle_dt = c_dt
 
             # Check required OHLC fields existence: open, high, low, close
             ohlc_fields = [("open", ("open", "o")), ("high", ("high", "h")), ("low", ("low", "l")), ("close", ("close", "c"))]
@@ -1319,10 +1382,75 @@ class ChronologicalBacktestEvaluator:
                 "raw": c,
             })
 
-        # 9. Chronological Sorting
-        sorted_candles = sorted(parsed_candles, key=lambda x: x["dt"])
+        # 9. Preserve and require source order; never repair malformed evidence by sorting it.
+        sorted_candles = parsed_candles
 
-        # 10. Validate Spacing and Gap Detection
+        # 10. Enforce exact trace boundaries and source freshness.
+        horizon_end_dt = detection_dt + dt.timedelta(seconds=OUTCOME_HORIZON_SECONDS)
+        if abs((trace_start_dt - detection_dt).total_seconds()) > 1.0:
+            self.diagnostics["unresolved_outcomes"] += 1
+            return False, {
+                "outcome_classification": "INCOMPLETE_OBSERVATION",
+                "target_reached": None,
+                "market_target_reached": None,
+                "mfe_pct": mfe_pct,
+                "mae_pct": None,
+                "hours_to_target": None,
+                "is_evaluated": False,
+                "resolution_reason": "TRACE_START_MISMATCH: trace start must equal the timezone-aware detection timestamp",
+                "execution_status": exec_status,
+                "execution_net_return_pct": None,
+            }, None
+        if trace_end_dt < horizon_end_dt - dt.timedelta(seconds=1):
+            self.diagnostics["unresolved_outcomes"] += 1
+            return False, {
+                "outcome_classification": "INCOMPLETE_OBSERVATION",
+                "target_reached": None,
+                "market_target_reached": None,
+                "mfe_pct": mfe_pct,
+                "mae_pct": None,
+                "hours_to_target": None,
+                "is_evaluated": False,
+                "resolution_reason": "PARTIAL_OBSERVATION_WINDOW: trace ends before the exact 24-hour as-of boundary",
+                "execution_status": exec_status,
+                "execution_net_return_pct": None,
+            }, None
+        if trace_end_dt > horizon_end_dt + dt.timedelta(seconds=1):
+            self.diagnostics["unresolved_outcomes"] += 1
+            return False, {
+                "outcome_classification": "INCOMPLETE_OBSERVATION",
+                "target_reached": None,
+                "market_target_reached": None,
+                "mfe_pct": mfe_pct,
+                "mae_pct": None,
+                "hours_to_target": None,
+                "is_evaluated": False,
+                "resolution_reason": "TRACE_END_MISMATCH: trace end exceeds the exact 24-hour as-of boundary",
+                "execution_status": exec_status,
+                "execution_net_return_pct": None,
+            }, None
+        if retrieved_dt < trace_end_dt or (retrieved_dt - trace_end_dt).total_seconds() > MAX_SOURCE_RETRIEVAL_LAG_SECONDS:
+            self.diagnostics["unresolved_outcomes"] += 1
+            return False, {
+                "outcome_classification": "STALE_CANDLE_OBSERVATION",
+                "target_reached": None,
+                "market_target_reached": None,
+                "mfe_pct": mfe_pct,
+                "mae_pct": None,
+                "hours_to_target": None,
+                "is_evaluated": False,
+                "resolution_reason": "STALE_CANDLE_OBSERVATION: source retrieval must occur within 15 minutes after the 24-hour as-of boundary",
+                "execution_status": exec_status,
+                "execution_net_return_pct": None,
+            }, None
+        expected_count = OUTCOME_HORIZON_SECONDS // step_seconds
+        expected_candle_times = [
+            detection_dt + dt.timedelta(seconds=step_seconds * index)
+            for index in range(1, expected_count + 1)
+        ]
+        observed_candle_times = [candle["dt"] for candle in sorted_candles]
+
+        # 11. Validate Spacing and Gap Detection
         for i in range(len(sorted_candles) - 1):
             delta_s = (sorted_candles[i + 1]["dt"] - sorted_candles[i]["dt"]).total_seconds()
             if delta_s < step_seconds * 0.5:
@@ -1353,7 +1481,8 @@ class ChronologicalBacktestEvaluator:
                     "hours_to_target": None,
                     "is_evaluated": False,
                     "resolution_reason": (
-                        f"CANDLE_GAP_DETECTED: gap of {delta_s}s between {sorted_candles[i]['dt']} and "
+                        f"CANDLE_GAP_DETECTED: observed {len(observed_candle_times)} of {expected_count} "
+                        f"configured {candle_interval} observations; gap of {delta_s}s between {sorted_candles[i]['dt']} and "
                         f"{sorted_candles[i + 1]['dt']} exceeds declared {step_seconds}s interval"
                     ),
                     "execution_status": exec_status,
@@ -1382,7 +1511,31 @@ class ChronologicalBacktestEvaluator:
                 "execution_net_return_pct": None,
             }, None
 
-        # 11. Observation Window Coverage & Trace Metadata Agreement
+        # Missing expected samples cannot shrink the denominator to the supplied
+        # candle count; only the configured interval over the full horizon counts.
+        if observed_candle_times != expected_candle_times:
+            self.diagnostics["unresolved_outcomes"] += 1
+            stale_final = bool(observed_candle_times and observed_candle_times[-1] < expected_candle_times[-1])
+            reason = (
+                f"CANDLE_COVERAGE_INCOMPLETE: observed {len(observed_candle_times)} of "
+                f"{expected_count} configured {candle_interval} observations in the 24-hour window"
+            )
+            if stale_final:
+                reason += "; TRACE_END_MISMATCH: STALE_FINAL_CANDLE ends before the as-of boundary"
+            return False, {
+                "outcome_classification": "INCOMPLETE_OBSERVATION",
+                "target_reached": None,
+                "market_target_reached": None,
+                "mfe_pct": mfe_pct,
+                "mae_pct": None,
+                "hours_to_target": None,
+                "is_evaluated": False,
+                "resolution_reason": reason,
+                "execution_status": exec_status,
+                "execution_net_return_pct": None,
+            }, None
+
+        # 12. Observation Window Coverage & Trace Metadata Agreement
         first_candle_dt = sorted_candles[0]["dt"]
         last_candle_dt = sorted_candles[-1]["dt"]
         candle_boundary_tolerance_s = max(60.0, step_seconds * 1.5)
@@ -1471,7 +1624,7 @@ class ChronologicalBacktestEvaluator:
                 "execution_net_return_pct": None,
             }, None
 
-        # 12. For TARGET_NOT_REACHED: Enforce full 24-hour observation coverage
+        # 13. For TARGET_NOT_REACHED: Enforce full 24-hour observation coverage
         if outcome_status == "TARGET_NOT_REACHED":
             elapsed_trace_hours = (trace_end_dt - detection_dt).total_seconds() / 3600.0
             if elapsed_trace_hours < 24.0:
@@ -1510,7 +1663,7 @@ class ChronologicalBacktestEvaluator:
                     "execution_net_return_pct": None,
                 }, None
 
-        # 13. Verifiable Source-Response Evidence Reconciliation & Metadata Validation (Fail-Closed)
+        # 14. Source-Response Evidence Reconciliation & Metadata Validation (Fail-Closed)
         captured_resp = (
             trace.get("captured_response")
             or trace.get("response_evidence")
@@ -1846,6 +1999,51 @@ class ChronologicalBacktestEvaluator:
                 "execution_net_return_pct": None,
             }, None
 
+        if isinstance(parsed_body, dict):
+            payload_provider = normalize_trace_provider(parsed_body.get("provider"))
+            if payload_provider != norm_prov:
+                self.diagnostics["unresolved_outcomes"] += 1
+                return False, {
+                    "outcome_classification": "RESPONSE_PROVIDER_MISMATCH",
+                    "target_reached": None,
+                    "market_target_reached": None,
+                    "mfe_pct": mfe_pct,
+                    "mae_pct": None,
+                    "hours_to_target": None,
+                    "is_evaluated": False,
+                    "resolution_reason": "RESPONSE_PROVIDER_MISMATCH: captured response must identify the same recognized provider as the trace",
+                    "execution_status": exec_status,
+                    "execution_net_return_pct": None,
+                }, None
+            if str(parsed_body.get("market_key") or "").strip() != trace_mkey:
+                self.diagnostics["unresolved_outcomes"] += 1
+                return False, {
+                    "outcome_classification": "RESPONSE_MARKET_IDENTITY_MISMATCH",
+                    "target_reached": None,
+                    "market_target_reached": None,
+                    "mfe_pct": mfe_pct,
+                    "mae_pct": None,
+                    "hours_to_target": None,
+                    "is_evaluated": False,
+                    "resolution_reason": "RESPONSE_MARKET_IDENTITY_MISMATCH: captured response must identify the exact trace market",
+                    "execution_status": exec_status,
+                    "execution_net_return_pct": None,
+                }, None
+            if str(parsed_body.get("candle_interval") or "").strip().lower() != candle_interval:
+                self.diagnostics["unresolved_outcomes"] += 1
+                return False, {
+                    "outcome_classification": "RESPONSE_INTERVAL_MISMATCH",
+                    "target_reached": None,
+                    "market_target_reached": None,
+                    "mfe_pct": mfe_pct,
+                    "mae_pct": None,
+                    "hours_to_target": None,
+                    "is_evaluated": False,
+                    "resolution_reason": "RESPONSE_INTERVAL_MISMATCH: captured response interval differs from the declared interval",
+                    "execution_status": exec_status,
+                    "execution_net_return_pct": None,
+                }, None
+
         # Reconcile parsed response candles against sorted candles
         parsed_resp_candles = []
         for rc in resp_candles_raw:
@@ -2058,8 +2256,12 @@ class ChronologicalBacktestEvaluator:
             "derived_touch_hours": derived_touch_hours,
             "derived_touch_dt": derived_touch_dt,
             "candles_count": len(sorted_candles),
+            "expected_candles_count": expected_count,
+            "observation_coverage_pct": 100.0,
             "sorted_candles": sorted_candles,
             "provider": norm_prov,
+            "provenance_status": "PROVIDER_ATTRIBUTED_HASH_RECONCILED",
+            "blockchain_authentication_status": "NOT_ESTABLISHED",
             "source_ref": source_ref,
             "source_domain": source_domain,
             "request_url": resp_url,
@@ -2390,6 +2592,11 @@ class ChronologicalBacktestEvaluator:
         self.diagnostics["successfully_matched_outcomes"] += 1
         evidence_audit = {
             "evidence_level": "PROVIDER_ATTRIBUTED_INGESTION_AUDITED",
+            "provenance_status": trace_info.get("provenance_status") if trace_info else "MISSING",
+            "observation_quality_status": "COMPLETE_FIXED_GRID" if trace_info else "UNAVAILABLE",
+            "observation_coverage_pct": trace_info.get("observation_coverage_pct") if trace_info else None,
+            "expected_candle_count": trace_info.get("expected_candles_count") if trace_info else None,
+            "blockchain_authentication_status": trace_info.get("blockchain_authentication_status") if trace_info else "NOT_ESTABLISHED",
             "provider": trace_info.get("provider") if trace_info else None,
             "source_ref": trace_info.get("source_ref") if trace_info else None,
             "source_domain": trace_info.get("source_domain") if trace_info else None,
@@ -2419,6 +2626,8 @@ class ChronologicalBacktestEvaluator:
             "execution_status": exec_status,
             "execution_net_return_pct": exec_net_return,
             "evidence_audit": evidence_audit,
+            "observation_completeness_pct": 100.0,
+            "observation_completeness_semantics": "Complete fixed-grid coverage and fresh retrieval only; not predictive confidence.",
         }
 
     def _calculate_metrics(self, evaluations: list[dict[str, Any]]) -> dict[str, Any]:

@@ -84,6 +84,36 @@ class TestProspectiveOpportunityDataset:
         assert "raw_source_evidence" in snapshot
         assert snapshot["raw_source_evidence"]["contract_address"] == candidate["contract_address"]
 
+    def test_snapshot_is_deeply_immutable_and_measurement_hash_excludes_run_times(self):
+        candidate = {
+            "chain": "solana",
+            "contract_address": "MintImmutable111",
+            "pool_address": "PoolImmutable111",
+            "breakout_engine_scores": {"engine_1_momentum_acceleration": 42.0},
+            "risk_flags": ["WATCH"],
+        }
+        snapshot_time = dt.datetime(2026, 11, 13, 14, 0, tzinfo=dt.timezone.utc)
+        first = ProspectiveOpportunityDataset.create_snapshot(
+            candidate, run_id="run-a", scanner_version="v4.30.0",
+            configuration_fingerprint="fp-a", qualification_status="QUALIFIED",
+            snapshot_time=snapshot_time,
+        )
+        second = ProspectiveOpportunityDataset.create_snapshot(
+            candidate, run_id="run-b", scanner_version="v4.30.0",
+            configuration_fingerprint="fp-b", qualification_status="QUALIFIED",
+            snapshot_time=snapshot_time + dt.timedelta(minutes=1),
+        )
+
+        assert first["measurement_fingerprint"] == second["measurement_fingerprint"]
+        assert first["snapshot_id"] != second["snapshot_id"]
+        with pytest.raises(TypeError):
+            first["normalized_record"]["breakout_engines"]["engine_scores"]["engine_1_momentum_acceleration"] = 99
+        with pytest.raises(TypeError):
+            first["normalized_record"]["signal_score_and_components"]["risk_flags"].append("MUTATED")
+        candidate["breakout_engine_scores"]["engine_1_momentum_acceleration"] = 99
+        assert first["normalized_record"]["breakout_engines"]["engine_scores"]["engine_1_momentum_acceleration"] == 42.0
+        assert first["normalized_record"]["blockchain_cryptographic_authentication_status"] == "UNVERIFIED"
+
     def test_rejected_candidate_preserved_without_selection_bias(self, tmp_path):
         rejected_candidate = {
             "chain": "base",

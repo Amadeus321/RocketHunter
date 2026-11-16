@@ -29,6 +29,19 @@ if str(ROOT) not in sys.path:
 DEFAULT_MEMORY = ROOT / "rocket-hunter-data" / "scanner-memory"
 
 
+class _FrozenDict(dict):
+    def _immutable(self, *_args, **_kwargs):
+        raise TypeError("run configuration is immutable after fingerprint generation")
+
+    __setitem__ = _immutable
+    __delitem__ = _immutable
+    clear = _immutable
+    pop = _immutable
+    popitem = _immutable
+    setdefault = _immutable
+    update = _immutable
+
+
 def utc_now() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
@@ -144,13 +157,15 @@ def build_run_metadata(args: argparse.Namespace) -> dict:
         "dex_lookup_limit": 160,
     }
     fingerprint_input = json.dumps(configuration, sort_keys=True, separators=(",", ":"))
+    implementation_fingerprint = _project_fingerprint()
     return {
         "scanner_version": (ROOT / "VERSION").read_text(encoding="utf-8").strip(),
         "python_runtime_version": platform.python_version(),
         "configuration_fingerprint": hashlib.sha256(
-            fingerprint_input.encode("utf-8")
+            (implementation_fingerprint + "|" + fingerprint_input).encode("utf-8")
         ).hexdigest(),
-        "local_configuration": configuration,
+        "implementation_fingerprint": implementation_fingerprint,
+        "local_configuration": _FrozenDict(configuration),
     }
 
 

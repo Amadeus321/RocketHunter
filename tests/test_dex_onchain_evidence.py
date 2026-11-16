@@ -379,10 +379,39 @@ class OnchainEvidenceTests(unittest.TestCase):
         finally:
             evidence._rpc_post = original_rpc
             evidence._solana_rpc = original_url
-        self.assertEqual(result["status"], "VERIFIED")
-        self.assertEqual(result["control_type"], "LOCKED")
-        self.assertAlmostEqual(result["locked_pct"], 95.0)
-        self.assertIn("not burned", result["note"])
+        self.assertEqual(result["status"], "UNVERIFIED")
+        self.assertEqual(result["control_type"], "UNVERIFIED")
+        self.assertAlmostEqual(result["observed_incinerator_share_pct"], 95.0)
+        self.assertEqual(result["evidence_assurance"], "RPC_OBSERVATION_ONLY")
+
+    def test_solana_system_program_is_not_classified_as_a_dead_or_locked_lp_address(self):
+        original_rpc = evidence._rpc_post
+        original_url = evidence._solana_rpc
+
+        def fake_rpc(url, method, params, timeout):
+            if method == "getTokenSupply":
+                return {"value": {"amount": "1000"}}, {"ok": True}
+            if method == "getTokenLargestAccounts":
+                return {"value": [{"address": "LPAccount111"}]}, {"ok": True}
+            if method == "getMultipleAccounts":
+                return {"value": [{
+                    "data": {"parsed": {"info": {
+                        "owner": "11111111111111111111111111111111",
+                        "mint": "LpMint111",
+                        "tokenAmount": {"amount": "1000"},
+                    }}}
+                }]}, {"ok": True}
+            raise AssertionError("Unexpected RPC method " + method)
+
+        try:
+            evidence._solana_rpc = lambda timeout=8: "mock-rpc"
+            evidence._rpc_post = fake_rpc
+            result = evidence._solana_lp_lock_share("Pool111", "LpMint111", timeout=1)
+        finally:
+            evidence._rpc_post = original_rpc
+            evidence._solana_rpc = original_url
+        self.assertEqual(result["status"], "UNVERIFIED")
+        self.assertNotIn("observed_incinerator_share_pct", result)
 
     def test_evm_pool_identity_requires_exact_token_to_be_one_of_pool_tokens(self):
         original = evidence._eth_call
@@ -417,10 +446,10 @@ class OnchainEvidenceTests(unittest.TestCase):
             result = evidence._evm_lp_lock_share(POOL, "ethereum", timeout=1)
         finally:
             evidence._eth_call = original
-        self.assertEqual(result["status"], "VERIFIED")
-        self.assertEqual(result["control_type"], "LOCKED")
-        self.assertAlmostEqual(result["locked_pct"], 95.0)
-        self.assertIn("not burned", result["note"])
+        self.assertEqual(result["status"], "UNVERIFIED")
+        self.assertEqual(result["control_type"], "UNVERIFIED")
+        self.assertAlmostEqual(result["observed_burn_address_share_pct"], 95.0)
+        self.assertEqual(result["evidence_assurance"], "RPC_OBSERVATION_ONLY")
 
     def test_unsupported_chain_never_fabricates_verified_wallet_or_lp_data(self):
         result = evidence.enrich_candidate({

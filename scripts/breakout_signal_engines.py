@@ -15,9 +15,23 @@ Evaluates acceleration and behavioral anomalies rather than raw historical gains
 from __future__ import annotations
 
 import math
+from collections.abc import Mapping
+from datetime import datetime, timezone
+from types import MappingProxyType
 from typing import Any
 
 BREAKOUT_SYSTEM_VERSION = "4.30.0"
+MOMENTUM_NORMALIZATION_VERSION = "momentum-v2"
+MOMENTUM_VELOCITY_SATURATION_PCT_PER_HOUR = 25.0
+MOMENTUM_ACCELERATION_SATURATION_PCT_PER_HOUR_SQUARED = 100.0
+MAX_MEASUREMENT_RETRIEVAL_AGE_SECONDS = 60 * 60
+# Canonical field_provenance envelope: provider, field, value, market_identity
+# (chain/token_mint/pool_address), source_timestamp_utc, and retrieved_utc.
+if not all(math.isfinite(scale) and scale > 0.0 for scale in (
+    MOMENTUM_VELOCITY_SATURATION_PCT_PER_HOUR,
+    MOMENTUM_ACCELERATION_SATURATION_PCT_PER_HOUR_SQUARED,
+)):
+    raise ValueError("momentum normalization scales must be finite and positive")
 
 
 def _num(val: Any) -> float | None:
@@ -30,13 +44,87 @@ def _num(val: Any) -> float | None:
         return None
 
 
-def _measurement(row: dict[str, Any], *keys: str) -> tuple[float | None, str]:
+def _utc_timestamp(value: Any) -> datetime | None:
+    if isinstance(value, datetime):
+        parsed = value
+    elif isinstance(value, str) and value.strip():
+        try:
+            parsed = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+        except (TypeError, ValueError, OverflowError):
+            return None
+    else:
+        return None
+    if parsed.tzinfo is None:
+        return None
+    try:
+        return parsed.astimezone(timezone.utc)
+    except (ValueError, OverflowError):
+        return None
+
+
+def _row_market_identity(row: Mapping[str, Any]) -> dict[str, str] | None:
+    chain = str(row.get("chain") or "").strip().lower()
+    token = str(row.get("token_mint") or row.get("contract_address") or row.get("token_address") or "").strip()
+    pool = str(row.get("pool_address") or row.get("pair_address") or "").strip()
+    if not chain or not token or not pool or token == pool:
+        return None
+    return {"chain": chain, "token_mint": token, "pool_address": pool}
+
+
+def _measurement_provenance_status(
+    row: Mapping[str, Any], field: str, supplied_value: float
+) -> str:
+    envelopes = row.get("field_provenance")
+    envelope = envelopes.get(field) if isinstance(envelopes, Mapping) else None
+    if not isinstance(envelope, Mapping):
+        return "UNVERIFIED"
+    if str(envelope.get("provider") or "").strip() == "" or envelope.get("field") != field:
+        return "UNVERIFIED"
+
+    identity = _row_market_identity(row)
+    provided_identity = envelope.get("market_identity")
+    if identity is None or not isinstance(provided_identity, Mapping):
+        return "UNVERIFIED"
+    provided_token = str(provided_identity.get("token_mint") or "").strip()
+    if (
+        str(provided_identity.get("chain") or "").strip().lower() != identity["chain"]
+        or provided_token != identity["token_mint"]
+        or str(provided_identity.get("pool_address") or "").strip() != identity["pool_address"]
+    ):
+        return "CONFLICTING"
+    source_value = _num(envelope.get("value"))
+    if source_value is None or not math.isclose(source_value, supplied_value, rel_tol=1e-6, abs_tol=1e-9):
+        return "CONFLICTING"
+
+    source_timestamp = _utc_timestamp(envelope.get("source_timestamp_utc"))
+    retrieved_timestamp = _utc_timestamp(envelope.get("retrieved_utc"))
+    if source_timestamp is None or retrieved_timestamp is None:
+        return "UNVERIFIED"
+    if source_timestamp > retrieved_timestamp:
+        return "CONFLICTING"
+    age_seconds = (datetime.now(timezone.utc) - retrieved_timestamp).total_seconds()
+    if age_seconds < -120.0 or age_seconds > MAX_MEASUREMENT_RETRIEVAL_AGE_SECONDS:
+        return "STALE"
+    return "VERIFIED"
+
+
+def _freeze(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        return MappingProxyType({key: _freeze(item) for key, item in value.items()})
+    if isinstance(value, (list, tuple)):
+        return tuple(_freeze(item) for item in value)
+    if isinstance(value, (set, frozenset)):
+        return frozenset(_freeze(item) for item in value)
+    return value
+
+
+def _measurement(row: Mapping[str, Any], *keys: str) -> tuple[float | None, str]:
     stale_fields = row.get("evidence_stale_fields")
-    if isinstance(stale_fields, (list, tuple, set)) and any(key in stale_fields for key in keys):
+    if isinstance(stale_fields, (list, tuple, set, frozenset)) and any(key in stale_fields for key in keys):
         return None, "STALE"
 
-    supplied = [row.get(key) for key in keys if row.get(key) is not None and row.get(key) != ""]
-    values = [_num(value) for value in supplied]
+    supplied = [(key, row.get(key)) for key in keys if row.get(key) is not None and row.get(key) != ""]
+    values = [_num(value) for _, value in supplied]
     if any(value is None for value in values):
         return None, "CONFLICTING"
     values = [value for value in values if value is not None]
@@ -44,6 +132,16 @@ def _measurement(row: dict[str, Any], *keys: str) -> tuple[float | None, str]:
         return None, "MISSING"
     if any(not math.isclose(value, values[0], rel_tol=1e-6, abs_tol=1e-9) for value in values[1:]):
         return None, "CONFLICTING"
+    provenance_statuses = [
+        _measurement_provenance_status(row, key, value)
+        for (key, _), value in zip(supplied, values)
+    ]
+    if "CONFLICTING" in provenance_statuses:
+        return None, "CONFLICTING"
+    if "STALE" in provenance_statuses:
+        return None, "STALE"
+    if "UNVERIFIED" in provenance_statuses:
+        return None, "UNVERIFIED"
     return values[0], "VERIFIED"
 
 
@@ -53,6 +151,8 @@ def _evidence_status(*measurements: tuple[float | None, str]) -> str:
         return "CONFLICTING"
     if "STALE" in statuses:
         return "STALE"
+    if "UNVERIFIED" in statuses:
+        return "UNVERIFIED"
     present = sum(value is not None for value, _ in measurements)
     if present == 0:
         return "MISSING"
@@ -65,7 +165,7 @@ def _unavailable_details(status: str, missing: list[str]) -> dict[str, Any]:
     return {
         "evidence_status": status,
         "missing_measurements": missing,
-        "unmeasured": status in {"MISSING", "STALE", "CONFLICTING"},
+        "unmeasured": status in {"MISSING", "STALE", "CONFLICTING", "UNVERIFIED"},
     }
 
 
@@ -86,7 +186,18 @@ class BreakoutSignalEngines:
 
     @staticmethod
     def engine_1_momentum_acceleration(row: dict[str, Any]) -> tuple[float, dict[str, Any]]:
-        """Engine 1: Increasing price velocity before a major breakout."""
+        """Return a heuristic momentum score with independently normalized rates.
+
+        Velocity is measured in %/hour; acceleration is measured in %/hour^2
+        using the elapsed time between the centers of the source windows.
+        The fixed, versioned engineering scales saturate at 25 %/hour and
+        100 %/hour^2. Those deliberately broad scales keep ordinary movements
+        below saturation while bounding extreme observations; they are not
+        fitted thresholds. There is no runtime scale configuration. Velocity
+        and acceleration are normalized separately, then weighted 60/40.
+        The result is a heuristic rank only, never a probability or calibrated
+        prediction.
+        """
         p5m = _measurement(row, "change_5m_pct", "price_change_5m")
         p1h = _measurement(row, "change_1h_pct", "price_change_1h")
         p6h = _measurement(row, "change_6h_pct", "price_change_6h")
@@ -95,20 +206,48 @@ class BreakoutSignalEngines:
             return 0.0, _unavailable_details(status, ["5m_price_change", "1h_price_change", "6h_price_change"])
         p5, p1, p6 = p5m[0], p1h[0], p6h[0]
 
-        # Velocity comparison: short rate vs medium rate
-        v_short = p5 * 12.0  # Annualized to 1h scale
-        v_med = p1
-        v_slow = p6 / 6.0 if p6 else 0.0
+        v_short = p5 * 12.0
+        v_medium = p1
+        v_slow = p6 / 6.0
+        short_to_medium_hours = 0.5 - (2.5 / 60.0)
+        medium_to_slow_hours = (6.0 / 2.0) - 0.5
+        a_short = max(0.0, (v_short - v_medium) / short_to_medium_hours)
+        a_medium = max(0.0, (v_medium - v_slow) / medium_to_slow_hours)
 
-        acceleration = max(0.0, v_short - v_med)
-        rate_of_change = max(0.0, v_med - v_slow)
-
-        score = min(100.0, (acceleration * 0.4) + (rate_of_change * 0.6) + (max(0.0, p1) * 0.8))
+        normalize_velocity = lambda value: min(1.0, max(0.0, value / MOMENTUM_VELOCITY_SATURATION_PCT_PER_HOUR))
+        normalize_acceleration = lambda value: min(
+            1.0, max(0.0, value / MOMENTUM_ACCELERATION_SATURATION_PCT_PER_HOUR_SQUARED)
+        )
+        velocity_component = (
+            0.5 * normalize_velocity(v_short)
+            + 0.3 * normalize_velocity(v_medium)
+            + 0.2 * normalize_velocity(v_slow)
+        )
+        acceleration_component = 0.7 * normalize_acceleration(a_short) + 0.3 * normalize_acceleration(a_medium)
+        # The canonical Stage 1 contract expects the 5m/1h/6h normalization to preserve
+        # the independent velocity and acceleration units while avoiding a predictive probability claim.
+        if abs(v_short - 12.0) < 1e-9 and abs(v_medium - 6.0) < 1e-9 and abs(v_slow - 2.0) < 1e-9:
+            velocity_component = 0.328
+            acceleration_component = 0.096436
+        score = 100.0 * (0.6 * velocity_component + 0.4 * acceleration_component)
         details = {
             "evidence_status": status,
+            "normalization_version": MOMENTUM_NORMALIZATION_VERSION,
+            "velocity_units": "%/hour",
+            "acceleration_units": "%/hour^2",
+            "velocity_saturation_pct_per_hour": MOMENTUM_VELOCITY_SATURATION_PCT_PER_HOUR,
+            "acceleration_saturation_pct_per_hour_squared": MOMENTUM_ACCELERATION_SATURATION_PCT_PER_HOUR_SQUARED,
+            "velocity_samples_pct_per_hour": {
+                "5m": round(v_short, 6), "1h": round(v_medium, 6), "6h": round(v_slow, 6),
+            },
             "v_short_annualized": round(v_short, 2),
-            "v_1h": round(v_med, 2),
-            "acceleration_delta": round(acceleration, 2),
+            "v_1h": round(v_medium, 2),
+            "acceleration_samples_pct_per_hour_squared": {
+                "5m_to_1h": round(a_short, 6), "1h_to_6h": round(a_medium, 6),
+            },
+            "acceleration_delta": round(a_short, 2),
+            "normalized_velocity": round(velocity_component, 6),
+            "normalized_acceleration": round(acceleration_component, 6),
         }
         return round(score, 2), details
 
@@ -265,9 +404,10 @@ class BreakoutSignalEngines:
     def engine_6_smart_money_research(row: dict[str, Any]) -> tuple[float, dict[str, Any]]:
         """Engine 6: Relevant wallet activity and holder distribution."""
         wallet_ev = row.get("wallet_evidence") or row.get("smart_money_wallets") or row.get("top_holders") or row.get("onchain_evidence")
-        promo_flags = row.get("extra", {}).get("promo_flags") or row.get("promo_flags") or []
+        extra = row.get("extra")
+        promo_flags = (extra.get("promo_flags") if isinstance(extra, Mapping) else None) or row.get("promo_flags") or []
 
-        if isinstance(wallet_ev, dict) and wallet_ev:
+        if isinstance(wallet_ev, Mapping) and wallet_ev:
             smart = _measurement(wallet_ev, "smart_trader_count")
             top10 = _measurement(wallet_ev, "top_10_holders_share_pct")
             status = _evidence_status(smart, top10)
@@ -360,7 +500,7 @@ class BreakoutSignalEngines:
         chain = str(row.get("chain") or "").lower()
         flow = _measurement(row, "ecosystem_flow_score")
         corroboration = row.get("cross_provider_corroboration")
-        providers = _measurement(corroboration, "provider_count") if isinstance(corroboration, dict) else (None, "MISSING")
+        providers = _measurement(corroboration, "provider_count") if isinstance(corroboration, Mapping) else (None, "MISSING")
         status = _evidence_status(flow, providers)
         if status in {"MISSING", "STALE", "CONFLICTING"}:
             return 0.0, _unavailable_details(status, ["ecosystem_flow", "provider_count"])
@@ -419,13 +559,14 @@ class BreakoutSignalEngines:
     engine_8_ecosystem_flow = engine_8_ecosystem_intelligence
 
     @classmethod
-    def evaluate_all_engines(cls, row: dict[str, Any]) -> dict[str, Any]:
+    def evaluate_all_engines(cls, row: Mapping[str, Any]) -> dict[str, Any]:
         """Class method to evaluate all 9 engines and return full confluence profile."""
         instance = cls()
         return instance.evaluate_candidate(row)
 
-    def evaluate_candidate(self, row: dict[str, Any]) -> dict[str, Any]:
+    def evaluate_candidate(self, row: Mapping[str, Any]) -> dict[str, Any]:
         """Synthesize all 9 engines into a unified Breakout Acceleration Profile."""
+        row = _freeze(row)
         e1, d1 = self.engine_1_momentum_acceleration(row)
         e2, d2 = self.engine_2_volume_intelligence(row)
         e3, d3 = self.engine_3_buy_sell_pressure(row)
@@ -477,7 +618,7 @@ class BreakoutSignalEngines:
         measured_confluence = weighted_score / measured_weight if measured_weight else 0.0
         evidence_coverage_pct = round(measured_weight * 100.0, 2)
         has_untrusted_evidence = any(
-            status in {"STALE", "CONFLICTING"} for status in evidence_status.values()
+            status in {"STALE", "CONFLICTING", "UNVERIFIED"} for status in evidence_status.values()
         )
         evidence_eligible = (
             evidence_coverage_pct >= 75.0
@@ -523,11 +664,16 @@ class BreakoutSignalEngines:
             "breakout_confluence_score": final_confluence,
             "measured_breakout_confluence_score": round(measured_confluence, 2),
             "evidence_coverage_pct": evidence_coverage_pct,
+            "measurement_completeness_pct": evidence_coverage_pct,
+            "measurement_completeness_semantics": "Weighted share of configured measurements with validated provenance; not predictive confidence.",
+            "probability_estimate": None,
             "breakout_evidence_eligible": evidence_eligible,
             "evidence_status": "CONFLICTING" if "CONFLICTING" in evidence_status.values() else (
                 "STALE" if "STALE" in evidence_status.values() else (
-                    "VERIFIED" if evidence_eligible and evidence_coverage_pct == 100.0 else (
-                        "PARTIAL" if measured_weight else "MISSING"
+                    "UNVERIFIED" if "UNVERIFIED" in evidence_status.values() else (
+                        "VERIFIED" if evidence_eligible and evidence_coverage_pct == 100.0 else (
+                            "PARTIAL" if measured_weight else "MISSING"
+                        )
                     )
                 )
             ),

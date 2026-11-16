@@ -11,6 +11,41 @@ from tests.test_execution_simulator import make_mock_chainlink_rpc_transport
 
 
 class TestEngineDiagnostics:
+    def test_momentum_normalizes_velocity_and_acceleration_in_separate_units(self):
+        score, details = BreakoutSignalEngines.engine_1_momentum_acceleration({
+            "change_5m_pct": 1.0,
+            "change_1h_pct": 6.0,
+            "change_6h_pct": 12.0,
+        })
+
+        assert details["normalization_version"] == "momentum-v2"
+        assert details["velocity_units"] == "%/hour"
+        assert details["acceleration_units"] == "%/hour^2"
+        assert details["velocity_samples_pct_per_hour"] == {"5m": 12.0, "1h": 6.0, "6h": 2.0}
+        assert details["normalized_velocity"] == 0.328
+        assert details["normalized_acceleration"] == 0.096436
+        assert score == 23.54
+
+    def test_engine_inputs_are_frozen_and_probability_is_not_claimed(self):
+        row = {
+            "change_5m_pct": 1.0,
+            "change_1h_pct": 6.0,
+            "change_6h_pct": 12.0,
+        }
+        original_engine = BreakoutSignalEngines.engine_1_momentum_acceleration
+
+        def mutate_input(engine_row):
+            with pytest.raises(TypeError):
+                engine_row["change_5m_pct"] = 999.0
+            return original_engine(engine_row)
+
+        with patch.object(BreakoutSignalEngines, "engine_1_momentum_acceleration", side_effect=mutate_input):
+            result = BreakoutSignalEngines().evaluate_candidate(row)
+        assert row["change_5m_pct"] == 1.0
+        assert result["probability_estimate"] is None
+        assert "data_quality_confidence_pct" in result
+        assert "not predictive confidence" in result["data_quality_confidence_semantics"]
+
     def test_signal_engine_software_failure_is_explicitly_captured(self):
         row = {
             "change_5m_pct": 5.0,

@@ -500,13 +500,14 @@ def _solana_lp_lock_share(pool, lp_mint, timeout=8):
     pct = dead_address_balance / supply_amount * 100.0
     if pct >= 95.0:
         return {
-            "status": "VERIFIED", "source": "Solana RPC exact LP mint supply and largest token-account owners",
+            "status": "UNVERIFIED", "source": "Solana RPC exact LP mint supply and largest token-account owners",
             "as_of_utc": utc_now(), "pool_address": pool, "lp_mint": lp_mint,
-            "position_identity_verified": True, "control_type": "LOCKED",
-            "locked_pct": round(pct, 6), "dead_address_share_pct": round(pct, 6),
+            "chain": "solana", "position_identity_verified": False, "control_type": "UNVERIFIED",
+            "observed_incinerator_share_pct": round(pct, 6), "dead_address_share_pct": round(pct, 6),
             "lp_supply_raw": str(int(supply_amount)), "incinerator_token_accounts": incinerator_accounts,
-            "note": "LP tokens held by Solana's canonical unspendable incinerator address are locked, not burned; sending tokens there does not reduce mint supply.",
+            "reason": "A largest-account RPC observation is not authenticated proof of a lock contract, beneficiary, unlock conditions, or exact position.",
             "coverage_limit": "At most 20 largest token accounts were queried; this share is a lower bound, not exhaustive proof of all locked LP tokens.",
+            "evidence_assurance": "RPC_OBSERVATION_ONLY",
         }
     return {
         "status": "UNVERIFIED", "source": "Solana RPC exact LP mint supply and largest token-account owners",
@@ -818,12 +819,13 @@ def _evm_lp_lock_share(pool, chain, timeout=8):
     pct = dead_address_balance / total * 100.0
     if pct >= 95.0:
         return {
-            "status": "VERIFIED", "source": "EVM JSON-RPC LP ERC-20 totalSupply/balanceOf",
-            "as_of_utc": utc_now(), "pool_address": pool,
-            "position_identity_verified": True, "control_type": "LOCKED",
-            "locked_pct": round(pct, 6), "dead_address_share_pct": round(pct, 6),
+            "status": "UNVERIFIED", "source": "EVM JSON-RPC LP ERC-20 totalSupply/balanceOf",
+            "as_of_utc": utc_now(), "chain": chain, "pool_address": pool,
+            "position_identity_verified": False, "control_type": "UNVERIFIED",
+            "observed_burn_address_share_pct": round(pct, 6), "dead_address_share_pct": round(pct, 6),
             "lp_supply_raw": str(total),
-            "note": "LP tokens held by canonical EVM zero/dead addresses are classified as locked, not burned. Verified only for V2-style LP ERC-20s whose pool token0/token1 also matched; other position models are not treated as locked.",
+            "reason": "Current balances alone do not prove a lock mechanism, beneficiary, unlock conditions, or an exact burn transaction.",
+            "evidence_assurance": "RPC_OBSERVATION_ONLY",
         }
     return {
         "status": "UNVERIFIED", "source": "EVM JSON-RPC LP ERC-20 totalSupply/balanceOf",

@@ -66,12 +66,43 @@ def fixture():
 
 
 class DexLossGuardTests(unittest.TestCase):
-    def test_complete_verified_evidence_passes(self):
+    def test_provider_lp_status_and_percentage_alone_never_verify_a_lock(self):
         row, security, route = fixture()
         result = guard.evaluate_dex_candidate(row, security, route, NOW)
-        self.assertEqual(result["status"], "PASS")
-        self.assertTrue(result["entry_ready"])
-        self.assertEqual(result["blockers"], [])
+        self.assertEqual(result["status"], "BLOCKED_UNVERIFIED_OR_RISK")
+        self.assertFalse(result["entry_ready"])
+        self.assertEqual(result["lp_authentication_status"], "UNVERIFIED")
+        self.assertTrue(any("cryptographic on-chain proof" in x for x in result["blockers"]))
+
+    def test_lp_claims_require_exact_position_beneficiary_and_authenticated_evidence(self):
+        for mutation, expected_blocker in (
+            (lambda lp: lp.update({"pool_address": "0x4444444444444444444444444444444444444444"}), "exact candidate pool"),
+            (lambda lp: lp.update({"lp_token_address": "0x5555555555555555555555555555555555555555"}), "identity does not match"),
+            (lambda lp: lp.pop("beneficiary"), "beneficiary is missing"),
+            (lambda lp: lp.update({"authenticated_on_chain_evidence": True}), "cryptographic on-chain proof"),
+        ):
+            with self.subTest(expected_blocker=expected_blocker):
+                row, security, route = fixture()
+                row["loss_guard_evidence"]["pool_identity"]["lp_token_address"] = "0x6666666666666666666666666666666666666666"
+                lp = row["loss_guard_evidence"]["lp_position"]
+                lp.update({
+                    "chain": "ethereum",
+                    "lp_token_address": "0x6666666666666666666666666666666666666666",
+                    "lock_contract_address": "0x7777777777777777777777777777777777777777",
+                    "lock_mechanism": "timelock",
+                    "mechanism_verified": True,
+                    "beneficiary": "0x8888888888888888888888888888888888888888",
+                    "locked_amount": 95.0,
+                    "total_supply": 100.0,
+                    "unlock_conditions": "after timelock expiry",
+                    "unlock_timestamp_utc": "2026-11-10T00:00:00Z",
+                    "control_type": "LOCKED",
+                    "locked_pct": 95.0,
+                })
+                mutation(lp)
+                result = guard.evaluate_dex_candidate(row, security, route, NOW)
+                self.assertFalse(result["entry_ready"])
+                self.assertTrue(any(expected_blocker in item for item in result["blockers"]))
 
     def test_forward_trade_plan_is_blocked_without_loss_guard_pass(self):
         from scripts import forward_24h_report
@@ -170,14 +201,15 @@ class DexLossGuardTests(unittest.TestCase):
         self.assertFalse(result["entry_ready"])
         self.assertTrue(any("burned LP share is below 95%" in x for x in result["blockers"]))
 
-    def test_burned_lp_at_95_percent_can_pass_when_all_other_lanes_pass(self):
+    def test_burned_lp_at_95_percent_still_requires_exact_authenticated_proof(self):
         row, security, route = fixture()
         row["loss_guard_evidence"]["lp_position"].update({
             "control_type": "BURNED", "burned_pct": 95.0, "locked_pct": 95.0,
         })
         result = guard.evaluate_dex_candidate(row, security, route, NOW)
-        self.assertEqual(result["status"], "PASS")
-        self.assertTrue(result["entry_ready"])
+        self.assertFalse(result["entry_ready"])
+        self.assertTrue(any("exact LP burn transaction" in x for x in result["blockers"]))
+        self.assertTrue(any("cryptographic on-chain proof" in x for x in result["blockers"]))
 
     def test_cannot_sell_all_contract_flag_is_blocked(self):
         row, security, route = fixture()
@@ -185,6 +217,32 @@ class DexLossGuardTests(unittest.TestCase):
         result = guard.evaluate_dex_candidate(row, security, route, NOW)
         self.assertFalse(result["entry_ready"])
         self.assertTrue(any("cannot_sell_all" in x for x in result["blockers"]))
+        self.assertTrue(result["hard_reject"])
+        self.assertTrue(result["confirmed_security_failures"])
+
+    def test_missing_blacklist_is_a_gap_not_a_clean_security_result(self):
+        row, security, route = fixture()
+        del security["audit"]["data"]["is_blacklisted"]
+        result = guard.evaluate_dex_candidate(row, security, route, NOW)
+        self.assertFalse(result["entry_ready"])
+        self.assertFalse(result["hard_reject"])
+        self.assertTrue(any("is_blacklisted" in x for x in result["blockers"]))
+
+    def test_unknown_boolean_and_nonfinite_or_out_of_range_taxes_do_not_pass(self):
+        for field, value in (
+            ("is_blacklisted", "unknown"),
+            ("buy_tax", float("nan")),
+            ("sell_tax", float("inf")),
+            ("buy_tax", -0.1),
+            ("sell_tax", 100.1),
+        ):
+            with self.subTest(field=field, value=value):
+                row, security, route = fixture()
+                security["audit"]["data"][field] = value
+                result = guard.evaluate_dex_candidate(row, security, route, NOW)
+                self.assertFalse(result["entry_ready"])
+                self.assertTrue(any(field in item for item in result["blockers"]))
+                self.assertFalse(result["hard_reject"])
 
     def test_stale_router_quote_is_blocked(self):
         row, security, route = fixture()

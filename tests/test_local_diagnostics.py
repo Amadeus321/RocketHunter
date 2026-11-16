@@ -84,7 +84,10 @@ class LocalDiagnosticsTests(unittest.TestCase):
         self.assertEqual(first["python_runtime_version"], platform.python_version())
         self.assertEqual(first["configuration_fingerprint"], same["configuration_fingerprint"])
         self.assertNotEqual(first["configuration_fingerprint"], changed["configuration_fingerprint"])
+        self.assertTrue(first["implementation_fingerprint"])
         self.assertNotIn("api_key", str(first["local_configuration"]).lower())
+        with self.assertRaises(TypeError):
+            first["local_configuration"]["scanner_workers"] = 99
 
     def test_scan_state_updates_preserve_local_run_metadata(self):
         with tempfile.TemporaryDirectory() as tmp:

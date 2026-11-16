@@ -24,6 +24,11 @@ MAX_DEPLOYER_INITIAL_SUPPLY_PCT = 15.0
 MAX_LINKED_WALLET_CLUSTER_PCT = 20.0
 MIN_LOCKED_LP_PCT = 95.0
 MIN_TIMELOCK_HOURS = 24.0
+# GoPlus reports tax as a fraction (0.10 == 10%). This is the canonical
+# representation throughout this guard; no percentage-point conversion occurs.
+CANONICAL_TAX_UNIT = "fraction"
+MAX_TAX_FRACTION = 1.0
+MAX_ACCEPTABLE_TAX_FRACTION = 0.10
 
 ROUTE_OK_STATUSES = {
     "BUY_AND_SELL_FIRM_QUOTES_RETURNED",
@@ -64,13 +69,27 @@ def _explicit_false(value: Any) -> bool:
     return isinstance(value, str) and value.strip().lower() in {"0", "false"}
 
 
+def _boolean_measurement(value: Any) -> bool | None:
+    if value is True or (isinstance(value, int) and not isinstance(value, bool) and value == 1):
+        return True
+    if value is False or (isinstance(value, int) and not isinstance(value, bool) and value == 0):
+        return False
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"1", "true"}:
+            return True
+        if normalized in {"0", "false"}:
+            return False
+    return None
+
+
 def _utc(value: Any) -> datetime | None:
     if not isinstance(value, str) or not value.strip():
         return None
     try:
         parsed = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
         if parsed.tzinfo is None:
-            parsed = parsed.replace(tzinfo=timezone.utc)
+            return None
         return parsed.astimezone(timezone.utc)
     except (TypeError, ValueError, OverflowError):
         return None
@@ -137,17 +156,34 @@ def _security_checks(security_item: dict[str, Any] | None, evidence: dict[str, A
     if missing:
         blockers.append("token-security fields incomplete: " + ", ".join(missing))
     for field in REQUIRED_SECURITY_ZERO_FIELDS:
-        if field in data and str(data.get(field)).strip() not in {"0", "0.0", "false", "False"}:
+        measured = _boolean_measurement(data.get(field)) if field in data else None
+        if measured is True:
             blockers.append("token-security flag is active: " + field)
-    if "is_open_source" in data and str(data.get("is_open_source")).strip() not in {"1", "1.0", "true", "True"}:
-        blockers.append("token source is not verified open-source")
+        elif measured is None and field in data:
+            blockers.append("token-security flag is invalid or unknown: " + field)
+    if "is_open_source" in data:
+        open_source = _boolean_measurement(data.get("is_open_source"))
+        if open_source is False:
+            blockers.append("token source is not verified open-source")
+        elif open_source is None:
+            blockers.append("is_open_source is invalid or unknown")
+    tax_unit = str(data.get("tax_unit") or (
+        CANONICAL_TAX_UNIT if str(security_item.get("source") or "").strip().lower() == "goplus" else ""
+    )).strip().lower()
     for field in ("buy_tax", "sell_tax"):
         tax = _number(data.get(field))
-        if tax is None:
+        if tax_unit != CANONICAL_TAX_UNIT:
+            blockers.append(field + " unit is missing or not canonical fraction")
+        elif tax is None:
             blockers.append(field + " is missing or unparsable")
-        elif tax > 10.0:
+        elif tax < 0.0 or tax > MAX_TAX_FRACTION:
+            blockers.append(field + " is outside the valid 0-1 fraction range")
+        elif tax > MAX_ACCEPTABLE_TAX_FRACTION:
             blockers.append(field + " exceeds 10%")
-    if str(data.get("is_proxy", "0")).strip() in {"1", "1.0", "true", "True"}:
+    is_proxy = _boolean_measurement(data.get("is_proxy"))
+    if is_proxy is None:
+        blockers.append("is_proxy is invalid or unknown")
+    elif is_proxy:
         proxy = evidence.get("proxy_implementation") or {}
         if not _verified(proxy):
             blockers.append("proxy implementation/admin review missing")
@@ -233,14 +269,46 @@ def evaluate_dex_candidate(row: dict[str, Any], security_item: dict[str, Any] | 
         blockers.append("exact LP-position ownership/withdrawal audit missing")
     else:
         _fresh(lp, current, MAX_EVIDENCE_AGE_MINUTES, "LP-position audit", blockers)
+        if str(lp.get("chain") or "").strip().lower() != chain:
+            blockers.append("LP-position audit chain does not match candidate chain")
         if not same_address(chain, lp.get("pool_address"), pool):
             blockers.append("LP-position audit does not identify the exact candidate pool")
-        if not _truth(lp.get("position_identity_verified")):
-            blockers.append("LP position identity is not independently verified")
+        claimed_position = lp.get("lp_token_address") or lp.get("lp_mint") or lp.get("position_id")
+        expected_position = (
+            pool_identity.get("lp_token_address")
+            or pool_identity.get("lp_mint")
+            or pool_identity.get("position_id")
+        )
+        if not claimed_position:
+            blockers.append("exact LP token or position identity is missing")
+        elif not expected_position:
+            blockers.append("independently verified pool-to-LP token/position binding is missing")
+        elif (lp.get("position_id") and str(claimed_position) != str(expected_position)) or (
+            not lp.get("position_id") and not same_address(chain, claimed_position, expected_position)
+        ):
+            blockers.append("LP token or position identity does not match the independently verified pool")
         control = str(lp.get("control_type") or "").upper()
         if control not in LP_CONTROL_TYPES:
             blockers.append("LP withdrawal control is not verified as burned, locked or timelocked multisig")
-        elif control == "LOCKED":
+        if control in {"LOCKED", "TIMELOCKED_MULTISIG"}:
+            if not lp.get("lock_contract_address"):
+                blockers.append("LP lock contract identity is missing")
+            if not lp.get("lock_mechanism") or lp.get("mechanism_verified") is not True:
+                blockers.append("LP lock mechanism is not independently verified")
+            if not lp.get("beneficiary"):
+                blockers.append("LP lock beneficiary is missing")
+            locked_amount = _number(lp.get("locked_amount"))
+            total_amount = _number(lp.get("total_supply") or lp.get("position_amount"))
+            if locked_amount is None or locked_amount <= 0 or total_amount is None or total_amount <= 0:
+                blockers.append("exact locked amount and corresponding supply/position amount are required")
+            elif locked_amount > total_amount:
+                blockers.append("locked amount exceeds the corresponding supply/position amount")
+            unlock_dt = _utc(lp.get("unlock_timestamp_utc"))
+            if not lp.get("unlock_conditions") or unlock_dt is None:
+                blockers.append("LP unlock conditions and timezone-aware unlock timestamp are required")
+            elif unlock_dt <= current:
+                blockers.append("LP unlock timestamp is not in the future")
+        if control == "LOCKED":
             locked_pct = _number(lp.get("locked_pct"))
             if locked_pct is None or locked_pct < MIN_LOCKED_LP_PCT:
                 blockers.append("verified locked LP share is below 95% or unreported")
@@ -249,9 +317,18 @@ def evaluate_dex_candidate(row: dict[str, Any], security_item: dict[str, Any] | 
             if delay is None or delay < MIN_TIMELOCK_HOURS:
                 blockers.append("LP withdrawal timelock is missing or shorter than 24 hours")
         elif control == "BURNED":
-            burned_pct = _number(lp.get("burned_pct") if lp.get("burned_pct") is not None else lp.get("locked_pct"))
+            burned_pct = _number(lp.get("burned_pct"))
             if burned_pct is None or burned_pct < MIN_LOCKED_LP_PCT:
                 blockers.append("verified burned LP share is below 95% or unreported")
+            burn = lp.get("burn_transaction")
+            if (
+                not isinstance(burn, dict)
+                or not burn.get("transaction_hash")
+                or not burn.get("destination_address")
+                or not burn.get("token_or_position_id")
+            ):
+                blockers.append("exact LP burn transaction, destination, and token/position identity are required")
+        blockers.append("LP cryptographic on-chain proof is not independently verified by this implementation")
 
     _security_checks(security_item, evidence, current, blockers)
 
@@ -285,12 +362,45 @@ def evaluate_dex_candidate(row: dict[str, Any], security_item: dict[str, Any] | 
             blockers.append("router quote size differs from intended position size")
 
     blockers = list(dict.fromkeys(blockers))
+    confirmed_security_failures: list[str] = []
+    security_data = (
+        ((security_item.get("audit") or {}).get("data") or {})
+        if isinstance(security_item, dict) else {}
+    )
+    security_identity_verified = (
+        isinstance(security_item, dict)
+        and str(security_item.get("chain") or "").strip().lower() == chain
+        and same_address(chain, security_item.get("contract_address") or security_item.get("token_address"), contract)
+        and _fresh(security_item, current, MAX_EVIDENCE_AGE_MINUTES, "token-security audit", [])
+    )
+    if security_identity_verified and isinstance(security_data, dict):
+        confirmed_security_failures = [
+            "token-security flag is active: " + field
+            for field in REQUIRED_SECURITY_ZERO_FIELDS
+            if _boolean_measurement(security_data.get(field)) is True
+        ]
+        confirmed_security_failures.extend(
+            field + " exceeds 10%" for field in ("buy_tax", "sell_tax")
+            if (
+                str(security_data.get("tax_unit") or (
+                    CANONICAL_TAX_UNIT if str(security_item.get("source") or "").strip().lower() == "goplus" else ""
+                )).strip().lower() == CANONICAL_TAX_UNIT
+                and _number(security_data.get(field)) is not None
+                and MAX_ACCEPTABLE_TAX_FRACTION < _number(security_data.get(field)) <= MAX_TAX_FRACTION
+            )
+        )
+    evidence_gaps = [item for item in blockers if item not in confirmed_security_failures]
     return {
         "schema": "crypto-prebreakout.dex-loss-pattern-guard.v1",
         "guard_version": GUARD_VERSION,
         "status": "PASS" if not blockers else "BLOCKED_UNVERIFIED_OR_RISK",
         "entry_ready": not blockers,
         "blockers": blockers,
+        "confirmed_security_failures": confirmed_security_failures,
+        "adverse_findings": confirmed_security_failures,
+        "evidence_gaps": evidence_gaps,
+        "hard_reject": bool(confirmed_security_failures),
+        "lp_authentication_status": "UNVERIFIED",
         "checks": {
             "exact_token_and_pool_identity": bool(chain and contract and pool and not same_address(chain, contract, pool)),
             "launch_wallet_analysis": _verified(launch),
@@ -305,6 +415,8 @@ def evaluate_dex_candidate(row: dict[str, Any], security_item: dict[str, Any] | 
             "min_pool_age_hours": MIN_POOL_AGE_HOURS,
             "max_evidence_age_minutes": MAX_EVIDENCE_AGE_MINUTES,
             "max_route_age_minutes": MAX_ROUTE_AGE_MINUTES,
+            "tax_unit": CANONICAL_TAX_UNIT,
+            "max_acceptable_tax_fraction": MAX_ACCEPTABLE_TAX_FRACTION,
         },
         "note": "Research ranking is unaffected. Missing, stale, mismatched or adverse evidence blocks DEX entry readiness; this is not a guarantee against loss.",
     }
