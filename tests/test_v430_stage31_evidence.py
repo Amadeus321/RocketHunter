@@ -24,12 +24,14 @@ Exercises and validates all Stage 3.1 acceptance criteria with rigorous adversar
 """
 from __future__ import annotations
 
+import dataclasses
 import decimal
 import hashlib
 import math
 import random
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 from typing import Any
 
@@ -39,6 +41,8 @@ from scripts.research_evidence import (
     CANONICAL_OP_TAG,
     TECHNICAL_TP_PCT,
     UNISWAP_V3_FEE_SPACINGS,
+    BlockHeaderTrustAnchor,
+    BlockHeaderTrustAnchorRegistry,
     ClusteredEvaluationEngine,
     DatasetAReconciliationEngine,
     DualTrackOutcomeEvaluator,
@@ -47,8 +51,15 @@ from scripts.research_evidence import (
     InferentialStatus,
     JournalEntryPosition,
     JournalExitExecution,
+    LiquidityObservationRecord,
+    LiquidityClassificationEngine,
+    LiquidityClassificationStatus,
     ModeledExecutionStatus,
     MultiChainFinalityEngine,
+    OpStackOutputProofEvidence,
+    OpStackOutputProofPayload,
+    OpStackOutputProofVerifier,
+    OpStackAuthenticatedProofResult,
     OnChainTransferEvent,
     ProtectedDataVerifier,
     RpcEvidenceRecord,
@@ -57,6 +68,15 @@ from scripts.research_evidence import (
     UniswapV3Evidence,
     UniswapV3TickMath,
     ValidatedTransactionReceipt,
+    canonicalize_token_address,
+)
+from scripts.consensus_proof_verifier import (
+    keccak256,
+    encode_compact_path,
+    rlp_encode,
+    rlp_encode_bytes,
+    AccountStateLeaf,
+    HeaderConsensusEvidence,
 )
 
 
@@ -1117,6 +1137,543 @@ class TestStage31ClusteredStatisticalInference(unittest.TestCase):
         eval_res = ClusteredEvaluationEngine.run_stage31_evaluation(dataset_large, field="loss_diff")
         self.assertEqual(eval_res["status"], InferentialStatus.EXPLORATORY_UNCALIBRATED_INFERENCE.value)
         self.assertTrue("EXPLORATORY" in eval_res["diagnostic_flag"])
+
+
+class TestStage31IndependentAuditCorrections(unittest.TestCase):
+    """Test suite for Phase 3 audit corrections covering requirements D, E, F, J."""
+
+    def test_rpc_provenance_verifier_secure_filesystem_paths(self):
+        """Requirement D: Validate positive integers, reject path traversal, and create collision-safe quarantine files."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            verifier = RpcProvenanceVerifier(data_dir=Path(tmpdir))
+            valid_rec = RpcEvidenceRecord(
+                rpc_method="eth_getBlockByNumber",
+                rpc_params=[19000000, False],
+                retrieval_timestamp_utc="2026-11-15T00:00:00Z",
+                tls_handshake_metadata={"alpn": "h2"},
+                chain_id=1,
+                block_number=19_000_000,
+                block_hash="0x" + "aa" * 32,
+                parent_hash="0x" + "bb" * 32,
+                state_root="0x" + "cc" * 32,
+                provider_id="alchemy_primary",
+                provider_domain="eth-mainnet.g.alchemy.com",
+                raw_request_bytes=b'{"jsonrpc":"2.0","id":1,"method":"eth_getBlockByNumber"}',
+                raw_response_bytes=b'{"jsonrpc":"2.0","id":1,"result":{}}',
+                expected_request_sha256=hashlib.sha256(b'{"jsonrpc":"2.0","id":1,"method":"eth_getBlockByNumber"}').hexdigest().upper(),
+                expected_response_sha256=hashlib.sha256(b'{"jsonrpc":"2.0","id":1,"result":{}}').hexdigest().upper(),
+            )
+
+            # 1. Normal persistence works
+            req_p, resp_p = verifier.persist_raw_wire_payloads(valid_rec)
+            self.assertTrue(req_p.is_file())
+            self.assertTrue(resp_p.is_file())
+
+            # 2. Non-integer chain_id rejected (e.g. boolean, string)
+            bad_rec_bool = dataclasses.replace(valid_rec, chain_id=True)
+            with self.assertRaises(ValueError):
+                verifier.persist_raw_wire_payloads(bad_rec_bool)
+
+            # 3. Negative chain_id rejected
+            bad_rec_neg = dataclasses.replace(valid_rec, chain_id=-1)
+            with self.assertRaises(ValueError):
+                verifier.persist_raw_wire_payloads(bad_rec_neg)
+
+            # 4. Zero block_number rejected
+            bad_rec_zero = dataclasses.replace(valid_rec, block_number=0)
+            with self.assertRaises(ValueError):
+                verifier.persist_raw_wire_payloads(bad_rec_zero)
+
+            # 5. Requirement D: Quarantine creates genuinely immutable collision-safe manifests
+            # Exclusive creation preserves prior artifacts across repeated writes with identical block hashes and reasons
+            for _ in range(5):
+                q_dest = verifier.quarantine_reorganized_block(valid_rec, reason="Reorg detected")
+
+            self.assertTrue(q_dest.is_dir())
+            self.assertTrue((q_dest / "quarantine_manifest.json").is_file())
+            # All 5 unique quarantine files must exist simultaneously with no collisions or overwrites
+            immutable_files = list(q_dest.glob("quarantine_0x*.json"))
+            self.assertEqual(len(immutable_files), 5)
+            # Ensure unique filenames
+            self.assertEqual(len(set(f.name for f in immutable_files)), 5)
+            # Verify history log recorded all 5 events
+            history_file = q_dest / "quarantine_history.jsonl"
+            self.assertTrue(history_file.is_file())
+            history_lines = [l for l in history_file.read_text(encoding="utf-8").strip().splitlines() if l.strip()]
+            self.assertEqual(len(history_lines), 5)
+
+    def test_liquidity_classification_hardened_adversarial(self):
+        """Requirement E: Harden liquidity classification with NaN/inf rejection, initial checks, and permanent collapse."""
+        t0 = "2026-11-15T00:00:00Z"
+        base_record = LiquidityObservationRecord(
+            chain_id=1,
+            token_mint="0x" + "22" * 20,
+            pool_address="0x" + "11" * 20,
+            block_number=19_000_000,
+            block_hash="0x" + "aa" * 32,
+            source_event_timestamp_utc="2026-11-15T00:10:00Z",
+            local_ingestion_timestamp_utc="2026-11-15T00:10:05Z",
+            d_ask_plus_2pct=100_000,
+            d_bid_minus_2pct=100_000,
+            liquidity_usd=1_000_000.0,
+        )
+
+        # 1. NaN in liquidity_usd rejected
+        rec_nan = dataclasses.replace(base_record, liquidity_usd=float("nan"))
+        res_nan = LiquidityClassificationEngine.evaluate_liquidity_trajectory([rec_nan], t0)
+        self.assertEqual(res_nan["status"], LiquidityClassificationStatus.UNRESOLVED_LIQUIDITY.value)
+        self.assertEqual(res_nan["diagnostic"], "NON_FINITE_OR_NEGATIVE_LIQUIDITY_REJECTED")
+
+        # 2. Negative depth rejected
+        rec_neg = dataclasses.replace(base_record, d_ask_plus_2pct=-50)
+        res_neg = LiquidityClassificationEngine.evaluate_liquidity_trajectory([rec_neg], t0)
+        self.assertEqual(res_neg["status"], LiquidityClassificationStatus.UNRESOLVED_LIQUIDITY.value)
+        self.assertEqual(res_neg["diagnostic"], "NON_FINITE_OR_NEGATIVE_LIQUIDITY_REJECTED")
+
+        # 3. Initial liquidity <= 0 rejected
+        rec_zero_init = dataclasses.replace(base_record, liquidity_usd=0.0)
+        res_zero = LiquidityClassificationEngine.evaluate_liquidity_trajectory([rec_zero_init], t0)
+        self.assertEqual(res_zero["status"], LiquidityClassificationStatus.UNRESOLVED_LIQUIDITY.value)
+        self.assertEqual(res_zero["diagnostic"], "INITIAL_LIQUIDITY_NON_POSITIVE")
+
+        # 4. Permanent collapse: collapse occurs mid-window, recovery occurs later, status remains collapsed
+        rec_mid_collapse = dataclasses.replace(
+            base_record,
+            source_event_timestamp_utc="2026-11-15T06:00:00Z",
+            d_ask_plus_2pct=10_000,   # 10% of initial (collapse < 20%)
+            d_bid_minus_2pct=10_000,
+            liquidity_usd=100_000.0,
+        )
+        rec_recovered_terminal = dataclasses.replace(
+            base_record,
+            source_event_timestamp_utc="2026-11-15T23:50:00Z",
+            d_ask_plus_2pct=90_000,   # 90% (recovered)
+            d_bid_minus_2pct=90_000,
+            liquidity_usd=900_000.0,
+        )
+        res_collapse_recovery = LiquidityClassificationEngine.evaluate_liquidity_trajectory(
+            [base_record, rec_mid_collapse, rec_recovered_terminal], t0
+        )
+        self.assertEqual(
+            res_collapse_recovery["status"],
+            LiquidityClassificationStatus.LIQUIDITY_DEPTH_COLLAPSE_OBSERVED_UNVERIFIED.value,
+        )
+        self.assertTrue(res_collapse_recovery["recovery_observed_after_collapse"])
+
+    def test_chain_specific_token_address_normalization(self):
+        """Requirement F: EVM addresses normalized to lowercase hex; Solana addresses strictly preserve Base58 case."""
+        # 1. EVM address normalization (lowercase)
+        evm_mixed = "0x" + "AbCdEf" * 6 + "123456"
+        self.assertEqual(canonicalize_token_address(evm_mixed, chain=1), evm_mixed.lower())
+
+        # 2. EVM with namespace prefix
+        self.assertEqual(canonicalize_token_address(f"ethereum:{evm_mixed}"), evm_mixed.lower())
+
+        # 3. Solana address strictly preserves case
+        sol_mint = "So11111111111111111111111111111111111111112"
+        self.assertEqual(canonicalize_token_address(sol_mint, chain=101), sol_mint)
+        self.assertEqual(canonicalize_token_address(f"solana:{sol_mint}"), sol_mint)
+
+        # 4. Differing case Solana addresses do NOT collide
+        sol_mint_lower = "so11111111111111111111111111111111111111112"
+        self.assertNotEqual(
+            canonicalize_token_address(sol_mint, chain="solana"),
+            canonicalize_token_address(sol_mint_lower, chain="solana"),
+        )
+
+        # 5. Invalid Solana Base58 characters (e.g. '0', 'O', 'I', 'l') raise ValueError
+        with self.assertRaises(ValueError):
+            canonicalize_token_address("solana:00000000000000000000000000000000000000000000")
+
+        # 6. Invalid EVM hex characters raise ValueError
+        with self.assertRaises(ValueError):
+            canonicalize_token_address("0xZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZ")
+
+    @mock.patch("scripts.consensus_proof_verifier.verify_bls_aggregate_signature", return_value=True)
+    def test_op_stack_withdrawal_maturity_delays(self, mock_bls):
+        """Requirement J: Evaluate OP Stack withdrawal maturity delay and authentication."""
+        t_proven = 1_000_000
+        delay = 604_800  # 7 days
+
+        # 1. Future timestamp (current < proven) -> FINALITY_PENDING
+        st_future = MultiChainFinalityEngine.evaluate_op_stack_withdrawal(
+            proven_withdrawal_timestamp=t_proven,
+            current_l1_timestamp=t_proven - 100,
+            proof_maturity_delay_seconds=delay,
+        )
+        self.assertEqual(st_future, FinalityState.FINALITY_PENDING)
+
+        # 2. Pending maturity (current in delay airgap) -> WITHDRAWAL_PENDING_MATURITY
+        st_pending = MultiChainFinalityEngine.evaluate_op_stack_withdrawal(
+            proven_withdrawal_timestamp=t_proven,
+            current_l1_timestamp=t_proven + 300_000,
+            proof_maturity_delay_seconds=delay,
+        )
+        self.assertEqual(st_pending, FinalityState.WITHDRAWAL_PENDING_MATURITY)
+
+        # 3. Delay elapsed without cryptographic output proof -> FINALITY_CALLER_ASSERTED_UNVERIFIED
+        st_elapsed_unauth = MultiChainFinalityEngine.evaluate_op_stack_withdrawal(
+            proven_withdrawal_timestamp=t_proven,
+            current_l1_timestamp=t_proven + delay + 100,
+            proof_maturity_delay_seconds=delay,
+            has_authenticated_output_proof=False,
+        )
+        self.assertEqual(st_elapsed_unauth, FinalityState.FINALITY_CALLER_ASSERTED_UNVERIFIED)
+
+        # 4. Requirement J: Delay elapsed with cryptographically authenticated output proof -> WITHDRAWAL_PROOF_MATURE_FINAL
+        w_hash = "0x" + "11" * 32
+        slot0 = (0).to_bytes(32, "big")
+        search_key = keccak256(bytes.fromhex(w_hash[2:]) + slot0)
+        nibbles = []
+        for b in search_key:
+            nibbles.extend([b >> 4, b & 0x0F])
+        compact = encode_compact_path(nibbles, is_leaf=True)
+        leaf = [compact, b"\x01"]
+        leaf_rlp = rlp_encode(leaf)
+        mp_root_bytes = keccak256(leaf_rlp)
+        mp_root = "0x" + mp_root_bytes.hex()
+        s_root = "0x" + "22" * 32
+        b_hash = "0x" + "33" * 32
+        preimage = b"\x00" + bytes.fromhex(s_root[2:]) + mp_root_bytes + bytes.fromhex(b_hash[2:])
+        output_root = "0x" + keccak256(preimage).hex()
+
+        # Construct L1 Oracle Storage Proof
+        out_root_bytes = bytes.fromhex(output_root[2:])
+        mapping_slot = 3
+        storage_key = keccak256((42).to_bytes(32, "big") + mapping_slot.to_bytes(32, "big"))
+        nibbles_storage = []
+        for b in storage_key:
+            nibbles_storage.extend([b >> 4, b & 0x0F])
+        compact_storage = encode_compact_path(nibbles_storage, is_leaf=True)
+        storage_leaf_rlp = rlp_encode([compact_storage, rlp_encode_bytes(out_root_bytes)])
+        oracle_storage_root = keccak256(storage_leaf_rlp)
+
+        # Construct L1 Oracle Account Proof
+        oracle_addr = "0x56315b90c40730925ec54a5a02b662791cb298f5"
+        oracle_acct_key = keccak256(bytes.fromhex(oracle_addr[2:]))
+        nonce_bytes = (1).to_bytes(1, "big")
+        balance_bytes = b""
+        code_hash = keccak256(b"code")
+        acct_val_rlp = rlp_encode([nonce_bytes, balance_bytes, oracle_storage_root, code_hash])
+        nibbles_acct = []
+        for b in oracle_acct_key:
+            nibbles_acct.extend([b >> 4, b & 0x0F])
+        compact_acct = encode_compact_path(nibbles_acct, is_leaf=True)
+        acct_leaf_rlp = rlp_encode([compact_acct, acct_val_rlp])
+        l1_state_root = "0x" + keccak256(acct_leaf_rlp).hex()
+
+        def _make_ssz_branch(leaf: bytes, gindex: int):
+            curr = leaf
+            k = gindex
+            branch = []
+            while k > 1:
+                sibling = hashlib.sha256(b"sibling:" + k.to_bytes(4, "big")).digest()
+                branch.append(sibling)
+                if k % 2 == 1:
+                    curr = hashlib.sha256(sibling + curr).digest()
+                else:
+                    curr = hashlib.sha256(curr + sibling).digest()
+                k //= 2
+            return curr, branch
+
+        def _create_verified_anchor(b_num, b_hash_str, s_root_str, c_id=1):
+            b_hash_bytes = bytes.fromhex(b_hash_str[2:])
+            s_root_bytes = bytes.fromhex(s_root_str[2:])
+            ep_root, sr_br = _make_ssz_branch(s_root_bytes, 34)
+            body_root, ep_br = _make_ssz_branch(ep_root, 25)
+            pubkeys_512 = [hashlib.sha256(f"pk_{i}".encode()).digest() + hashlib.sha256(f"ext_{i}".encode()).digest()[:16] for i in range(512)]
+            sync_root = bytes.fromhex("98d69927b32c3e0bd9f091f2f728fb95aeec620d2b5f04390465e65cd5d00b5c")
+            fin_root = bytes.fromhex("33" * 32)
+            beacon_state_root, fin_br = _make_ssz_branch(fin_root, 105)
+            ev = HeaderConsensusEvidence(
+                slot=9_000_000,
+                proposer_index=1,
+                parent_root=bytes.fromhex("22" * 32),
+                beacon_state_root=beacon_state_root,
+                body_root=body_root,
+                execution_payload_root=ep_root,
+                execution_block_hash=b_hash_bytes,
+                execution_block_number=b_num,
+                execution_state_root=s_root_bytes,
+                execution_receipts_root=bytes.fromhex("11" * 32),
+                execution_timestamp=1700000000,
+                execution_payload_branch=ep_br,
+                state_root_branch=sr_br,
+                sync_committee_bits=b"\xff" * 64,
+                sync_committee_signature=b"\xaa" * 96,
+                sync_committee_root=sync_root,
+                finalized_checkpoint_root=fin_root,
+                finalized_root_branch=fin_br,
+                signature_slot=9_000_001,
+                finalized_checkpoint_epoch=281250,
+                sync_committee_pubkeys=pubkeys_512,
+            )
+            return BlockHeaderTrustAnchor(
+                chain_id=c_id,
+                block_number=b_num,
+                block_hash=b_hash_str,
+                state_root=s_root_str,
+                header_timestamp_utc="2026-11-15T00:00:00Z",
+                consensus_mechanism="PROOF_OF_STAKE",
+                parent_hash="0x" + "22" * 32,
+                receipts_root="0x" + "11" * 32,
+                finality_status="FINALIZED_CANONICAL",
+                trust_source="ETH_CONSENSUS_SYNC_COMMITTEE",
+                verification_seal="",
+                is_authenticated=True,
+                consensus_evidence=ev,
+            )
+
+        # Register L1 Trust Anchor
+        l1_b_hash = "0x" + "55" * 32
+        l1_anchor = _create_verified_anchor(19_500_000, l1_b_hash, l1_state_root, c_id=1)
+        with mock.patch("scripts.consensus_proof_verifier.verify_bls_aggregate_signature", return_value=True):
+            BlockHeaderTrustAnchorRegistry.register(l1_anchor)
+
+        valid_op_payload = OpStackOutputProofPayload(
+            withdrawal_hash=w_hash,
+            l2_output_index=42,
+            l2_block_number=12345678,
+            l2_block_hash=b_hash,
+            l2_state_root=s_root,
+            l2_message_passer_storage_root=mp_root,
+            l2_message_passer_proof=[leaf_rlp],
+            l1_oracle_address=oracle_addr,
+            l1_block_number=19_500_000,
+            l1_block_hash=l1_b_hash,
+            l1_oracle_account_proof=[acct_leaf_rlp],
+            l1_output_storage_proof=[storage_leaf_rlp],
+            l2_chain_id=8453,
+            version_byte=b"\x00",
+            l1_output_slot=3,
+            l1_oracle_output_root=output_root,
+        )
+
+        ok, valid_op_proof, err = OpStackOutputProofVerifier.verify_withdrawal_proof(
+            valid_op_payload, l1_trust_anchor=l1_anchor
+        )
+        self.assertTrue(ok)
+        self.assertIsNotNone(valid_op_proof)
+
+        st_elapsed_auth = MultiChainFinalityEngine.evaluate_op_stack_withdrawal(
+            proven_withdrawal_timestamp=t_proven,
+            current_l1_timestamp=t_proven + delay + 100,
+            proof_maturity_delay_seconds=delay,
+            output_proof_evidence=valid_op_proof,
+            expected_withdrawal_hash=w_hash,
+            expected_output_root=output_root,
+            l1_trust_anchor=l1_anchor,
+        )
+        self.assertEqual(st_elapsed_auth, FinalityState.WITHDRAWAL_PROOF_MATURE_FINAL)
+
+        # Direct payload verification also produces WITHDRAWAL_PROOF_MATURE_FINAL
+        st_elapsed_payload = MultiChainFinalityEngine.evaluate_op_stack_withdrawal(
+            proven_withdrawal_timestamp=t_proven,
+            current_l1_timestamp=t_proven + delay + 100,
+            proof_maturity_delay_seconds=delay,
+            output_proof_payload=valid_op_payload,
+            expected_withdrawal_hash=w_hash,
+            expected_output_root=output_root,
+            l1_trust_anchor=l1_anchor,
+        )
+        self.assertEqual(st_elapsed_payload, FinalityState.WITHDRAWAL_PROOF_MATURE_FINAL)
+
+        # 5. Adversarial checks for Requirement J:
+        # 5a. Caller-constructed unsealed dataclass alone MUST NOT promote to verified finality
+        unsealed_evidence = OpStackOutputProofEvidence(
+            withdrawal_hash=w_hash,
+            l2_output_index=42,
+            l2_block_number=12345678,
+            output_root=output_root,
+            l1_oracle_output_root=output_root,
+            is_valid=True,
+        )
+        st_unsealed = MultiChainFinalityEngine.evaluate_op_stack_withdrawal(
+            proven_withdrawal_timestamp=t_proven,
+            current_l1_timestamp=t_proven + delay + 100,
+            proof_maturity_delay_seconds=delay,
+            output_proof_evidence=unsealed_evidence,
+        )
+        self.assertEqual(st_unsealed, FinalityState.FINALITY_CALLER_ASSERTED_UNVERIFIED)
+
+        # 5b. Forged HMAC seal on OpStackAuthenticatedProofResult is rejected
+        forged_result = OpStackAuthenticatedProofResult(
+            withdrawal_hash=w_hash,
+            l2_output_index=42,
+            l2_block_number=12345678,
+            output_root=output_root,
+            l1_oracle_output_root=output_root,
+            is_valid=True,
+            verification_seal="forged_seal_00000000000000000000000000000000000000000000000000000000",
+        )
+        st_forged_seal = MultiChainFinalityEngine.evaluate_op_stack_withdrawal(
+            proven_withdrawal_timestamp=t_proven,
+            current_l1_timestamp=t_proven + delay + 100,
+            proof_maturity_delay_seconds=delay,
+            output_proof_evidence=forged_result,
+        )
+        self.assertEqual(st_forged_seal, FinalityState.FINALITY_CALLER_ASSERTED_UNVERIFIED)
+
+        # 5c. Caller-asserted Boolean flag `has_authenticated_output_proof=True` alone is strictly rejected
+        st_forged_bool = MultiChainFinalityEngine.evaluate_op_stack_withdrawal(
+            proven_withdrawal_timestamp=t_proven,
+            current_l1_timestamp=t_proven + delay + 100,
+            proof_maturity_delay_seconds=delay,
+            has_authenticated_output_proof=True,
+        )
+        self.assertEqual(st_forged_bool, FinalityState.FINALITY_CALLER_ASSERTED_UNVERIFIED)
+
+        # 5d. Caller passing output_proof_evidence=True (Boolean) is rejected
+        st_bool_evidence = MultiChainFinalityEngine.evaluate_op_stack_withdrawal(
+            proven_withdrawal_timestamp=t_proven,
+            current_l1_timestamp=t_proven + delay + 100,
+            proof_maturity_delay_seconds=delay,
+            output_proof_evidence=True,  # type: ignore
+        )
+        self.assertEqual(st_bool_evidence, FinalityState.FINALITY_CALLER_ASSERTED_UNVERIFIED)
+
+        # 5e. Proof with is_valid=False is rejected
+        proof_invalid = dataclasses.replace(valid_op_proof, is_valid=False)
+        st_proof_invalid = MultiChainFinalityEngine.evaluate_op_stack_withdrawal(
+            proven_withdrawal_timestamp=t_proven,
+            current_l1_timestamp=t_proven + delay + 100,
+            proof_maturity_delay_seconds=delay,
+            output_proof_evidence=proof_invalid,
+        )
+        self.assertEqual(st_proof_invalid, FinalityState.FINALITY_CALLER_ASSERTED_UNVERIFIED)
+
+        # 5f. Mismatched output root rejected
+        st_root_mismatch = MultiChainFinalityEngine.evaluate_op_stack_withdrawal(
+            proven_withdrawal_timestamp=t_proven,
+            current_l1_timestamp=t_proven + delay + 100,
+            proof_maturity_delay_seconds=delay,
+            output_proof_evidence=valid_op_proof,
+            expected_output_root="0x" + "ff" * 32,
+        )
+        self.assertEqual(st_root_mismatch, FinalityState.FINALITY_CALLER_ASSERTED_UNVERIFIED)
+
+        # 5g. Mismatched withdrawal identity rejected
+        st_id_mismatch = MultiChainFinalityEngine.evaluate_op_stack_withdrawal(
+            proven_withdrawal_timestamp=t_proven,
+            current_l1_timestamp=t_proven + delay + 100,
+            proof_maturity_delay_seconds=delay,
+            output_proof_evidence=valid_op_proof,
+            expected_withdrawal_hash="0x" + "ee" * 32,
+        )
+        self.assertEqual(st_id_mismatch, FinalityState.FINALITY_CALLER_ASSERTED_UNVERIFIED)
+
+        # 5h. Output root does not match L1 oracle root rejected
+        proof_oracle_mismatch = dataclasses.replace(valid_op_proof, l1_oracle_output_root="0x" + "dd" * 32)
+        st_oracle_mismatch = MultiChainFinalityEngine.evaluate_op_stack_withdrawal(
+            proven_withdrawal_timestamp=t_proven,
+            current_l1_timestamp=t_proven + delay + 100,
+            proof_maturity_delay_seconds=delay,
+            output_proof_evidence=proof_oracle_mismatch,
+        )
+        self.assertEqual(st_oracle_mismatch, FinalityState.FINALITY_CALLER_ASSERTED_UNVERIFIED)
+
+        # 5i. Mandatory L1 Oracle Account or Storage proof missing fails closed
+        p_missing_l1 = dataclasses.replace(valid_op_payload, l1_oracle_account_proof=[])
+        ok_l1_miss, _, err_l1 = OpStackOutputProofVerifier.verify_withdrawal_proof(p_missing_l1, l1_trust_anchor=l1_anchor)
+        self.assertFalse(ok_l1_miss)
+        self.assertIn("MANDATORY_L1_ORACLE_PROOF_MISSING", err_l1)
+
+        # 5j. Mandatory L2 message passer proof missing fails closed
+        p_missing_l2 = dataclasses.replace(valid_op_payload, l2_message_passer_proof=[])
+        ok_l2_miss, _, err_l2 = OpStackOutputProofVerifier.verify_withdrawal_proof(p_missing_l2, l1_trust_anchor=l1_anchor)
+        self.assertFalse(ok_l2_miss)
+        self.assertIn("MANDATORY_L2_MESSAGE_PASSER_PROOF_MISSING", err_l2)
+
+        # 5k. Invalid Bedrock version byte (e.g. b"\x01") fails closed
+        p_bad_version = dataclasses.replace(valid_op_payload, version_byte=b"\x01")
+        ok_ver, _, err_ver = OpStackOutputProofVerifier.verify_withdrawal_proof(p_bad_version, l1_trust_anchor=l1_anchor)
+        self.assertFalse(ok_ver)
+        self.assertEqual(err_ver, "INVALID_OP_STACK_VERSION_BYTE")
+
+        # 5l. Unauthenticated L1 trust anchor fails closed
+        unauth_anchor = BlockHeaderTrustAnchor(
+            chain_id=1,
+            block_number=19_500_000,
+            block_hash=l1_b_hash,
+            state_root=l1_state_root,
+            header_timestamp_utc="2026-11-15T00:00:00Z",
+            is_authenticated=False,
+        )
+        ok_unauth, _, err_unauth = OpStackOutputProofVerifier.verify_withdrawal_proof(valid_op_payload, l1_trust_anchor=unauth_anchor)
+        self.assertFalse(ok_unauth)
+        self.assertEqual(err_unauth, "UNAUTHENTICATED_L1_BLOCK_HEADER_TRUST_ANCHOR_REQUIRED")
+
+        # 5m. L1 block number mismatch fails closed
+        p_block_mismatch = dataclasses.replace(valid_op_payload, l1_block_number=99_999_999)
+        ok_blk, _, err_blk = OpStackOutputProofVerifier.verify_withdrawal_proof(p_block_mismatch, l1_trust_anchor=l1_anchor)
+        self.assertFalse(ok_blk)
+        self.assertIn("L1_TRUST_ANCHOR_BLOCK_NUMBER_MISMATCH", err_blk)
+
+        # 5n. Caller-selected oracle address fails closed
+        p_bad_oracle = dataclasses.replace(valid_op_payload, l1_oracle_address="0x1111111111111111111111111111111111111111")
+        ok_oracle, _, err_oracle = OpStackOutputProofVerifier.verify_withdrawal_proof(p_bad_oracle, l1_trust_anchor=l1_anchor)
+        self.assertFalse(ok_oracle)
+        self.assertIn("REJECTED_CALLER_SELECTED_ORACLE_ADDRESS", err_oracle)
+
+        # 5o. Arbitrary output storage slot fails closed
+        p_bad_slot = dataclasses.replace(valid_op_payload, l1_output_slot=4)
+        ok_slot, _, err_slot = OpStackOutputProofVerifier.verify_withdrawal_proof(p_bad_slot, l1_trust_anchor=l1_anchor)
+        self.assertFalse(ok_slot)
+        self.assertEqual(err_slot, "REJECTED_ARBITRARY_STORAGE_SLOT_4")
+
+        # 5p. Direct caller injection into BlockHeaderTrustAnchorRegistry without authentication fails closed
+        caller_fake_anchor = BlockHeaderTrustAnchor(
+            chain_id=1,
+            block_number=19_500_001,
+            block_hash="0x" + "aa" * 32,
+            state_root="0x" + "bb" * 32,
+            header_timestamp_utc="2026-11-15T00:00:00Z",
+            is_authenticated=True,
+        )
+        with self.assertRaises(ValueError) as ctx_inj:
+            BlockHeaderTrustAnchorRegistry.register(caller_fake_anchor)
+        self.assertIn("failed cryptographic authenticity verification", str(ctx_inj.exception))
+
+        # 5q. L1 trust anchor chain ID mismatch fails closed
+        l1_wrong_chain_anchor = _create_verified_anchor(19_500_000, l1_b_hash, l1_state_root, c_id=10)
+        ok_chain, _, err_chain = OpStackOutputProofVerifier.verify_withdrawal_proof(valid_op_payload, l1_trust_anchor=l1_wrong_chain_anchor)
+        self.assertFalse(ok_chain)
+        self.assertIn("L1_TRUST_ANCHOR_CHAIN_MISMATCH", err_chain)
+
+        # 5r. Caller-created anchor with forged seal fails closed
+        forged_seal_anchor = BlockHeaderTrustAnchor(
+            chain_id=1,
+            block_number=19_500_000,
+            block_hash=l1_b_hash,
+            state_root=l1_state_root,
+            header_timestamp_utc="2026-11-15T00:00:00Z",
+            verification_seal="0x" + "ff" * 32,
+            is_authenticated=True,
+        )
+        ok_forge, _, err_forge = OpStackOutputProofVerifier.verify_withdrawal_proof(valid_op_payload, l1_trust_anchor=forged_seal_anchor)
+        self.assertFalse(ok_forge)
+        self.assertEqual(err_forge, "UNAUTHENTICATED_L1_BLOCK_HEADER_TRUST_ANCHOR_REQUIRED")
+
+        # 5s. Caller-constructed unsealed evidence NEVER produces WITHDRAWAL_PROOF_MATURE_FINAL
+        forged_evidence = OpStackOutputProofEvidence(
+            withdrawal_hash=w_hash,
+            l2_output_index=42,
+            l2_block_number=12345678,
+            output_root=output_root,
+            l1_oracle_output_root=output_root,
+            is_valid=True,
+        )
+        st_forged = MultiChainFinalityEngine.evaluate_op_stack_withdrawal(
+            proven_withdrawal_timestamp=t_proven,
+            current_l1_timestamp=t_proven + delay + 100,
+            proof_maturity_delay_seconds=delay,
+            output_proof_evidence=forged_evidence,
+            expected_withdrawal_hash=w_hash,
+            expected_output_root=output_root,
+            l1_trust_anchor=l1_anchor,
+        )
+        self.assertEqual(st_forged, FinalityState.FINALITY_CALLER_ASSERTED_UNVERIFIED)
+        self.assertNotEqual(st_forged, FinalityState.WITHDRAWAL_PROOF_MATURE_FINAL)
 
 
 if __name__ == "__main__":

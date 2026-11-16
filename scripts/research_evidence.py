@@ -57,13 +57,67 @@ import datetime as dt
 import decimal
 import enum
 import hashlib
+import hmac
 import json
 import math
 import os
 from pathlib import Path
 import re
+import subprocess
 import sys
+import time
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple
+
+try:
+    from scripts.consensus_proof_verifier import (
+        WormholeGuardianSet,
+        CANONICAL_PRODUCTION_GUARDIAN_SETS,
+        DEV_HARDHAT_ANVIL_KEYS,
+        compute_sync_committee_root,
+        keccak256,
+        verify_mpt_proof,
+        AccountStateLeaf,
+        UniswapV2Slot3Decoder,
+        MPTVerificationResult,
+        rlp_encode,
+        rlp_encode_bytes,
+        rlp_decode,
+        encode_compact_path,
+        compute_uniswap_v2_pair_address,
+        HeaderConsensusEvidence,
+        HeaderConsensusVerifier,
+        UNISWAP_V2_FACTORY_MAINNET,
+        secp256k1_ecrecover,
+        parse_wormhole_vaa,
+        verify_wormhole_vaa,
+        GINDEX_EXECUTION_PAYLOAD_STATE_ROOT,
+        GINDEX_FINALIZED_CHECKPOINT_ROOT,
+    )
+except ImportError:
+    from consensus_proof_verifier import (
+        WormholeGuardianSet,
+        CANONICAL_PRODUCTION_GUARDIAN_SETS,
+        DEV_HARDHAT_ANVIL_KEYS,
+        compute_sync_committee_root,
+        keccak256,
+        verify_mpt_proof,
+        AccountStateLeaf,
+        UniswapV2Slot3Decoder,
+        MPTVerificationResult,
+        rlp_encode,
+        rlp_encode_bytes,
+        rlp_decode,
+        encode_compact_path,
+        compute_uniswap_v2_pair_address,
+        HeaderConsensusEvidence,
+        HeaderConsensusVerifier,
+        UNISWAP_V2_FACTORY_MAINNET,
+        secp256k1_ecrecover,
+        parse_wormhole_vaa,
+        verify_wormhole_vaa,
+        GINDEX_EXECUTION_PAYLOAD_STATE_ROOT,
+        GINDEX_FINALIZED_CHECKPOINT_ROOT,
+    )
 
 # Decimal context with 100 digits of precision for canonical TickMath verification
 decimal.getcontext().prec = 100
@@ -249,6 +303,396 @@ class UniswapV3TickMath:
 # 3. Reproducibility Manifest & Protected Data Verifier
 # ==============================================================================
 
+TRUSTED_VALUATION_SOURCES: Set[str] = {
+    "CHAINLINK_ORACLE",
+    "UNISWAP_V3_TWAP",
+    "PYTH_NETWORK",
+}
+
+
+def get_actual_git_state(base_dir: Optional[Path] = None) -> Tuple[Optional[str], Optional[bool]]:
+    """Inspects actual git state (HEAD SHA and working tree cleanliness) via git CLI.
+    Returns (head_sha, is_clean). If git is unavailable or not in a git repo, returns (None, None).
+    Never silently falls back to a different working directory.
+    """
+    try:
+        cwd = str(base_dir) if base_dir else os.getcwd()
+        res_sha = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if res_sha.returncode != 0:
+            return None, None
+        head_sha = res_sha.stdout.strip()
+
+        res_status = subprocess.run(
+            ["git", "status", "--porcelain"],
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if res_status.returncode != 0:
+            return head_sha, None
+        is_clean = len(res_status.stdout.strip()) == 0
+        return head_sha, is_clean
+    except Exception:
+        return None, None
+
+
+def derive_actual_runtime_dependencies() -> Dict[str, str]:
+    """Derives complete runtime dependency inventory from actual installed packages via importlib.metadata.
+    Strictly fails closed if enumeration fails or raises an exception.
+    """
+    import importlib.metadata
+    deps: Dict[str, str] = {}
+    enumeration_succeeded = True
+    try:
+        for dist in importlib.metadata.distributions():
+            name = dist.metadata.get("Name")
+            if name:
+                deps[name.lower()] = dist.version
+    except Exception:
+        enumeration_succeeded = False
+
+    deps["python"] = sys.version.split()[0]
+    pkg_count = len([k for k in deps.keys() if k not in {"python", "inventory_status"}])
+    if enumeration_succeeded and pkg_count >= 2:
+        deps["inventory_status"] = "COMPLETE"
+    else:
+        deps["inventory_status"] = "INCOMPLETE"
+    return deps
+
+
+def derive_reproducible_environment_info(base_dir: Optional[Path] = None) -> Dict[str, Any]:
+    """Captures reproducible environment information, distinguishing installed-package inventory
+    from a complete reproducible dependency lock (e.g. requirements.txt or poetry.lock).
+    """
+    root = base_dir or Path(os.getcwd())
+    lock_candidates = [
+        ("requirements.txt", "PIP_REQUIREMENTS_LOCK"),
+        ("Pipfile.lock", "PIPENV_LOCK"),
+        ("poetry.lock", "POETRY_LOCK"),
+        ("pyproject.toml", "PYPROJECT_TOML"),
+    ]
+    lock_info: Dict[str, Any] = {
+        "lock_type": "UNPINNED_ENVIRONMENT",
+        "lock_file": None,
+        "lock_sha256": None,
+        "is_reproducible_lock": False,
+        "environment_reproducibility": "INSTALLED_INVENTORY_ONLY_NOT_REPRODUCIBLE_LOCK",
+    }
+    for fname, ltype in lock_candidates:
+        candidate_path = root / fname
+        if candidate_path.is_file():
+            lock_info["lock_type"] = ltype
+            lock_info["lock_file"] = fname
+            lock_info["lock_sha256"] = hashlib.sha256(candidate_path.read_bytes()).hexdigest().upper()
+            lock_info["is_reproducible_lock"] = True
+            lock_info["environment_reproducibility"] = f"PINNED_DEPENDENCY_LOCK_{ltype}"
+            break
+    return lock_info
+
+
+@dataclasses.dataclass
+class CompleteReplayManifest:
+    """Verifiable, tamper-evident replay manifest capturing complete environment and assumptions."""
+    git_commit_sha: str
+    is_working_tree_clean: bool
+    python_version: str
+    dependency_versions: Dict[str, str]
+    input_datasets: Dict[str, Dict[str, Any]]
+    configuration_hashes: Dict[str, str]
+    identity_bindings: Dict[str, Any]
+    valuation_sources: Dict[str, Any]
+    gas_fee_assumptions: Dict[str, Any]
+    slippage_execution_assumptions: Dict[str, Any]
+    source_evidence_ids: List[str]
+    consumed_configurations: Optional[List[str]] = None
+    reproducible_environment: Optional[Dict[str, Any]] = None
+
+    def to_dict(self) -> Dict[str, Any]:
+        return dataclasses.asdict(self)
+
+    def compute_digest(self) -> str:
+        """Deterministic SHA-256 digest over canonical JSON representation."""
+        canonical_str = json.dumps(self.to_dict(), sort_keys=True, separators=(",", ":"))
+        return hashlib.sha256(canonical_str.encode("utf-8")).hexdigest()
+
+    def validate(self, base_dir: Optional[Path] = None) -> Tuple[bool, List[str]]:
+        """Strictly validates all manifest metadata, file paths, SHA-256 formats and hashes,
+        record counts, configuration hashes, dependency versions, and valuation sources.
+        Fails closed on any discrepancy or unverifiable input.
+        """
+        errors = []
+        hex64_pattern = re.compile(r"^[0-9a-fA-F]{64}$")
+        hex40_pattern = re.compile(r"^[0-9a-fA-F]{40}$")
+
+        # 1. Validate git commit SHA format and actual git state
+        root = base_dir or Path(os.getcwd())
+        if base_dir is not None:
+            resolved_base = Path(base_dir).resolve()
+            if not (resolved_base / ".git").exists():
+                errors.append(f"INCORRECT_REPOSITORY_ROOT: base_dir '{base_dir}' is not a git repository root (missing .git)")
+
+        actual_head, actual_clean = get_actual_git_state(root)
+        if actual_head is None or actual_clean is None:
+            errors.append("GIT_STATE_UNAVAILABLE: Git commit and working tree state could not be independently inspected")
+        else:
+            if not self.git_commit_sha or not hex40_pattern.match(self.git_commit_sha):
+                errors.append(f"Invalid git_commit_sha format: {self.git_commit_sha!r}")
+            elif self.git_commit_sha.lower() != actual_head.lower():
+                errors.append(f"Git commit SHA mismatch: claimed {self.git_commit_sha}, actual {actual_head}")
+            if self.is_working_tree_clean != actual_clean:
+                errors.append(f"Git working tree clean status mismatch: claimed {self.is_working_tree_clean}, actual {actual_clean}")
+
+        # 2. Validate python and dependency versions
+        if not self.python_version or not isinstance(self.python_version, str):
+            errors.append(f"Invalid python_version: {self.python_version!r}")
+        if not self.dependency_versions or not isinstance(self.dependency_versions, dict):
+            errors.append("dependency_versions must be a non-empty dictionary")
+        else:
+            if "python" not in self.dependency_versions:
+                errors.append("dependency_versions missing required 'python' entry")
+            pkg_keys = {k for k in self.dependency_versions.keys() if k not in {"python", "inventory_status"}}
+            if len(pkg_keys) == 0:
+                errors.append("DEPENDENCY_INVENTORY_INCOMPLETE: Inventory contains only Python without installed runtime dependencies")
+            inv_status = self.dependency_versions.get("inventory_status")
+            if inv_status == "INCOMPLETE":
+                errors.append("DEPENDENCY_INVENTORY_INCOMPLETE: strict replay requires COMPLETE inventory")
+            elif inv_status is not None and inv_status != "COMPLETE":
+                errors.append(f"Invalid dependency inventory_status: {inv_status!r}")
+
+            import importlib.metadata
+            for pkg_name, claimed_ver in self.dependency_versions.items():
+                if pkg_name in {"python", "inventory_status"}:
+                    continue
+                try:
+                    actual_ver = importlib.metadata.version(pkg_name)
+                    if claimed_ver != actual_ver:
+                        errors.append(f"Dependency '{pkg_name}' version mismatch: claimed {claimed_ver}, installed {actual_ver}")
+                except importlib.metadata.PackageNotFoundError:
+                    errors.append(f"Dependency '{pkg_name}' not installed in runtime environment")
+                except Exception as e:
+                    errors.append(f"Dependency '{pkg_name}' inspection error: {e}")
+
+        # 3. Validate input datasets (dataset_a is required)
+        if not self.input_datasets or not isinstance(self.input_datasets, dict):
+            errors.append("input_datasets must be a non-empty dictionary")
+        else:
+            if "dataset_a" not in self.input_datasets:
+                errors.append("input_datasets missing required 'dataset_a'")
+
+            root = base_dir or Path(os.getcwd())
+            for d_name, d_meta in self.input_datasets.items():
+                if not isinstance(d_meta, dict):
+                    errors.append(f"Dataset '{d_name}' metadata must be a dictionary")
+                    continue
+                d_path_str = d_meta.get("path")
+                d_sha = d_meta.get("sha256")
+                d_count = d_meta.get("record_count") if "record_count" in d_meta else d_meta.get("count")
+
+                # Validate SHA-256 format
+                if not d_sha or not isinstance(d_sha, str) or not hex64_pattern.match(d_sha):
+                    errors.append(f"Dataset '{d_name}' has invalid SHA-256 format: {d_sha!r}")
+
+                # Validate record count format
+                if d_count is None or type(d_count) is not int or d_count < 0:
+                    errors.append(f"Dataset '{d_name}' has invalid record_count: {d_count!r}")
+
+                # Validate actual file on disk
+                if not d_path_str:
+                    errors.append(f"Dataset '{d_name}' missing path")
+                else:
+                    d_path = Path(d_path_str)
+                    if not d_path.is_absolute():
+                        d_path = root / d_path
+                    if not d_path.is_file():
+                        errors.append(f"Dataset '{d_name}' file not found: {d_path}")
+                    else:
+                        with open(d_path, "rb") as f:
+                            actual_bytes = f.read()
+                        actual_sha = hashlib.sha256(actual_bytes).hexdigest().upper()
+                        if d_sha and actual_sha != d_sha.upper():
+                            errors.append(f"Dataset '{d_name}' SHA-256 mismatch: claimed {d_sha}, actual {actual_sha}")
+
+                        # Validate actual record count
+                        actual_count = 0
+                        try:
+                            text_content = actual_bytes.decode("utf-8")
+                            try:
+                                json_obj = json.loads(text_content)
+                                if isinstance(json_obj, list):
+                                    actual_count = len(json_obj)
+                                elif isinstance(json_obj, dict):
+                                    if "positions" in json_obj and isinstance(json_obj["positions"], list):
+                                        actual_count = len(json_obj["positions"])
+                                    elif "records" in json_obj and isinstance(json_obj["records"], list):
+                                        actual_count = len(json_obj["records"])
+                                    else:
+                                        actual_count = len(json_obj)
+                            except json.JSONDecodeError:
+                                actual_count = sum(1 for line in text_content.splitlines() if line.strip())
+                        except Exception as e:
+                            errors.append(f"Dataset '{d_name}' failed record count parse: {e}")
+
+                        if d_count is not None and actual_count != d_count:
+                            errors.append(f"Dataset '{d_name}' record count mismatch: claimed {d_count}, actual {actual_count}")
+
+        # 4. Validate configuration hashes and verify on-disk files if present
+        if not self.configuration_hashes or not isinstance(self.configuration_hashes, dict):
+            errors.append("configuration_hashes must be a non-empty dictionary")
+        else:
+            root = base_dir or Path(os.getcwd())
+            for c_name, c_hash in self.configuration_hashes.items():
+                if not c_hash or not isinstance(c_hash, str) or not hex64_pattern.match(c_hash):
+                    errors.append(f"Configuration '{c_name}' has invalid SHA-256 format: {c_hash!r}")
+                else:
+                    cfg_file = Path(c_name)
+                    if not cfg_file.is_absolute():
+                        cfg_file = root / cfg_file
+                    if cfg_file.is_file():
+                        with open(cfg_file, "rb") as f:
+                            actual_cfg_sha = hashlib.sha256(f.read()).hexdigest().upper()
+                        if actual_cfg_sha != c_hash.upper():
+                            errors.append(f"Configuration '{c_name}' SHA-256 mismatch: claimed {c_hash}, actual {actual_cfg_sha}")
+                    elif c_name.endswith(".json") or c_name.endswith(".yaml") or c_name.endswith(".toml") or "/" in c_name or "\\" in c_name:
+                        errors.append(f"Configuration file not found on disk: {c_name}")
+
+            # Validate explicitly consumed configurations if provided
+            if self.consumed_configurations is not None:
+                for req_cfg in self.consumed_configurations:
+                    if not any(k == req_cfg or Path(k).name == Path(req_cfg).name for k in self.configuration_hashes.keys()):
+                        errors.append(f"Missing replay configuration input: '{req_cfg}' consumed by replay but omitted from configuration_hashes")
+                    req_path = Path(req_cfg)
+                    if not req_path.is_absolute():
+                        req_path = root / req_path
+                    if not req_path.is_file():
+                        errors.append(f"Missing replay configuration input file on disk: '{req_cfg}'")
+
+            # Discover all configuration inputs actually consumed by the replay on disk (recursive)
+            config_patterns = ["*config*.json", "*config*.yaml", "*config*.toml"]
+            discovered_configs = set()
+            ignored_parts = {".git", ".pytest_cache", "__pycache__", ".system_generated", "venv", "env", ".venv", "node_modules", "brain", "review_package"}
+            for pat in config_patterns:
+                for cfg_path in root.rglob(pat):
+                    if cfg_path.is_file():
+                        try:
+                            rel = cfg_path.relative_to(root)
+                        except ValueError:
+                            continue
+                        if any(part in ignored_parts or part.startswith("backup") or part.startswith(".backup") for part in rel.parts):
+                            continue
+                        discovered_configs.add(rel.as_posix())
+
+            for disc_cfg in sorted(discovered_configs):
+                if not any(k == disc_cfg or Path(k).name == Path(disc_cfg).name for k in self.configuration_hashes.keys()):
+                    errors.append(f"Unlisted configuration file omitted from manifest: {disc_cfg}")
+
+        # 5. Validate valuation sources against trusted registry
+        if not self.valuation_sources or not isinstance(self.valuation_sources, dict):
+            errors.append("valuation_sources must be a non-empty dictionary")
+        else:
+            for v_name, v_meta in self.valuation_sources.items():
+                if not isinstance(v_meta, dict):
+                    errors.append(f"Valuation source '{v_name}' must be a dictionary")
+                    continue
+                v_src = v_meta.get("source")
+                if not v_src or not isinstance(v_src, str):
+                    errors.append(f"Valuation source '{v_name}' missing exact 'source' identifier")
+                elif v_src not in TRUSTED_VALUATION_SOURCES:
+                    errors.append(f"Valuation source '{v_name}' has untrusted source: {v_src!r}")
+                ts = v_meta.get("timestamp_utc")
+                if not ts or not isinstance(ts, str):
+                    errors.append(f"Valuation source '{v_name}' missing 'timestamp_utc'")
+                else:
+                    try:
+                        parsed_ts = dt.datetime.fromisoformat(ts.replace("Z", "+00:00"))
+                        if parsed_ts.tzinfo is None:
+                            errors.append(f"Valuation source '{v_name}' timestamp is timezone-naive")
+                    except Exception:
+                        errors.append(f"Valuation source '{v_name}' has invalid timestamp format: {ts!r}")
+
+        # 6. Validate source evidence IDs
+        if not self.source_evidence_ids or not isinstance(self.source_evidence_ids, list) or len(self.source_evidence_ids) == 0:
+            errors.append("source_evidence_ids must be a non-empty list")
+
+        # 7. Validate reproducible_environment and lockfile integrity if present
+        if self.reproducible_environment is not None:
+            if not isinstance(self.reproducible_environment, dict):
+                errors.append("reproducible_environment must be a dictionary")
+            else:
+                lock_file = self.reproducible_environment.get("lock_file")
+                claimed_sha = self.reproducible_environment.get("lock_sha256")
+                is_lock = self.reproducible_environment.get("is_reproducible_lock")
+                if is_lock:
+                    if not lock_file:
+                        errors.append("reproducible_environment claims is_reproducible_lock=True but lock_file is None")
+                    if not claimed_sha:
+                        errors.append("reproducible_environment claims is_reproducible_lock=True but lock_sha256 is None")
+                if lock_file:
+                    lf_path = Path(lock_file)
+                    if not lf_path.is_absolute():
+                        lf_path = root / lf_path
+                    if not lf_path.is_file():
+                        errors.append(f"Lockfile '{lock_file}' specified in reproducible_environment not found on disk")
+                    else:
+                        actual_sha = hashlib.sha256(lf_path.read_bytes()).hexdigest().upper()
+                        if claimed_sha and actual_sha != claimed_sha.upper():
+                            errors.append(f"Lockfile '{lock_file}' SHA-256 mismatch: claimed {claimed_sha}, actual {actual_sha}")
+
+        return len(errors) == 0, errors
+
+
+class ReplayManifestBuilder:
+    """Constructs verifiable, tamper-evident replay manifests for research intelligence runs."""
+
+    @classmethod
+    def build(
+        cls,
+        git_commit_sha: str,
+        is_working_tree_clean: bool,
+        input_datasets: Dict[str, Dict[str, Any]],
+        configuration_hashes: Dict[str, str],
+        identity_bindings: Dict[str, Any],
+        valuation_sources: Dict[str, Any],
+        gas_fee_assumptions: Dict[str, Any],
+        slippage_execution_assumptions: Dict[str, Any],
+        source_evidence_ids: List[str],
+        dependency_versions: Optional[Dict[str, str]] = None,
+        python_version: Optional[str] = None,
+        base_dir: Optional[Path] = None,
+        reproducible_environment: Optional[Dict[str, Any]] = None,
+        validate_strict: bool = True,
+    ) -> CompleteReplayManifest:
+        if dependency_versions is None:
+            dependency_versions = derive_actual_runtime_dependencies()
+        if reproducible_environment is None:
+            reproducible_environment = derive_reproducible_environment_info(base_dir=base_dir)
+        manifest = CompleteReplayManifest(
+            git_commit_sha=git_commit_sha,
+            is_working_tree_clean=is_working_tree_clean,
+            python_version=python_version or sys.version.split()[0],
+            dependency_versions=dependency_versions,
+            input_datasets=input_datasets,
+            configuration_hashes=configuration_hashes,
+            identity_bindings=identity_bindings,
+            valuation_sources=valuation_sources,
+            gas_fee_assumptions=gas_fee_assumptions,
+            slippage_execution_assumptions=slippage_execution_assumptions,
+            source_evidence_ids=sorted(list(source_evidence_ids)),
+            reproducible_environment=reproducible_environment,
+        )
+        if validate_strict:
+            is_valid, errors = manifest.validate(base_dir=base_dir)
+            if not is_valid:
+                raise ValueError(f"CompleteReplayManifest validation failed: {'; '.join(errors)}")
+        return manifest
+
+
 class ProtectedDataVerifier:
     """Computes and validates pre-run and post-run hashes of all protected project data.
     
@@ -429,7 +873,18 @@ class RpcProvenanceVerifier:
 
     def persist_raw_wire_payloads(self, record: RpcEvidenceRecord) -> Tuple[Path, Path]:
         """Persists raw request and response bytes to disk and returns paths."""
-        dest_dir = self.evidence_dir / str(record.chain_id) / str(record.block_number)
+        if type(record.chain_id) is not int or record.chain_id <= 0:
+            raise ValueError(f"chain_id must be a positive integer, got: {record.chain_id!r}")
+        if type(record.block_number) is not int or record.block_number <= 0:
+            raise ValueError(f"block_number must be a positive integer, got: {record.block_number!r}")
+
+        dest_dir = (self.evidence_dir / str(record.chain_id) / str(record.block_number)).resolve()
+        evidence_root = self.evidence_dir.resolve()
+        try:
+            dest_dir.relative_to(evidence_root)
+        except ValueError:
+            raise ValueError(f"Path traversal detected in evidence directory: {dest_dir}")
+
         dest_dir.mkdir(parents=True, exist_ok=True)
         req_path = dest_dir / f"req_{record.computed_request_sha256}.bin"
         resp_path = dest_dir / f"resp_{record.computed_response_sha256}.bin"
@@ -567,11 +1022,25 @@ class RpcProvenanceVerifier:
 
     def quarantine_reorganized_block(self, record: RpcEvidenceRecord, reason: str) -> Path:
         """Isolates reorganized or unlinked block artifacts into quarantine sink."""
-        dest = self.quarantine_dir / str(record.chain_id) / str(record.block_number)
+        if type(record.chain_id) is not int or record.chain_id <= 0:
+            raise ValueError(f"chain_id must be a positive integer, got: {record.chain_id!r}")
+        if type(record.block_number) is not int or record.block_number <= 0:
+            raise ValueError(f"block_number must be a positive integer, got: {record.block_number!r}")
+
+        dest = (self.quarantine_dir / str(record.chain_id) / str(record.block_number)).resolve()
+        quarantine_root = self.quarantine_dir.resolve()
+        try:
+            dest.relative_to(quarantine_root)
+        except ValueError:
+            raise ValueError(f"Path traversal detected in quarantine directory: {dest}")
+
         dest.mkdir(parents=True, exist_ok=True)
+        now_dt = dt.datetime.now(dt.timezone.utc)
+        reason_hash = hashlib.sha256(reason.encode("utf-8")).hexdigest()[:8]
+
         manifest = {
             "reason": reason,
-            "quarantined_at_utc": dt.datetime.now(dt.timezone.utc).isoformat(),
+            "quarantined_at_utc": now_dt.isoformat(),
             "chain_id": record.chain_id,
             "block_number": record.block_number,
             "block_hash": record.block_hash,
@@ -582,14 +1051,881 @@ class RpcProvenanceVerifier:
             "request_sha256": record.expected_request_sha256,
             "response_sha256": record.expected_response_sha256,
         }
-        with open(dest / "quarantine_manifest.json", "w", encoding="utf-8") as f:
-            json.dump(manifest, f, indent=2)
+
+        # 1. Exclusive creation of unique immutable artifact with high-resolution nanosecond timestamp & entropy
+        created_file = None
+        for _ in range(10):
+            timestamp_ns = time.time_ns()
+            entropy = os.urandom(6).hex()
+            candidate_file = dest / f"quarantine_{record.block_hash}_{timestamp_ns}_{entropy}_{reason_hash}.json"
+            try:
+                with open(candidate_file, "x", encoding="utf-8") as f:
+                    json.dump(manifest, f, indent=2)
+                created_file = candidate_file
+                break
+            except FileExistsError:
+                continue
+
+        if created_file is None:
+            raise RuntimeError(f"Failed to exclusively create quarantine artifact in {dest}")
+
+        # 2. Preserve prior canonical manifest; only write if it does not already exist
+        canonical_manifest = dest / "quarantine_manifest.json"
+        if not canonical_manifest.exists():
+            try:
+                with open(canonical_manifest, "x", encoding="utf-8") as f:
+                    json.dump(manifest, f, indent=2)
+            except FileExistsError:
+                pass  # Race condition safe: existing canonical manifest is never overwritten
+
+        # 3. Append to immutable history log
+        log_file = dest / "quarantine_history.jsonl"
+        with open(log_file, "a", encoding="utf-8") as f:
+            f.write(json.dumps(manifest) + "\n")
+
         return dest
 
 
 # ==============================================================================
-# 5. Configuration-Driven Multi-Chain Finality State Machine
+# 5. Configuration-Driven Multi-Chain Finality State Machine & Trust Anchors
 # ==============================================================================
+
+BASE58_ALPHABET = set("123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz")
+HEX_ALPHABET = set("0123456789abcdefABCDEF")
+
+
+def canonicalize_token_address(token_identifier: str, chain: str | int | None = None) -> str:
+    """Extracts canonical on-chain token address:
+    - EVM: lowercases and validates 0x hex format.
+    - Solana: strictly preserves Base58 case and validates Base58 charset (len 32-44). Never lowercases Solana addresses.
+    - Rejects malformed addresses or characters.
+    """
+    if not token_identifier or not isinstance(token_identifier, str):
+        raise ValueError(f"Invalid token identifier: {token_identifier}")
+
+    raw = token_identifier.strip()
+    prefix = ""
+    addr = raw
+    if ":" in raw:
+        parts = raw.split(":", 1)
+        prefix = parts[0].strip().lower()
+        addr = parts[1].strip()
+
+    is_solana = False
+    if chain is not None:
+        chain_str = str(chain).strip().lower()
+        if chain_str in {"solana", "sol", "101", "102", "103"}:
+            is_solana = True
+    elif prefix in {"solana", "sol"}:
+        is_solana = True
+    elif not addr.startswith("0x") and 32 <= len(addr) <= 44 and all(c in BASE58_ALPHABET for c in addr):
+        is_solana = True
+
+    if is_solana:
+        if not (32 <= len(addr) <= 44):
+            raise ValueError(f"Invalid Solana address length ({len(addr)}): {addr}")
+        if not all(c in BASE58_ALPHABET for c in addr):
+            raise ValueError(f"Invalid Solana Base58 character in address: {addr}")
+        return addr  # Strictly preserve case!
+
+    # EVM address
+    if not addr.lower().startswith("0x"):
+        raise ValueError(f"Invalid EVM address (must start with 0x): {token_identifier}")
+    hex_body = addr[2:]
+    if not hex_body or not all(c in HEX_ALPHABET for c in hex_body):
+        raise ValueError(f"Invalid EVM address hex characters: {token_identifier}")
+
+    return "0x" + hex_body.lower()
+
+
+_POOL_METADATA_SEAL_KEY: bytes = os.urandom(32)
+
+
+@dataclasses.dataclass(frozen=True)
+class BlockHeaderTrustAnchor:
+    """Independently authenticated block header / consensus commitment trust anchor."""
+    chain_id: int
+    block_number: int
+    block_hash: str
+    state_root: str
+    header_timestamp_utc: str
+    consensus_mechanism: str = "PROOF_OF_STAKE"
+    parent_hash: Optional[str] = None
+    receipts_root: Optional[str] = None
+    finality_status: str = "FINALIZED_CANONICAL"
+    trust_source: str = "ETH_CONSENSUS_SYNC_COMMITTEE"
+    verification_seal: str = ""
+    is_authenticated: bool = False
+    consensus_evidence: Optional[HeaderConsensusEvidence] = None
+
+    @classmethod
+    def _compute_seal(cls, *args: Any, **kwargs: Any) -> str:
+        """Abolished: Local HMAC seals are not treated as consensus authentication."""
+        return ""
+
+    @classmethod
+    def create_unverified_anchor(
+        cls,
+        chain_id: int,
+        block_number: int,
+        block_hash: str,
+        state_root: str,
+        header_timestamp_utc: str,
+        consensus_mechanism: str = "PROOF_OF_STAKE",
+        parent_hash: Optional[str] = None,
+        receipts_root: Optional[str] = None,
+        finality_status: str = "BLOCK_HEADER_UNVERIFIED",
+        trust_source: str = "UNVERIFIED_CALLER_ASSERTION",
+    ) -> "BlockHeaderTrustAnchor":
+        """Factory method returning an explicitly unverified anchor without cryptographic authentication."""
+        return cls(
+            chain_id=chain_id,
+            block_number=block_number,
+            block_hash=block_hash,
+            state_root=state_root,
+            header_timestamp_utc=header_timestamp_utc,
+            consensus_mechanism=consensus_mechanism,
+            parent_hash=parent_hash,
+            receipts_root=receipts_root,
+            finality_status="BLOCK_HEADER_UNVERIFIED",
+            trust_source=trust_source,
+            verification_seal="",
+            is_authenticated=False,
+            consensus_evidence=None,
+        )
+
+    @classmethod
+    def from_consensus_verification(
+        cls,
+        evidence: HeaderConsensusEvidence,
+        trusted_sync_committee_root: Optional[bytes] = None,
+        chain_id: int = 1,
+        header_timestamp_utc: Optional[str] = None,
+    ) -> "BlockHeaderTrustAnchor":
+        """Cryptographically verifies consensus evidence and issues an authenticated BlockHeaderTrustAnchor.
+        If verification fails or consensus evidence is invalid or unverified, returns an explicitly unverified anchor (is_authenticated=False).
+        """
+        ok, err = HeaderConsensusVerifier.verify_execution_header(
+            evidence=evidence,
+            trusted_sync_committee_root=trusted_sync_committee_root,
+        )
+        b_hash_hex = "0x" + evidence.execution_block_hash.hex()
+        s_root_hex = "0x" + evidence.execution_state_root.hex()
+        ts_str = header_timestamp_utc or dt.datetime.fromtimestamp(
+            evidence.execution_timestamp, dt.timezone.utc
+        ).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+        if not ok or err is not None:
+            return cls.create_unverified_anchor(
+                chain_id=chain_id,
+                block_number=evidence.execution_block_number,
+                block_hash=b_hash_hex,
+                state_root=s_root_hex,
+                header_timestamp_utc=ts_str,
+                finality_status="BLOCK_HEADER_UNVERIFIED",
+                trust_source=f"CONSENSUS_VERIFICATION_DOWNGRADED:{err}",
+            )
+
+        is_finalized = HeaderConsensusVerifier.is_execution_block_finalized(evidence)
+        finality_status = "FINALIZED_CANONICAL" if is_finalized else "ATTESTED_UNFINALIZED"
+        is_authenticated = is_finalized
+
+        return cls(
+            chain_id=chain_id,
+            block_number=evidence.execution_block_number,
+            block_hash=b_hash_hex,
+            state_root=s_root_hex,
+            header_timestamp_utc=ts_str,
+            consensus_mechanism="PROOF_OF_STAKE",
+            parent_hash="0x" + evidence.parent_root.hex(),
+            receipts_root="0x" + evidence.execution_receipts_root.hex() if evidence.execution_receipts_root else None,
+            finality_status=finality_status,
+            trust_source="ETH_CONSENSUS_SYNC_COMMITTEE" if is_finalized else "ETH_CONSENSUS_ATTESTED_ONLY",
+            verification_seal="",
+            is_authenticated=is_authenticated,
+            consensus_evidence=evidence,
+        )
+
+    @classmethod
+    def verify_authenticity(cls, anchor: Any) -> bool:
+        """Cryptographically verifies that an anchor was genuinely authenticated by underlying consensus evidence."""
+        if not isinstance(anchor, BlockHeaderTrustAnchor):
+            return False
+        if not anchor.is_authenticated:
+            return False
+        if anchor.finality_status != "FINALIZED_CANONICAL":
+            return False
+        if anchor.consensus_evidence is None or not isinstance(anchor.consensus_evidence, HeaderConsensusEvidence):
+            return False
+
+        ev = anchor.consensus_evidence
+        if not HeaderConsensusVerifier.is_execution_block_finalized(ev):
+            return False
+        ok, err = HeaderConsensusVerifier.verify_execution_header(ev)
+        if not ok or err is not None:
+            return False
+
+        if anchor.block_number != ev.execution_block_number:
+            return False
+        if anchor.block_hash.lower() != ("0x" + ev.execution_block_hash.hex().lower()):
+            return False
+        if anchor.state_root.lower() != ("0x" + ev.execution_state_root.hex().lower()):
+            return False
+        if anchor.parent_hash and ev.parent_root and anchor.parent_hash.lower() != ("0x" + ev.parent_root.hex().lower()):
+            return False
+        if anchor.receipts_root and ev.execution_receipts_root and anchor.receipts_root.lower() != ("0x" + ev.execution_receipts_root.hex().lower()):
+            return False
+
+        return True
+
+
+@dataclasses.dataclass(frozen=True)
+class PoolMetadataTrustAnchor:
+    """Independently authenticated pool metadata and storage layout anchor."""
+    chain_id: int
+    pool_address: str
+    token0_address: str
+    token1_address: str
+    token0_decimals: int
+    token1_decimals: int
+    token0_is_quote: bool
+    venue_type: str = "UNISWAP_V2"
+    reserves_storage_slot: int = 3
+    factory_address: str = "0x5C69bEe701ef814a2B6a3EDD4B1652CB9cc5aA6f"
+    storage_layout_verified: bool = False
+    is_create2_derived: bool = False
+    trust_source: str = "CANONICAL_FACTORY_REGISTRY"
+    verification_seal: str = ""
+    is_authenticated: bool = False
+
+    @classmethod
+    def _compute_seal(
+        cls,
+        chain_id: int,
+        pool_address: str,
+        token0_address: str,
+        token1_address: str,
+        token0_decimals: int,
+        token1_decimals: int,
+        token0_is_quote: bool,
+        venue_type: str,
+        reserves_storage_slot: int,
+        factory_address: str,
+        trust_source: str,
+        storage_layout_verified: bool,
+    ) -> str:
+        data = f"{chain_id}:{pool_address.lower()}:{token0_address.lower()}:{token1_address.lower()}:{token0_decimals}:{token1_decimals}:{token0_is_quote}:{venue_type}:{reserves_storage_slot}:{factory_address.lower()}:{trust_source}:{storage_layout_verified}"
+        return hmac.new(_POOL_METADATA_SEAL_KEY, data.encode("utf-8"), hashlib.sha256).hexdigest()
+
+    @classmethod
+    def create_unverified_metadata(
+        cls,
+        chain_id: int,
+        pool_address: str,
+        token0_address: str,
+        token1_address: str,
+        token0_decimals: int,
+        token1_decimals: int,
+        token0_is_quote: bool,
+        venue_type: str = "UNISWAP_V2",
+        reserves_storage_slot: int = 3,
+        factory_address: str = "0x5C69bEe701ef814a2B6a3EDD4B1652CB9cc5aA6f",
+        trust_source: str = "UNVERIFIED_CALLER_METADATA",
+    ) -> "PoolMetadataTrustAnchor":
+        """Factory method returning unverified pool metadata."""
+        return cls(
+            chain_id=chain_id,
+            pool_address=canonicalize_token_address(pool_address),
+            token0_address=canonicalize_token_address(token0_address),
+            token1_address=canonicalize_token_address(token1_address),
+            token0_decimals=token0_decimals,
+            token1_decimals=token1_decimals,
+            token0_is_quote=token0_is_quote,
+            venue_type=venue_type,
+            reserves_storage_slot=reserves_storage_slot,
+            factory_address=canonicalize_token_address(factory_address),
+            storage_layout_verified=False,
+            is_create2_derived=False,
+            trust_source=trust_source,
+            verification_seal="",
+            is_authenticated=False,
+        )
+
+    @classmethod
+    def verify_authenticity(cls, meta: Any) -> bool:
+        """Cryptographically verifies pool metadata and storage layout verification seal."""
+        if not isinstance(meta, PoolMetadataTrustAnchor):
+            return False
+        if not meta.is_authenticated or not meta.verification_seal or not meta.storage_layout_verified:
+            return False
+        expected_seal = cls._compute_seal(
+            chain_id=meta.chain_id,
+            pool_address=meta.pool_address,
+            token0_address=meta.token0_address,
+            token1_address=meta.token1_address,
+            token0_decimals=meta.token0_decimals,
+            token1_decimals=meta.token1_decimals,
+            token0_is_quote=meta.token0_is_quote,
+            venue_type=meta.venue_type,
+            reserves_storage_slot=meta.reserves_storage_slot,
+            factory_address=meta.factory_address,
+            trust_source=meta.trust_source,
+            storage_layout_verified=meta.storage_layout_verified,
+        )
+        return hmac.compare_digest(meta.verification_seal, expected_seal)
+
+
+CANONICAL_V2_PAIR_RUNTIME_CODE_HASHES: Dict[int, bytes] = {
+    1: bytes.fromhex("c46b1ad77c95c808800ba84050a4985cfb14ff26046e7f8fbcfcc3c1e3b5e40c"),
+    11155111: bytes.fromhex("c46b1ad77c95c808800ba84050a4985cfb14ff26046e7f8fbcfcc3c1e3b5e40c"),
+}
+
+UNISWAP_V3_POOL_RUNTIME_CODE_HASH: bytes = bytes.fromhex(
+    "a598dd2fba360510c5a8f02f44423a4468e902df5857dbce3ca162a43a3a31ff"
+)
+
+CANONICAL_CHAINLINK_CODE_HASHES: Dict[int, bytes] = {
+    1: bytes.fromhex("3479008bc5b5ad9e02ef2c2c04ae5ce5c249bc8558eb80dd94488b0ea77f52f3"),
+    11155111: bytes.fromhex("3479008bc5b5ad9e02ef2c2c04ae5ce5c249bc8558eb80dd94488b0ea77f52f3"),
+}
+
+CANONICAL_PYTH_EMITTERS: Set[Tuple[int, bytes]] = {
+    # Wormhole chain 26: Pythnet authoritative Wormhole emitter contract
+    (26, bytes.fromhex("e101424e8655b23739dd0d4e032534378012a86bbfa44002f4b4b1984479b45d")),
+    # Wormhole chain 1: Solana Pyth authoritative Wormhole emitter program
+    (1, bytes.fromhex("71ff630fd034a3a0c70088f0a39229f6bfa53f0188a87d66c3042c8ebfbc502f")),
+}
+
+CANONICAL_WORMHOLE_GUARDIANS: Dict[int, List[str]] = {
+    1: list(CANONICAL_PRODUCTION_GUARDIAN_SETS[3].guardians),
+    11155111: list(CANONICAL_PRODUCTION_GUARDIAN_SETS[3].guardians),
+}
+
+
+CANONICAL_V2_FACTORIES: Dict[int, Dict[str, Any]] = {
+    1: {  # Ethereum Mainnet Uniswap V2
+        "factory": "0x5C69bEe701ef814a2B6a3EDD4B1652CB9cc5aA6f".lower(),
+        "init_code_hash": bytes.fromhex("96e8ac4277198ff8b6f785478aa9a39f403cb768dd02cbee326c3e7da348845f"),
+        "venue": "UNISWAP_V2",
+        "reserves_storage_slot": 3,
+    },
+    11155111: {  # Sepolia Uniswap V2
+        "factory": "0x5C69bEe701ef814a2B6a3EDD4B1652CB9cc5aA6f".lower(),
+        "init_code_hash": bytes.fromhex("96e8ac4277198ff8b6f785478aa9a39f403cb768dd02cbee326c3e7da348845f"),
+        "venue": "UNISWAP_V2",
+        "reserves_storage_slot": 3,
+    },
+}
+
+CANONICAL_AUTHENTICATED_TOKENS: Dict[int, Dict[str, Dict[str, Any]]] = {
+    1: {  # Ethereum Mainnet
+        "0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2": {"symbol": "WETH", "decimals": 18, "is_quote": True},
+        "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48": {"symbol": "USDC", "decimals": 6, "is_quote": True},
+        "0xdac17f958d2ee523a2206206994597c13d831ec7": {"symbol": "USDT", "decimals": 6, "is_quote": True},
+        "0x6b175474e89094c44da98b954eedeac495271d0f": {"symbol": "DAI", "decimals": 18, "is_quote": True},
+    },
+    11155111: {  # Sepolia
+        "0x7b79995e5f793a07bc00c21412e50ecae098e7f9": {"symbol": "WETH", "decimals": 18, "is_quote": True},
+    },
+    8453: {  # Base
+        "0x4200000000000000000000000000000000000006": {"symbol": "WETH", "decimals": 18, "is_quote": True},
+        "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913": {"symbol": "USDC", "decimals": 6, "is_quote": True},
+    },
+}
+
+
+class PoolMetadataVerifier:
+    """Independently verifies pool metadata, token ordering, CREATE2 pair address derivation, and storage layout."""
+
+    @classmethod
+    def verify_pool_metadata(
+        cls,
+        chain_id: int,
+        pool_address: str,
+        token0_address: str,
+        token1_address: str,
+        token0_decimals: int,
+        token1_decimals: int,
+        token0_is_quote: bool,
+        factory_address: Optional[str] = None,
+        reserves_storage_slot: int = 3,
+        venue_type: str = "UNISWAP_V2",
+        block_trust_anchor: Optional[BlockHeaderTrustAnchor] = None,
+        pool_account_proof: Optional[list[bytes]] = None,
+        pool_code_proof: Optional[bytes | list[bytes]] = None,
+        state_proofs: Any = None,
+    ) -> PoolMetadataTrustAnchor:
+        """Independently validates and seals PoolMetadataTrustAnchor using CREATE2 derivation,
+        MPT account proof of canonical deployed runtime code hash, and canonical token validation."""
+        if chain_id not in CANONICAL_V2_FACTORIES:
+            raise ValueError(f"Unsupported chain_id for canonical pool metadata verification: {chain_id}")
+
+        canonical_deployment = CANONICAL_V2_FACTORIES[chain_id]
+        expected_factory = canonical_deployment["factory"]
+        init_code = canonical_deployment["init_code_hash"]
+
+        canon_pool = canonicalize_token_address(pool_address)
+        canon_t0 = canonicalize_token_address(token0_address)
+        canon_t1 = canonicalize_token_address(token1_address)
+
+        if factory_address is not None:
+            canon_fac = canonicalize_token_address(factory_address)
+            if canon_fac.lower() != expected_factory.lower():
+                raise ValueError(f"Fabricated factory address: expected {expected_factory}, got {factory_address}")
+        else:
+            canon_fac = expected_factory
+
+        if venue_type != "UNISWAP_V2":
+            raise ValueError(f"Unsupported venue_type: {venue_type}")
+        if reserves_storage_slot != 3:
+            raise ValueError(f"Uniswap V2 reserves storage slot must be 3, got: {reserves_storage_slot}")
+        if not (0 <= token0_decimals <= 36) or not (0 <= token1_decimals <= 36):
+            raise ValueError("Token decimals must be between 0 and 36")
+
+        int_t0 = int(canon_t0[2:], 16)
+        int_t1 = int(canon_t1[2:], 16)
+        if int_t0 >= int_t1:
+            raise ValueError(
+                f"Canonical token ordering violation: token0 ({canon_t0}) must be numerically less than token1 ({canon_t1})"
+            )
+
+        # Independently derive CREATE2 pair address
+        computed_pair = compute_uniswap_v2_pair_address(
+            factory=canon_fac,
+            token0=canon_t0,
+            token1=canon_t1,
+            init_code_hash=init_code,
+        )
+        if canon_pool.lower() != computed_pair.lower():
+            raise ValueError(
+                f"Pool address mismatch: claimed {pool_address}, CREATE2 derived {computed_pair}"
+            )
+
+        # 1. Authenticate token decimals & quote orientation against canonical registry
+        t0_auth = False
+        t1_auth = False
+        chain_tokens = CANONICAL_AUTHENTICATED_TOKENS.get(chain_id, {})
+
+        if canon_t0 in chain_tokens:
+            expected_t0 = chain_tokens[canon_t0]
+            if token0_decimals != expected_t0["decimals"]:
+                raise ValueError(f"Token0 decimals contradiction: claimed {token0_decimals}, verified {expected_t0['decimals']}")
+            t0_auth = True
+
+        if canon_t1 in chain_tokens:
+            expected_t1 = chain_tokens[canon_t1]
+            if token1_decimals != expected_t1["decimals"]:
+                raise ValueError(f"Token1 decimals contradiction: claimed {token1_decimals}, verified {expected_t1['decimals']}")
+            t1_auth = True
+
+        # 2. Deployed runtime code authentication strictly via MPT account proof
+        # Caller-supplied code hash or state dicts are strictly rejected without genuine MPT proof
+        code_auth = False
+        expected_runtime_code_hash = CANONICAL_V2_PAIR_RUNTIME_CODE_HASHES.get(chain_id)
+
+        mpt_nodes = pool_account_proof if pool_account_proof is not None else (pool_code_proof if isinstance(pool_code_proof, list) else None)
+
+        if (
+            block_trust_anchor is not None
+            and BlockHeaderTrustAnchor.verify_authenticity(block_trust_anchor)
+            and mpt_nodes is not None
+            and len(mpt_nodes) > 0
+            and expected_runtime_code_hash is not None
+        ):
+            s_root = bytes.fromhex(block_trust_anchor.state_root[2:] if block_trust_anchor.state_root.startswith("0x") else block_trust_anchor.state_root)
+            pool_key = keccak256(bytes.fromhex(canon_pool[2:]))
+            acc_res = verify_mpt_proof(root_hash=s_root, search_key_bytes=pool_key, proof_nodes=mpt_nodes)
+            if acc_res.is_valid and acc_res.is_included and acc_res.value_bytes:
+                try:
+                    acc_fields = rlp_decode(acc_res.value_bytes)
+                    if isinstance(acc_fields, list) and len(acc_fields) >= 4:
+                        deployed_code_hash = acc_fields[3]
+                        if deployed_code_hash == expected_runtime_code_hash:
+                            code_auth = True
+                except Exception:
+                    code_auth = False
+
+        # If any element lacks independent cryptographic verification, retain modeled unverified status
+        if not code_auth or not t0_auth or not t1_auth:
+            return PoolMetadataTrustAnchor(
+                chain_id=chain_id,
+                pool_address=canon_pool,
+                token0_address=canon_t0,
+                token1_address=canon_t1,
+                token0_decimals=token0_decimals,
+                token1_decimals=token1_decimals,
+                token0_is_quote=token0_is_quote,
+                venue_type=venue_type,
+                reserves_storage_slot=reserves_storage_slot,
+                factory_address=canon_fac,
+                storage_layout_verified=False,
+                is_create2_derived=True,
+                trust_source="MODELED_UNVERIFIED_POOL_METADATA",
+                verification_seal="",
+                is_authenticated=False,
+            )
+
+        seal = PoolMetadataTrustAnchor._compute_seal(
+            chain_id=chain_id,
+            pool_address=canon_pool,
+            token0_address=canon_t0,
+            token1_address=canon_t1,
+            token0_decimals=token0_decimals,
+            token1_decimals=token1_decimals,
+            token0_is_quote=token0_is_quote,
+            venue_type=venue_type,
+            reserves_storage_slot=reserves_storage_slot,
+            factory_address=canon_fac,
+            trust_source="INDEPENDENTLY_AUTHENTICATED_POOL_METADATA",
+            storage_layout_verified=True,
+        )
+
+        return PoolMetadataTrustAnchor(
+            chain_id=chain_id,
+            pool_address=canon_pool,
+            token0_address=canon_t0,
+            token1_address=canon_t1,
+            token0_decimals=token0_decimals,
+            token1_decimals=token1_decimals,
+            token0_is_quote=token0_is_quote,
+            venue_type=venue_type,
+            reserves_storage_slot=reserves_storage_slot,
+            factory_address=canon_fac,
+            storage_layout_verified=True,
+            is_create2_derived=True,
+            trust_source="INDEPENDENTLY_AUTHENTICATED_POOL_METADATA",
+            verification_seal=seal,
+            is_authenticated=True,
+        )
+
+
+class BlockHeaderTrustAnchorRegistry:
+    """Process-level canonical registry for independently authenticated block header trust anchors."""
+    _anchors: Dict[Tuple[int, int, str], BlockHeaderTrustAnchor] = {}
+
+    @classmethod
+    def register(cls, anchor: BlockHeaderTrustAnchor) -> None:
+        if not BlockHeaderTrustAnchor.verify_authenticity(anchor):
+            raise ValueError("Cannot register unauthenticated block header trust anchor: failed cryptographic authenticity verification")
+        key = (anchor.chain_id, anchor.block_number, anchor.block_hash.lower())
+        cls._anchors[key] = anchor
+
+    @classmethod
+    def get(cls, chain_id: int, block_number: int, block_hash: str) -> Optional[BlockHeaderTrustAnchor]:
+        return cls._anchors.get((chain_id, block_number, block_hash.lower()))
+
+    @classmethod
+    def clear(cls) -> None:
+        cls._anchors.clear()
+
+
+class PoolMetadataTrustAnchorRegistry:
+    """Process-level canonical registry for independently authenticated pool metadata."""
+    _metadata: Dict[Tuple[int, str], PoolMetadataTrustAnchor] = {}
+
+    @classmethod
+    def register(cls, metadata: PoolMetadataTrustAnchor) -> None:
+        if not PoolMetadataTrustAnchor.verify_authenticity(metadata):
+            raise ValueError("Cannot register unauthenticated pool metadata trust anchor: failed cryptographic authenticity verification")
+        key = (metadata.chain_id, canonicalize_token_address(metadata.pool_address))
+        cls._metadata[key] = metadata
+
+    @classmethod
+    def get(cls, chain_id: int, pool_address: str) -> Optional[PoolMetadataTrustAnchor]:
+        try:
+            canon = canonicalize_token_address(pool_address)
+            return cls._metadata.get((chain_id, canon))
+        except Exception:
+            return None
+
+    @classmethod
+    def clear(cls) -> None:
+        cls._metadata.clear()
+
+
+OP_STACK_TRUSTED_L1_DEPLOYMENTS: Dict[int, Dict[str, Any]] = {
+    8453: {  # Base
+        "l1_chain_id": 1,
+        "oracle_address": "0x56315b90c40730925ec54a5a02b662791cb298f5",
+        "dispute_game_factory": "0x43edb88c4b80fdd2ceee3949752eabe26df56079",
+        "canonical_output_slot": 3,
+        "contract_name": "L2OutputOracle",
+    },
+    10: {    # OP Mainnet
+        "l1_chain_id": 1,
+        "oracle_address": "0xdfe97868233d1aa22e815a266982f2cf17685a27",
+        "dispute_game_factory": "0x0c450125bf4ff25cc5cb4e6a0d2f83733077e641",
+        "canonical_output_slot": 3,
+        "contract_name": "L2OutputOracle",
+    },
+    11155420: { # OP Sepolia
+        "l1_chain_id": 11155111,
+        "oracle_address": "0x90e9c4f8a994a250f6aEdf66130B09405776077b",
+        "dispute_game_factory": "0x05f96151cb2203650501e5cfde60114561540a3e",
+        "canonical_output_slot": 3,
+        "contract_name": "L2OutputOracle",
+    },
+}
+
+
+@dataclasses.dataclass
+class OpStackOutputProofPayload:
+    """Raw cryptographic output-proof payload for OP Stack Bedrock / DisputeGame withdrawal."""
+    withdrawal_hash: str
+    l2_output_index: int
+    l2_block_number: int
+    l2_block_hash: str
+    l2_state_root: str
+    l2_message_passer_storage_root: str
+    l2_message_passer_proof: List[bytes]  # MANDATORY: inclusion proof of withdrawal_hash
+    l1_oracle_address: str
+    l1_block_number: int
+    l1_block_hash: str
+    l1_oracle_account_proof: List[bytes]
+    l1_output_storage_proof: List[bytes]
+    l2_chain_id: int = 8453
+    version_byte: bytes = b"\x00"
+    l1_output_slot: Optional[int] = None
+    l1_oracle_output_root: Optional[str] = None
+
+
+@dataclasses.dataclass
+class OpStackAuthenticatedProofResult:
+    """Non-forgeable result sealed by OpStackOutputProofVerifier."""
+    withdrawal_hash: str
+    l2_output_index: int
+    l2_block_number: int
+    output_root: str
+    l1_oracle_output_root: str
+    is_valid: bool
+    proof_type: str = "OP_STACK_AUTHENTICATED_OUTPUT_PROOF"
+    verification_seal: str = ""
+
+
+@dataclasses.dataclass
+class OpStackOutputProofEvidence:
+    """Caller-constructible output-proof evidence for OP Stack (unauthenticated unless sealed)."""
+    withdrawal_hash: str
+    l2_output_index: int
+    l2_block_number: int
+    output_root: str
+    l1_oracle_output_root: str
+    is_valid: bool
+    proof_type: str = "OP_STACK_OUTPUT_PROPOSAL_PROOF"
+
+
+class OpStackOutputProofVerifier:
+    """Cryptographic output-proof verifier for OP Stack Bedrock withdrawals.
+
+    Verifies output root composition:
+        keccak256(version_byte || state_root || message_passer_storage_root || block_hash)
+    and optional L2ToL1MessagePasser inclusion proof.
+    Issues a tamper-evident OpStackAuthenticatedProofResult protected by a process-isolated HMAC seal.
+    Caller-constructed dataclasses or unsealed results are strictly rejected.
+    """
+    _SEAL_KEY: bytes = os.urandom(32)
+
+    @classmethod
+    def _compute_seal(
+        cls,
+        withdrawal_hash: str,
+        l2_output_index: int,
+        l2_block_number: int,
+        output_root: str,
+        l1_oracle_output_root: str,
+        is_valid: bool,
+    ) -> str:
+        data = f"{withdrawal_hash.lower()}:{l2_output_index}:{l2_block_number}:{output_root.lower()}:{l1_oracle_output_root.lower()}:{is_valid}"
+        return hmac.new(cls._SEAL_KEY, data.encode("utf-8"), hashlib.sha256).hexdigest()
+
+    @classmethod
+    def is_authenticated_result(cls, result: Any) -> bool:
+        """Verifies that the proof result carries a valid HMAC verification seal from this process."""
+        if not isinstance(result, OpStackAuthenticatedProofResult):
+            return False
+        if not result.is_valid or not result.verification_seal:
+            return False
+        expected_seal = cls._compute_seal(
+            withdrawal_hash=result.withdrawal_hash,
+            l2_output_index=result.l2_output_index,
+            l2_block_number=result.l2_block_number,
+            output_root=result.output_root,
+            l1_oracle_output_root=result.l1_oracle_output_root,
+            is_valid=result.is_valid,
+        )
+        return hmac.compare_digest(result.verification_seal, expected_seal)
+
+    @classmethod
+    def verify_withdrawal_proof(
+        cls,
+        payload: OpStackOutputProofPayload,
+        l1_trust_anchor: Optional[BlockHeaderTrustAnchor] = None,
+        expected_withdrawal_hash: Optional[str] = None,
+        expected_output_root: Optional[str] = None,
+        l1_chain_id: int = 1,
+    ) -> Tuple[bool, Optional[OpStackAuthenticatedProofResult], Optional[str]]:
+        """Cryptographically verifies OP Stack output root composition, mandatory inclusion proof,
+        and mandatory L1 publication proof anchored to an authenticated L1 block header.
+        """
+        # 1. Format checks
+        if not payload.withdrawal_hash.startswith("0x") or len(payload.withdrawal_hash) != 66:
+            return False, None, "INVALID_WITHDRAWAL_HASH_FORMAT"
+        if not payload.l2_block_hash.startswith("0x") or len(payload.l2_block_hash) != 66:
+            return False, None, "INVALID_L2_BLOCK_HASH_FORMAT"
+        if not payload.l2_state_root.startswith("0x") or len(payload.l2_state_root) != 66:
+            return False, None, "INVALID_L2_STATE_ROOT_FORMAT"
+        if not payload.l2_message_passer_storage_root.startswith("0x") or len(payload.l2_message_passer_storage_root) != 66:
+            return False, None, "INVALID_L2_MESSAGE_PASSER_STORAGE_ROOT_FORMAT"
+        if payload.l2_block_number <= 0 or payload.l2_output_index < 0:
+            return False, None, "INVALID_BLOCK_OR_INDEX"
+
+        # 2. Strict version byte check (Bedrock requires 0x00)
+        if payload.version_byte != b"\x00":
+            return False, None, "INVALID_OP_STACK_VERSION_BYTE"
+
+        if expected_withdrawal_hash is not None and payload.withdrawal_hash.lower() != expected_withdrawal_hash.lower():
+            return False, None, "WITHDRAWAL_HASH_MISMATCH"
+
+        # 3. Mandatory independently authenticated L1 block header trust anchor
+        anchor = l1_trust_anchor or BlockHeaderTrustAnchorRegistry.get(
+            l1_chain_id, payload.l1_block_number, payload.l1_block_hash
+        )
+        if anchor is None or not BlockHeaderTrustAnchor.verify_authenticity(anchor):
+            return False, None, "UNAUTHENTICATED_L1_BLOCK_HEADER_TRUST_ANCHOR_REQUIRED"
+
+        deployment = OP_STACK_TRUSTED_L1_DEPLOYMENTS.get(payload.l2_chain_id)
+        if deployment is None:
+            return False, None, f"UNSUPPORTED_OP_STACK_L2_CHAIN_{payload.l2_chain_id}"
+        if anchor.chain_id != deployment["l1_chain_id"]:
+            return False, None, f"L1_TRUST_ANCHOR_CHAIN_MISMATCH_EXPECTED_{deployment['l1_chain_id']}_GOT_{anchor.chain_id}"
+        if anchor.block_number != payload.l1_block_number:
+            return False, None, f"L1_TRUST_ANCHOR_BLOCK_NUMBER_MISMATCH_{anchor.block_number}_VS_{payload.l1_block_number}"
+        if anchor.block_hash.lower() != payload.l1_block_hash.lower():
+            return False, None, "L1_TRUST_ANCHOR_BLOCK_HASH_MISMATCH"
+
+        # Reject caller-selected oracle addresses and arbitrary storage slots
+        expected_oracle = canonicalize_token_address(deployment["oracle_address"])
+        try:
+            actual_oracle = canonicalize_token_address(payload.l1_oracle_address)
+        except Exception:
+            return False, None, f"INVALID_L1_ORACLE_ADDRESS_FORMAT_{payload.l1_oracle_address}"
+        if actual_oracle != expected_oracle:
+            return False, None, f"REJECTED_CALLER_SELECTED_ORACLE_ADDRESS_{payload.l1_oracle_address}"
+
+        canonical_slot = deployment["canonical_output_slot"]
+        if payload.l1_output_slot is not None and payload.l1_output_slot != canonical_slot:
+            return False, None, f"REJECTED_ARBITRARY_STORAGE_SLOT_{payload.l1_output_slot}"
+
+        # 4. Mandatory L2 message passer MPT inclusion proof
+        if not payload.l2_message_passer_proof or not isinstance(payload.l2_message_passer_proof, list) or len(payload.l2_message_passer_proof) == 0:
+            return False, None, "MANDATORY_L2_MESSAGE_PASSER_PROOF_MISSING"
+
+        try:
+            mp_root = bytes.fromhex(payload.l2_message_passer_storage_root[2:])
+            w_bytes = bytes.fromhex(payload.withdrawal_hash[2:])
+            slot0_bytes = (0).to_bytes(32, "big")
+            search_key = keccak256(w_bytes + slot0_bytes)
+
+            mpt_res = verify_mpt_proof(
+                root_hash=mp_root,
+                search_key_bytes=search_key,
+                proof_nodes=payload.l2_message_passer_proof,
+            )
+            if not mpt_res.is_valid or not mpt_res.is_included:
+                return False, None, f"MESSAGE_PASSER_MPT_PROOF_INVALID: {mpt_res.error}"
+        except Exception as e:
+            return False, None, f"MESSAGE_PASSER_PROOF_EXCEPTION: {e}"
+
+        # 5. Output root composition verification: keccak256(version_byte || state_root || message_passer_root || block_hash)
+        try:
+            s_root = bytes.fromhex(payload.l2_state_root[2:])
+            b_hash = bytes.fromhex(payload.l2_block_hash[2:])
+            output_root_preimage = b"\x00" + s_root + mp_root + b_hash
+            computed_output_root = "0x" + keccak256(output_root_preimage).hex()
+        except Exception as e:
+            return False, None, f"OUTPUT_ROOT_COMPUTATION_FAILED: {e}"
+
+        if expected_output_root is not None and computed_output_root.lower() != expected_output_root.lower():
+            return False, None, f"EXPECTED_OUTPUT_ROOT_MISMATCH_{computed_output_root}_VS_{expected_output_root}"
+
+        # 6. Mandatory L1 Oracle Account and Storage Proof Verification
+        if not payload.l1_oracle_account_proof or not payload.l1_output_storage_proof:
+            return False, None, "MANDATORY_L1_ORACLE_PROOF_MISSING"
+
+        try:
+            l1_state_root_bytes = bytes.fromhex(anchor.state_root[2:])
+            canon_oracle = canonicalize_token_address(payload.l1_oracle_address)
+            oracle_acct_key = keccak256(bytes.fromhex(canon_oracle[2:]))
+
+            oracle_acct_res = verify_mpt_proof(
+                root_hash=l1_state_root_bytes,
+                search_key_bytes=oracle_acct_key,
+                proof_nodes=payload.l1_oracle_account_proof,
+            )
+            if not oracle_acct_res.is_valid or not oracle_acct_res.is_included or not oracle_acct_res.value_bytes:
+                return False, None, f"L1_ORACLE_ACCOUNT_PROOF_INVALID: {oracle_acct_res.error}"
+
+            oracle_leaf = AccountStateLeaf.from_rlp(oracle_acct_res.value_bytes)
+            if not oracle_leaf.is_valid:
+                return False, None, f"L1_ORACLE_LEAF_INVALID: {oracle_leaf.error}"
+            oracle_storage_root = oracle_leaf.storage_root
+
+            # Storage key for outputRoots[l2_output_index]
+            mapping_slot = canonical_slot
+            storage_slot_bytes = mapping_slot.to_bytes(32, "big")
+            index_bytes = payload.l2_output_index.to_bytes(32, "big")
+            oracle_storage_key = keccak256(index_bytes + storage_slot_bytes)
+
+            oracle_storage_res = verify_mpt_proof(
+                root_hash=oracle_storage_root,
+                search_key_bytes=oracle_storage_key,
+                proof_nodes=payload.l1_output_storage_proof,
+            )
+            if not oracle_storage_res.is_valid or not oracle_storage_res.is_included or not oracle_storage_res.value_bytes:
+                return False, None, f"L1_ORACLE_STORAGE_PROOF_INVALID: {oracle_storage_res.error}"
+
+            val = oracle_storage_res.value_bytes
+            try:
+                dec = rlp_decode(val)
+                if isinstance(dec, bytes):
+                    val = dec
+            except Exception:
+                pass
+
+            if len(val) >= 32:
+                published_root = "0x" + val[:32].hex()
+            else:
+                published_root = "0x" + val.hex()
+
+            if published_root.lower() != computed_output_root.lower():
+                return False, None, f"L1_ORACLE_PUBLISHED_OUTPUT_ROOT_MISMATCH_{published_root}_VS_{computed_output_root}"
+        except Exception as e:
+            return False, None, f"L1_ORACLE_PROOF_VERIFICATION_EXCEPTION: {e}"
+
+        if payload.l1_oracle_output_root is not None and payload.l1_oracle_output_root.lower() != published_root.lower():
+            return False, None, f"COMPUTED_OUTPUT_ROOT_MISMATCH_{computed_output_root}_VS_{payload.l1_oracle_output_root}"
+
+        seal = cls._compute_seal(
+            withdrawal_hash=payload.withdrawal_hash,
+            l2_output_index=payload.l2_output_index,
+            l2_block_number=payload.l2_block_number,
+            output_root=computed_output_root,
+            l1_oracle_output_root=published_root,
+            is_valid=True,
+        )
+
+        res = OpStackAuthenticatedProofResult(
+            withdrawal_hash=payload.withdrawal_hash,
+            l2_output_index=payload.l2_output_index,
+            l2_block_number=payload.l2_block_number,
+            output_root=computed_output_root,
+            l1_oracle_output_root=published_root,
+            is_valid=True,
+            proof_type="OP_STACK_AUTHENTICATED_OUTPUT_PROOF",
+            verification_seal=seal,
+        )
+        return True, res, None
+
 
 class MultiChainFinalityEngine:
     """Evaluates protocol finality state transitions from caller-provided metadata and delay parameters.
@@ -664,15 +2000,55 @@ class MultiChainFinalityEngine:
 
         return FinalityState.FINALITY_PENDING
 
-    @staticmethod
+    @classmethod
     def evaluate_op_stack_withdrawal(
+        cls,
         proven_withdrawal_timestamp: int,
         current_l1_timestamp: int,
         proof_maturity_delay_seconds: int,
+        output_proof_evidence: Optional[Any] = None,
+        output_proof_payload: Optional[OpStackOutputProofPayload] = None,
+        expected_withdrawal_hash: Optional[str] = None,
+        expected_output_root: Optional[str] = None,
+        l1_trust_anchor: Optional[BlockHeaderTrustAnchor] = None,
+        **kwargs: Any,
     ) -> FinalityState:
-        """Evaluates withdrawal proof maturity delay starting at provenWithdrawal.timestamp."""
-        if current_l1_timestamp >= proven_withdrawal_timestamp + proof_maturity_delay_seconds:
-            return FinalityState.WITHDRAWAL_PROOF_MATURE_FINAL
+        """Evaluates withdrawal proof maturity delay starting at provenWithdrawal.timestamp.
+        Strictly rejects caller-asserted boolean flags (e.g. has_authenticated_output_proof=True).
+        Requires a cryptographically authenticated OpStackAuthenticatedProofResult sealed by OpStackOutputProofVerifier
+        bound to an independently authenticated L1 block header trust anchor.
+        Caller timestamps alone or unauthenticated dataclasses must NEVER produce WITHDRAWAL_PROOF_MATURE_FINAL.
+        Future timestamps (current_l1_timestamp < proven_withdrawal_timestamp) return FINALITY_PENDING.
+        """
+        if current_l1_timestamp < proven_withdrawal_timestamp:
+            return FinalityState.FINALITY_PENDING
+
+        delay_elapsed = current_l1_timestamp >= proven_withdrawal_timestamp + proof_maturity_delay_seconds
+
+        is_proof_authenticated = False
+        if output_proof_payload is not None and isinstance(output_proof_payload, OpStackOutputProofPayload):
+            ok, res, _ = OpStackOutputProofVerifier.verify_withdrawal_proof(
+                payload=output_proof_payload,
+                l1_trust_anchor=l1_trust_anchor,
+                expected_withdrawal_hash=expected_withdrawal_hash,
+                expected_output_root=expected_output_root,
+            )
+            if ok and res is not None:
+                is_proof_authenticated = True
+        elif output_proof_evidence is not None:
+            if OpStackOutputProofVerifier.is_authenticated_result(output_proof_evidence):
+                proof = output_proof_evidence
+                hash_match = (expected_withdrawal_hash is None or proof.withdrawal_hash.lower() == expected_withdrawal_hash.lower())
+                root_match = (expected_output_root is None or proof.output_root.lower() == expected_output_root.lower())
+                oracle_match = proof.output_root.lower() == proof.l1_oracle_output_root.lower()
+                if hash_match and root_match and oracle_match:
+                    is_proof_authenticated = True
+
+        if delay_elapsed:
+            if is_proof_authenticated:
+                return FinalityState.WITHDRAWAL_PROOF_MATURE_FINAL
+            return FinalityState.FINALITY_CALLER_ASSERTED_UNVERIFIED
+
         return FinalityState.WITHDRAWAL_PENDING_MATURITY
 
     @staticmethod
@@ -793,7 +2169,8 @@ class UniswapV3Evidence:
         for t_init, data in self.initialized_ticks.items():
             if t_init % spacing != 0:
                 return False
-            if data.get("liquidityGross", 0) <= 0:
+            gross = data.get("liquidityGross") if "liquidityGross" in data else abs(data.get("liquidityNet", 0))
+            if gross <= 0:
                 return False
 
             if t_min <= t_init <= t_max:
@@ -816,6 +2193,9 @@ class UniswapV3Evidence:
                         if t_min <= actual_tick <= t_max:
                             if actual_tick not in self.initialized_ticks:
                                 return False  # Bit set in bitmap but tick missing from initialized_ticks!
+                            gross = self.initialized_ticks[actual_tick].get("liquidityGross")
+                            if gross is not None and gross <= 0:
+                                return False
 
         return True
 
@@ -1008,6 +2388,7 @@ class UniswapV3SwapSimulator:
                 if tick_idx >= len(boundary_ticks):
                     return False, amount_in - amount_remaining, amount_out_total, current_sqrt_price, "ZERO_LIQUIDITY_DEPTH_EXHAUSTED"
 
+            w_cur = (current_tick // spacing) >> 8
             if tick_idx < len(boundary_ticks):
                 next_tick = boundary_ticks[tick_idx]
                 next_sqrt_p = UniswapV3TickMath.get_sqrt_ratio_at_tick(next_tick)
@@ -1015,15 +2396,42 @@ class UniswapV3SwapSimulator:
                     step_target = max(next_sqrt_p, target_sqrt_price_x96)
                 else:
                     step_target = min(next_sqrt_p, target_sqrt_price_x96)
+                boundary_tick = next_tick
+                boundary_sqrt_p = next_sqrt_p
             else:
                 next_tick = None
-                step_target = target_sqrt_price_x96
+                if zero_for_one:
+                    boundary_tick = (w_cur << 8) * spacing
+                    boundary_sqrt_p = UniswapV3TickMath.get_sqrt_ratio_at_tick(boundary_tick)
+                    step_target = max(boundary_sqrt_p, target_sqrt_price_x96)
+                else:
+                    boundary_tick = (((w_cur + 1) << 8) - 1) * spacing
+                    boundary_sqrt_p = UniswapV3TickMath.get_sqrt_ratio_at_tick(boundary_tick)
+                    step_target = min(boundary_sqrt_p, target_sqrt_price_x96)
 
-            # Check bitmap coverage for the path to step_target
-            comp_idx = (next_tick // spacing) if next_tick is not None else (current_tick // spacing)
-            word_pos = comp_idx >> 8
-            if word_pos not in evidence.tick_bitmap:
-                return False, amount_in - amount_remaining, amount_out_total, current_sqrt_price, "MODELED_DEPTH_UNRESOLVED_BITMAP_GAP"
+            step_target_tick = UniswapV3TickMath.get_tick_at_sqrt_ratio(step_target)
+            t_min_check = min(current_tick, step_target_tick)
+            t_max_check = max(current_tick, step_target_tick)
+            w_target = (step_target_tick // spacing) >> 8
+
+            # Verify all intervening bitmap words exist between w_cur and w_target
+            w_range_min = min(w_cur, w_target)
+            w_range_max = max(w_cur, w_target)
+            for w in range(w_range_min, w_range_max + 1):
+                if w not in evidence.tick_bitmap:
+                    return False, amount_in - amount_remaining, amount_out_total, current_sqrt_price, "MODELED_DEPTH_UNRESOLVED_BITMAP_GAP"
+                word_val = evidence.tick_bitmap[w]
+                if word_val != 0:
+                    for bit_pos in range(256):
+                        if (word_val & (1 << bit_pos)) != 0:
+                            comp_idx = (w << 8) + bit_pos
+                            act_tick = comp_idx * spacing
+                            if t_min_check <= act_tick <= t_max_check:
+                                if act_tick not in evidence.initialized_ticks:
+                                    return False, amount_in - amount_remaining, amount_out_total, current_sqrt_price, "MODELED_DEPTH_UNRESOLVED_UNINITIALIZED_TICK"
+                                gross = evidence.initialized_ticks[act_tick].get("liquidityGross") if "liquidityGross" in evidence.initialized_ticks[act_tick] else abs(evidence.initialized_ticks[act_tick].get("liquidityNet", 0))
+                                if gross <= 0:
+                                    return False, amount_in - amount_remaining, amount_out_total, current_sqrt_price, "MODELED_DEPTH_UNRESOLVED_UNINITIALIZED_TICK"
 
             next_sqrt_price, step_in, step_out, fee_step = UniswapV3SwapMath.compute_swap_step(
                 current_sqrt_price,
@@ -1042,6 +2450,9 @@ class UniswapV3SwapSimulator:
                 tick_data = evidence.initialized_ticks.get(next_tick)
                 if not tick_data:
                     return False, amount_in - amount_remaining, amount_out_total, current_sqrt_price, "MODELED_DEPTH_UNRESOLVED_UNINITIALIZED_TICK"
+                gross = tick_data.get("liquidityGross") if "liquidityGross" in tick_data else abs(tick_data.get("liquidityNet", 0))
+                if gross <= 0:
+                    return False, amount_in - amount_remaining, amount_out_total, current_sqrt_price, "MODELED_DEPTH_UNRESOLVED_UNINITIALIZED_TICK"
                 liquidity_net = tick_data.get("liquidityNet", 0)
                 if zero_for_one:
                     current_liquidity -= liquidity_net
@@ -1050,6 +2461,11 @@ class UniswapV3SwapSimulator:
                     current_liquidity += liquidity_net
                     current_tick = next_tick
                 tick_idx += 1
+            elif current_sqrt_price == step_target and next_tick is None and current_sqrt_price == boundary_sqrt_p:
+                if zero_for_one:
+                    current_tick = boundary_tick - 1
+                else:
+                    current_tick = boundary_tick + 1
             elif current_sqrt_price == target_sqrt_price_x96:
                 break
 
@@ -1393,6 +2809,615 @@ def calculate_solana_tx_fee_usd(
     return fee_sol, fee_usd, "MODELED_GAS_COST_SOLANA_COMPUTE_UNITS"
 
 
+CANONICAL_VALUATION_FEEDS: Dict[int, Set[str]] = {
+    1: {  # Ethereum Mainnet
+        "0x5f4ec3df9cbd43714fe2740f5e3616155c5b8419",  # ETH / USD
+        "0x8fffffd4afb6115b954bd326cbe7b4ba576818f6",  # USDC / USD
+        "0x3e7d1eab13ad0104d2750b8863b489d65364e32d",  # USDT / USD
+    },
+    8453: {  # Base
+        "0x71041dddad3595f9cef3dccf156597b71c782d68",  # ETH / USD
+        "0x7e860098f58b3649411852513627710b2ca66624",  # USDC / USD
+    },
+    10: {  # OP Mainnet
+        "0x13e3ee699d1909e989722e753853ae30b17e08c5",  # ETH / USD
+        "0x16a9fa2fda030272a0ee55664d6ca523d79311a6",  # USDC / USD
+    },
+    42161: {  # Arbitrum One
+        "0x639fe6ab55c921f74e7fac1ee960c0b6293ba612",  # ETH / USD
+        "0x50834f3163758fcc1df9973b6e91f0f0f0434ad0",  # USDC / USD
+    },
+    56: {  # BSC
+        "0x0567f2323251f0aab15c8dfb1967e4e8a7d42aee",  # BNB / USD
+        "0x14e613ac84a31f709eadbdf89c6cc390fdc9540a",  # ETH / USD
+    },
+    137: {  # Polygon
+        "0xab594600376ec9fd91f8e885dadf0ce036862de0",  # MATIC / USD
+        "0xf9680d99d6c9589e2a93a78a04a279e509205945",  # ETH / USD
+    },
+    43114: {  # Avalanche
+        "0x0a77230d17318075983913bc2145db16c7366156",  # AVAX / USD
+        "0x976b3b0304f98a3e913307322215702a46630053",  # ETH / USD
+    },
+}
+
+_VALUATION_SEAL_KEY: bytes = os.urandom(32)
+
+
+@dataclasses.dataclass(frozen=True)
+class ChainlinkRoundEvidence:
+    """Raw on-chain Chainlink latestRoundData/getRoundData evidence."""
+    feed_address: str
+    round_id: int
+    answer: int
+    decimals: int
+    started_at: int
+    updated_at: int
+    answered_in_round: int
+
+
+@dataclasses.dataclass(frozen=True)
+class PythPriceEvidence:
+    """Raw on-chain Pyth price update evidence."""
+    feed_id: str
+    price: int
+    conf: int
+    expo: int
+    publish_time: int
+
+
+@dataclasses.dataclass(frozen=True)
+class UniswapV3TwapEvidence:
+    """Raw on-chain Uniswap V3 observe() tick cumulatives evidence."""
+    pool_address: str
+    token0_address: str
+    token1_address: str
+    token0_decimals: int
+    token1_decimals: int
+    tick_cumulatives: Tuple[int, int]
+    timestamps: Tuple[int, int]
+
+
+@dataclasses.dataclass(frozen=True)
+class ValuationEvidenceRecord:
+    """Cryptographically bound valuation evidence record."""
+    source: str
+    chain_id: int
+    token_address: str
+    price_usd: float
+    timestamp_utc: str
+    feed_or_pool_address: Optional[str] = None
+    round_id_or_observation_index: Optional[int] = None
+    observation_digest: str = ""
+    verification_seal: str = ""
+    is_authenticated: bool = False
+
+
+class ValuationEvidenceVerifier:
+    """Cryptographic verifier deriving authenticated valuation records strictly from raw oracle evidence."""
+
+    @classmethod
+    def verify_chainlink_round(
+        cls,
+        chain_id: int,
+        token_address: str,
+        evidence: ChainlinkRoundEvidence,
+        block_trust_anchor: Optional[BlockHeaderTrustAnchor] = None,
+        storage_proof: Optional[list[bytes]] = None,
+        account_proof: Optional[list[bytes]] = None,
+        proxy_storage_proof: Optional[list[bytes]] = None,
+        aggregator_account_proof: Optional[list[bytes]] = None,
+        aggregator_storage_proof: Optional[list[bytes]] = None,
+        require_authenticated: bool = False,
+    ) -> ValuationEvidenceRecord:
+        """Derives valuation record from Chainlink round data.
+        Mandatorily treats proxy contract and aggregator contract as separate accounts:
+        1. Authenticates proxy account proof against authenticated block state root.
+        2. Verifies proxy contract deployed code.
+        3. Decodes aggregator address from proxy storage (slot 0) or verified aggregator proof.
+        4. Authenticates aggregator account proof and verifies runtime code hash.
+        5. Derives exact transmission mapping storage slot: keccak256(roundId, 43).
+        6. Verifies transmission storage proof against aggregator storageRoot (never proxy storageRoot).
+        7. Decodes exact contract-specific Transmission struct: int192 answer (bytes 8..32), uint64 timestamp (bytes 0..8).
+        """
+        if chain_id not in CANONICAL_VALUATION_FEEDS:
+            raise ValueError(f"Unsupported chain_id for valuation authentication: {chain_id}")
+        canon_feed = canonicalize_token_address(evidence.feed_address)
+        if canon_feed not in CANONICAL_VALUATION_FEEDS[chain_id]:
+            raise ValueError(f"Fabricated or unverified Chainlink feed address: {evidence.feed_address} on chain {chain_id}")
+        if evidence.round_id <= 0:
+            raise ValueError(f"Invalid Chainlink round_id: {evidence.round_id}")
+        if evidence.answered_in_round < evidence.round_id:
+            raise ValueError(f"Chainlink round not answered: {evidence.answered_in_round} < {evidence.round_id}")
+        if evidence.answer <= 0:
+            raise ValueError(f"Chainlink non-positive answer: {evidence.answer}")
+        if not (0 <= evidence.decimals <= 18):
+            raise ValueError(f"Invalid decimals: {evidence.decimals}")
+        if evidence.updated_at <= 0 or evidence.started_at <= 0 or evidence.updated_at < evidence.started_at:
+            raise ValueError(f"Invalid timestamps: started_at={evidence.started_at}, updated_at={evidence.updated_at}")
+
+        derived_price = float(evidence.answer) / (10 ** evidence.decimals)
+        canon_token = canonicalize_token_address(token_address)
+        ts_utc = dt.datetime.fromtimestamp(evidence.updated_at, dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+        obs_preimage = f"{chain_id}:{canon_feed}:{canon_token}:{evidence.round_id}:{evidence.answer}:{evidence.decimals}:{evidence.updated_at}"
+        obs_digest = hashlib.sha256(obs_preimage.encode("utf-8")).hexdigest()
+
+        # Cryptographic anchor and proof verification
+        has_anchor = block_trust_anchor is not None and BlockHeaderTrustAnchor.verify_authenticity(block_trust_anchor)
+        eff_storage_proof = aggregator_storage_proof if aggregator_storage_proof is not None else storage_proof
+        has_proofs = eff_storage_proof is not None and len(eff_storage_proof) > 0 and account_proof is not None and len(account_proof) > 0
+
+        proof_verified = False
+        if has_anchor and has_proofs:
+            try:
+                state_root_bytes = bytes.fromhex(
+                    block_trust_anchor.state_root[2:] if block_trust_anchor.state_root.startswith("0x") else block_trust_anchor.state_root
+                )
+                feed_addr_bytes = bytes.fromhex(canon_feed[2:])
+                feed_key = keccak256(feed_addr_bytes)
+
+                # 1. Verify proxy account proof against block state root
+                acc_res = verify_mpt_proof(root_hash=state_root_bytes, search_key_bytes=feed_key, proof_nodes=account_proof)
+                if acc_res.is_valid and acc_res.is_included and acc_res.value_bytes:
+                    proxy_fields = rlp_decode(acc_res.value_bytes)
+                    if isinstance(proxy_fields, list) and len(proxy_fields) >= 4:
+                        proxy_storage_root = proxy_fields[2]
+                        proxy_code_hash = proxy_fields[3]
+
+                        # Proxy must be a deployed contract
+                        if len(proxy_storage_root) == 32 and len(proxy_code_hash) == 32 and proxy_code_hash != b"\x00" * 32:
+                            # 2. Separate Aggregator Account: Proxy account proof cannot substitute for aggregator account proof
+                            aggregator_sroot = None
+                            if aggregator_account_proof is not None and len(aggregator_account_proof) > 0:
+                                # Determine aggregator address: from proxy storage proof (slot 0) or feed address
+                                agg_addr_bytes = None
+                                if proxy_storage_proof is not None and len(proxy_storage_proof) > 0:
+                                    slot0_key = keccak256((0).to_bytes(32, "big"))
+                                    p_sres = verify_mpt_proof(root_hash=proxy_storage_root, search_key_bytes=slot0_key, proof_nodes=proxy_storage_proof)
+                                    if p_sres.is_valid and p_sres.is_included and p_sres.value_bytes:
+                                        slot0_val = rlp_decode(p_sres.value_bytes)
+                                        if isinstance(slot0_val, bytes) and len(slot0_val) >= 20:
+                                            agg_addr_bytes = slot0_val[-20:]
+                                if agg_addr_bytes is None:
+                                    agg_addr_bytes = feed_addr_bytes
+
+                                agg_key = keccak256(agg_addr_bytes)
+                                agg_res = verify_mpt_proof(root_hash=state_root_bytes, search_key_bytes=agg_key, proof_nodes=aggregator_account_proof)
+                                if agg_res.is_valid and agg_res.is_included and agg_res.value_bytes:
+                                    agg_fields = rlp_decode(agg_res.value_bytes)
+                                    if isinstance(agg_fields, list) and len(agg_fields) >= 4:
+                                        agg_code_hash = agg_fields[3]
+                                        expected_code = CANONICAL_CHAINLINK_CODE_HASHES.get(chain_id)
+                                        if expected_code is None or agg_code_hash == expected_code:
+                                            aggregator_sroot = agg_fields[2]
+                            elif proxy_storage_proof is None:
+                                # Direct aggregator verification path where account_proof is the aggregator
+                                expected_code = CANONICAL_CHAINLINK_CODE_HASHES.get(chain_id)
+                                if expected_code is None or proxy_code_hash == expected_code:
+                                    aggregator_sroot = proxy_storage_root
+
+                            if aggregator_sroot is not None and len(aggregator_sroot) == 32:
+                                # 3. Exact OffchainAggregator s_transmissions mapping storage slot: keccak256(roundId, 43)
+                                s_key = keccak256((evidence.round_id & 0xFFFFFFFF).to_bytes(32, "big") + (43).to_bytes(32, "big"))
+                                s_res = verify_mpt_proof(root_hash=aggregator_sroot, search_key_bytes=s_key, proof_nodes=eff_storage_proof)
+                                if s_res.is_valid and s_res.is_included and s_res.value_bytes:
+                                    val_unpacked = rlp_decode(s_res.value_bytes)
+                                    if isinstance(val_unpacked, bytes) and len(val_unpacked) > 0:
+                                        slot_bytes = val_unpacked.rjust(32, b"\x00")
+                                        # Exact Transmission struct unpacking: int192 answer (bytes 8..32), uint64 timestamp (bytes 0..8)
+                                        ans = int.from_bytes(slot_bytes[8:32], "big", signed=True)
+                                        ts = int.from_bytes(slot_bytes[0:8], "big")
+                                        # Strict binding: matching answer alone NEVER authenticates without exact timestamp binding
+                                        if ans == evidence.answer and ts == evidence.updated_at and evidence.started_at <= evidence.updated_at:
+                                            proof_verified = True
+            except Exception:
+                proof_verified = False
+
+        if not proof_verified:
+            if require_authenticated:
+                raise ValueError("Chainlink round data lacks cryptographic MPT account/storage proof anchored to authenticated state root")
+            return ValuationEvidenceRecord(
+                source="CHAINLINK_ORACLE",
+                chain_id=chain_id,
+                token_address=canon_token,
+                price_usd=derived_price,
+                timestamp_utc=ts_utc,
+                feed_or_pool_address=canon_feed,
+                round_id_or_observation_index=evidence.round_id,
+                observation_digest=obs_digest,
+                verification_seal="",
+                is_authenticated=False,
+            )
+
+        seal = ValuationEvidenceAuthenticator._compute_seal(
+            source="CHAINLINK_ORACLE",
+            chain_id=chain_id,
+            token_address=canon_token,
+            price_usd=derived_price,
+            timestamp_utc=ts_utc,
+            feed_or_pool_address=canon_feed,
+            round_id_or_observation_index=evidence.round_id,
+            observation_digest=obs_digest,
+        )
+
+        return ValuationEvidenceRecord(
+            source="CHAINLINK_ORACLE",
+            chain_id=chain_id,
+            token_address=canon_token,
+            price_usd=derived_price,
+            timestamp_utc=ts_utc,
+            feed_or_pool_address=canon_feed,
+            round_id_or_observation_index=evidence.round_id,
+            observation_digest=obs_digest,
+            verification_seal=seal,
+            is_authenticated=True,
+        )
+
+    @classmethod
+    def verify_pyth_price(
+        cls,
+        chain_id: int,
+        token_address: str,
+        evidence: PythPriceEvidence,
+        pyth_signature_proof: Optional[bytes] = None,
+        require_authenticated: bool = False,
+    ) -> ValuationEvidenceRecord:
+        """Derives valuation record from Pyth price update.
+        Mandatorily requires cryptographic Wormhole VM signature proof for authenticated records.
+        """
+        if chain_id not in CANONICAL_VALUATION_FEEDS:
+            raise ValueError(f"Unsupported chain_id for valuation authentication: {chain_id}")
+        canon_feed = canonicalize_token_address(evidence.feed_id) if evidence.feed_id.startswith("0x") and len(evidence.feed_id) == 42 else evidence.feed_id.lower()
+        if evidence.price <= 0:
+            raise ValueError(f"Pyth non-positive price: {evidence.price}")
+        if evidence.conf < 0 or evidence.conf >= evidence.price:
+            raise ValueError(f"Pyth confidence exceeds sanity bounds: conf={evidence.conf}, price={evidence.price}")
+        if evidence.publish_time <= 0:
+            raise ValueError(f"Invalid publish_time: {evidence.publish_time}")
+
+        derived_price = float(evidence.price) * (10 ** evidence.expo)
+        if derived_price <= 0 or not math.isfinite(derived_price):
+            raise ValueError(f"Invalid derived price: {derived_price}")
+
+        canon_token = canonicalize_token_address(token_address)
+        ts_utc = dt.datetime.fromtimestamp(evidence.publish_time, dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+        obs_preimage = f"{chain_id}:{canon_feed}:{canon_token}:{evidence.price}:{evidence.expo}:{evidence.publish_time}"
+        obs_digest = hashlib.sha256(obs_preimage.encode("utf-8")).hexdigest()
+
+        # Cryptographic Pyth Wormhole signature proof check
+        vaa_verified = False
+        if pyth_signature_proof is not None and len(pyth_signature_proof) > 0:
+            ok_vaa, vaa_err, parsed_vaa = verify_wormhole_vaa(
+                raw_vaa=pyth_signature_proof,
+                current_timestamp=evidence.publish_time,
+            )
+            if ok_vaa and parsed_vaa is not None:
+                emitter_chain = parsed_vaa.get("emitter_chain")
+                emitter_addr = parsed_vaa.get("emitter_address")
+                is_valid_emitter = False
+                if emitter_chain in (26, 1) and isinstance(emitter_addr, bytes):
+                    for ec, ea in CANONICAL_PYTH_EMITTERS:
+                        if ec == emitter_chain and (ea == emitter_addr or ea in emitter_addr or emitter_addr in ea):
+                            is_valid_emitter = True
+                            break
+
+                if is_valid_emitter:
+                    try:
+                        payload = parsed_vaa["payload"]
+                        if payload.startswith(b"P2WH"):
+                            hdr_len = int.from_bytes(payload[6:8], "big")
+                            msg_payload = payload[8 + hdr_len:]
+                        else:
+                            msg_payload = payload
+                        if len(msg_payload) >= 61:
+                            p_feed_id = "0x" + msg_payload[1:33].hex().lower()
+                            p_price = int.from_bytes(msg_payload[33:41], "big", signed=True)
+                            p_conf = int.from_bytes(msg_payload[41:49], "big")
+                            p_expo = int.from_bytes(msg_payload[49:53], "big", signed=True)
+                            p_pub_time = int.from_bytes(msg_payload[53:61], "big", signed=True)
+                            if (
+                                p_feed_id == canon_feed.lower()
+                                and p_price == evidence.price
+                                and p_conf == evidence.conf
+                                and p_expo == evidence.expo
+                                and p_pub_time == evidence.publish_time
+                            ):
+                                vaa_verified = True
+                    except Exception:
+                        vaa_verified = False
+
+        if not vaa_verified:
+            if require_authenticated:
+                raise ValueError("Pyth price update lacks valid cryptographic Wormhole/Pyth signature proof")
+            return ValuationEvidenceRecord(
+                source="PYTH_NETWORK",
+                chain_id=chain_id,
+                token_address=canon_token,
+                price_usd=derived_price,
+                timestamp_utc=ts_utc,
+                feed_or_pool_address=canon_feed if canon_feed.startswith("0x") and len(canon_feed) == 42 else "0x" + "00"*20,
+                round_id_or_observation_index=evidence.publish_time,
+                observation_digest=obs_digest,
+                verification_seal="",
+                is_authenticated=False,
+            )
+
+        seal = ValuationEvidenceAuthenticator._compute_seal(
+            source="PYTH_NETWORK",
+            chain_id=chain_id,
+            token_address=canon_token,
+            price_usd=derived_price,
+            timestamp_utc=ts_utc,
+            feed_or_pool_address=canon_feed if canon_feed.startswith("0x") and len(canon_feed) == 42 else "0x" + "00"*20,
+            round_id_or_observation_index=evidence.publish_time,
+            observation_digest=obs_digest,
+        )
+
+        return ValuationEvidenceRecord(
+            source="PYTH_NETWORK",
+            chain_id=chain_id,
+            token_address=canon_token,
+            price_usd=derived_price,
+            timestamp_utc=ts_utc,
+            feed_or_pool_address=canon_feed if canon_feed.startswith("0x") and len(canon_feed) == 42 else "0x" + "00"*20,
+            round_id_or_observation_index=evidence.publish_time,
+            observation_digest=obs_digest,
+            verification_seal=seal,
+            is_authenticated=True,
+        )
+
+    @classmethod
+    def verify_uniswap_v3_twap(
+        cls,
+        chain_id: int,
+        token_address: str,
+        evidence: UniswapV3TwapEvidence,
+        observation_proof_t1: Optional[list[bytes]] = None,
+        observation_proof_t2: Optional[list[bytes]] = None,
+        pool_account_proof_t1: Optional[list[bytes]] = None,
+        pool_account_proof_t2: Optional[list[bytes]] = None,
+        observation_index_t1: Optional[int] = None,
+        observation_index_t2: Optional[int] = None,
+        block_anchor_t1: Optional[BlockHeaderTrustAnchor] = None,
+        block_anchor_t2: Optional[BlockHeaderTrustAnchor] = None,
+        require_authenticated: bool = False,
+    ) -> ValuationEvidenceRecord:
+        """Derives valuation record from Uniswap V3 observe() tick cumulatives.
+        Mandatorily implements exact Uniswap V3 observation storage layout:
+        1. Authenticates pool account proofs against block state root to extract pool storageRoot.
+        2. Proves observation storage slots against pool storageRoot (never global state root).
+        3. Enforces valid observation ring-buffer indexes (uint16 < 65536; timestamps rejected).
+        4. Derives observation mapping slot: keccak256(uint256(index) || uint256(8)).
+        5. Decodes Observation struct: bool initialized (byte 0), int56 tickCumulative (bytes 21..28), uint32 blockTimestamp (bytes 28..32).
+        6. Verifies exact binding of decoded timestamps and tick cumulatives at both endpoints.
+        """
+        if chain_id not in CANONICAL_VALUATION_FEEDS:
+            raise ValueError(f"Unsupported chain_id for valuation authentication: {chain_id}")
+        t1, t2 = evidence.timestamps
+        if t2 - t1 < 60:
+            raise ValueError(f"TWAP window too short: {t2 - t1} seconds < 60 seconds minimum")
+        c1, c2 = evidence.tick_cumulatives
+        avg_tick = (c2 - c1) / (t2 - t1)
+        raw_price = (1.0001 ** avg_tick) * (10 ** (evidence.token0_decimals - evidence.token1_decimals))
+        if raw_price <= 0 or not math.isfinite(raw_price):
+            raise ValueError(f"Invalid derived TWAP price: {raw_price}")
+
+        canon_pool = canonicalize_token_address(evidence.pool_address)
+        canon_token = canonicalize_token_address(token_address)
+        ts_utc = dt.datetime.fromtimestamp(t2, dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+        obs_preimage = f"{chain_id}:{canon_pool}:{canon_token}:{c1}:{c2}:{t1}:{t2}"
+        obs_digest = hashlib.sha256(obs_preimage.encode("utf-8")).hexdigest()
+
+        # Reject UNIX timestamps used as observation indexes (< 65536 mandatory)
+        if observation_index_t1 is not None and observation_index_t1 >= 65536:
+            if require_authenticated:
+                raise ValueError("UNISWAP_V3_INVALID_OBSERVATION_INDEX: UNIX timestamp cannot be used as observation ring-buffer index")
+            observation_index_t1 = None
+        if observation_index_t2 is not None and observation_index_t2 >= 65536:
+            if require_authenticated:
+                raise ValueError("UNISWAP_V3_INVALID_OBSERVATION_INDEX: UNIX timestamp cannot be used as observation ring-buffer index")
+            observation_index_t2 = None
+
+        has_anchors = (
+            block_anchor_t1 is not None and BlockHeaderTrustAnchor.verify_authenticity(block_anchor_t1) and
+            block_anchor_t2 is not None and BlockHeaderTrustAnchor.verify_authenticity(block_anchor_t2)
+        )
+        has_obs_proofs = (
+            observation_proof_t1 is not None and len(observation_proof_t1) > 0 and
+            observation_proof_t2 is not None and len(observation_proof_t2) > 0
+        )
+        has_indices = (observation_index_t1 is not None and observation_index_t2 is not None)
+
+        obs_verified = False
+        if has_anchors and has_obs_proofs and has_indices:
+            try:
+                sr1 = bytes.fromhex(block_anchor_t1.state_root[2:] if block_anchor_t1.state_root.startswith("0x") else block_anchor_t1.state_root)
+                sr2 = bytes.fromhex(block_anchor_t2.state_root[2:] if block_anchor_t2.state_root.startswith("0x") else block_anchor_t2.state_root)
+                pool_key = keccak256(bytes.fromhex(canon_pool[2:]))
+
+                # 1. Authenticate pool account proof to extract pool storage root (never use stateRoot as storage root)
+                pool_sroot1 = None
+                pool_sroot2 = None
+                if pool_account_proof_t1 is not None and len(pool_account_proof_t1) > 0:
+                    p1_acc = verify_mpt_proof(root_hash=sr1, search_key_bytes=pool_key, proof_nodes=pool_account_proof_t1)
+                    if p1_acc.is_valid and p1_acc.is_included and p1_acc.value_bytes:
+                        acc_f1 = rlp_decode(p1_acc.value_bytes)
+                        if isinstance(acc_f1, list) and len(acc_f1) >= 4 and len(acc_f1[2]) == 32:
+                            pool_sroot1 = acc_f1[2]
+
+                if pool_account_proof_t2 is not None and len(pool_account_proof_t2) > 0:
+                    p2_acc = verify_mpt_proof(root_hash=sr2, search_key_bytes=pool_key, proof_nodes=pool_account_proof_t2)
+                    if p2_acc.is_valid and p2_acc.is_included and p2_acc.value_bytes:
+                        acc_f2 = rlp_decode(p2_acc.value_bytes)
+                        if isinstance(acc_f2, list) and len(acc_f2) >= 4 and len(acc_f2[2]) == 32:
+                            pool_sroot2 = acc_f2[2]
+
+                # 2. Verify observation storage proofs against pool storageRoot
+                if pool_sroot1 is not None and pool_sroot2 is not None:
+                    slot_key_t1 = keccak256((observation_index_t1).to_bytes(32, "big") + (8).to_bytes(32, "big"))
+                    slot_key_t2 = keccak256((observation_index_t2).to_bytes(32, "big") + (8).to_bytes(32, "big"))
+
+                    sres1 = verify_mpt_proof(root_hash=pool_sroot1, search_key_bytes=slot_key_t1, proof_nodes=observation_proof_t1)
+                    sres2 = verify_mpt_proof(root_hash=pool_sroot2, search_key_bytes=slot_key_t2, proof_nodes=observation_proof_t2)
+
+                    if sres1.is_valid and sres1.is_included and sres1.value_bytes and \
+                       sres2.is_valid and sres2.is_included and sres2.value_bytes:
+                        val1 = rlp_decode(sres1.value_bytes)
+                        val2 = rlp_decode(sres2.value_bytes)
+                        if isinstance(val1, bytes) and isinstance(val2, bytes) and len(val1) > 0 and len(val2) > 0:
+                            slot1_bytes = val1.rjust(32, b"\x00")
+                            slot2_bytes = val2.rjust(32, b"\x00")
+                            # Uniswap V3 Observation struct layout:
+                            # byte 0: bool initialized
+                            # bytes 1..21: uint160 secondsPerLiquidityCumulativeX128
+                            # bytes 21..28: int56 tickCumulative
+                            # bytes 28..32: uint32 blockTimestamp
+                            init1 = bool(slot1_bytes[0])
+                            cum1_dec = int.from_bytes(slot1_bytes[21:28], "big", signed=True)
+                            ts1_dec = int.from_bytes(slot1_bytes[28:32], "big")
+
+                            init2 = bool(slot2_bytes[0])
+                            cum2_dec = int.from_bytes(slot2_bytes[21:28], "big", signed=True)
+                            ts2_dec = int.from_bytes(slot2_bytes[28:32], "big")
+
+                            if init1 and init2 and ts1_dec == t1 and ts2_dec == t2 and cum1_dec == c1 and cum2_dec == c2:
+                                obs_verified = True
+            except Exception:
+                obs_verified = False
+
+        if not obs_verified:
+            if require_authenticated:
+                raise ValueError("Uniswap V3 TWAP requires authenticated observation state proofs at both observation points")
+            return ValuationEvidenceRecord(
+                source="UNISWAP_V3_TWAP",
+                chain_id=chain_id,
+                token_address=canon_token,
+                price_usd=raw_price,
+                timestamp_utc=ts_utc,
+                feed_or_pool_address=canon_pool,
+                round_id_or_observation_index=t2,
+                observation_digest=obs_digest,
+                verification_seal="",
+                is_authenticated=False,
+            )
+
+        seal = ValuationEvidenceAuthenticator._compute_seal(
+            source="UNISWAP_V3_TWAP",
+            chain_id=chain_id,
+            token_address=canon_token,
+            price_usd=raw_price,
+            timestamp_utc=ts_utc,
+            feed_or_pool_address=canon_pool,
+            round_id_or_observation_index=t2,
+            observation_digest=obs_digest,
+        )
+
+        return ValuationEvidenceRecord(
+            source="UNISWAP_V3_TWAP",
+            chain_id=chain_id,
+            token_address=canon_token,
+            price_usd=raw_price,
+            timestamp_utc=ts_utc,
+            feed_or_pool_address=canon_pool,
+            round_id_or_observation_index=t2,
+            observation_digest=obs_digest,
+            verification_seal=seal,
+            is_authenticated=True,
+        )
+
+
+class ValuationEvidenceAuthenticator:
+    """Cryptographic authenticator and verifier for valuation evidence records."""
+    _SEAL_KEY: bytes = _VALUATION_SEAL_KEY
+
+    @classmethod
+    def _compute_seal(
+        cls,
+        source: str,
+        chain_id: int,
+        token_address: str,
+        price_usd: float,
+        timestamp_utc: str,
+        feed_or_pool_address: str,
+        round_id_or_observation_index: int,
+        observation_digest: str,
+    ) -> str:
+        data = f"{source}:{chain_id}:{token_address.lower()}:{price_usd:.8f}:{timestamp_utc}:{feed_or_pool_address.lower()}:{round_id_or_observation_index}:{observation_digest.lower()}"
+        return hmac.new(cls._SEAL_KEY, data.encode("utf-8"), hashlib.sha256).hexdigest()
+
+    @classmethod
+    def create_authenticated_record(cls, *args: Any, **kwargs: Any) -> ValuationEvidenceRecord:
+        """Deprecated/removed: caller-supplied claims cannot be sealed directly without independent verification."""
+        raise ValueError(
+            "ValuationEvidenceAuthenticator.create_authenticated_record is removed: "
+            "caller-supplied price/timestamp cannot be authenticated directly. "
+            "Use ValuationEvidenceVerifier.verify_chainlink_round, verify_pyth_price, "
+            "or verify_uniswap_v3_twap with genuine oracle evidence."
+        )
+
+    @classmethod
+    def create_unverified_record(
+        cls,
+        source: str,
+        chain_id: int,
+        token_address: str,
+        price_usd: float,
+        timestamp_utc: str,
+        feed_or_pool_address: str,
+        round_id_or_observation_index: int = 1,
+    ) -> ValuationEvidenceRecord:
+        """Returns explicitly unverified valuation record."""
+        return ValuationEvidenceRecord(
+            source=source,
+            chain_id=chain_id,
+            token_address=canonicalize_token_address(token_address),
+            price_usd=price_usd,
+            timestamp_utc=timestamp_utc,
+            feed_or_pool_address=canonicalize_token_address(feed_or_pool_address) if feed_or_pool_address.startswith("0x") and len(feed_or_pool_address) == 42 else feed_or_pool_address,
+            round_id_or_observation_index=round_id_or_observation_index,
+            observation_digest="",
+            verification_seal="",
+            is_authenticated=False,
+        )
+
+    @classmethod
+    def verify_record(cls, record: Any) -> Tuple[bool, Optional[str]]:
+        """Verifies whether a record is genuinely authenticated and has not been forged or fabricated."""
+        if not isinstance(record, ValuationEvidenceRecord):
+            return False, "VALUATION_RECORD_INVALID_TYPE"
+        if not record.is_authenticated:
+            return False, "VALUATION_RECORD_UNAUTHENTICATED"
+        if not record.verification_seal:
+            return False, "FORGED_VALUATION_AUTHENTICATION_FLAG"
+        if not record.feed_or_pool_address or not str(record.feed_or_pool_address).startswith("0x"):
+            return False, "FABRICATED_VALUATION_FEED_ADDRESS"
+
+        try:
+            canon_feed = canonicalize_token_address(record.feed_or_pool_address)
+        except Exception:
+            return False, "FABRICATED_VALUATION_FEED_ADDRESS"
+
+        if record.chain_id not in CANONICAL_VALUATION_FEEDS or canon_feed not in CANONICAL_VALUATION_FEEDS[record.chain_id]:
+            return False, "FABRICATED_VALUATION_FEED_ADDRESS"
+
+        expected_seal = cls._compute_seal(
+            source=record.source,
+            chain_id=record.chain_id,
+            token_address=record.token_address,
+            price_usd=record.price_usd,
+            timestamp_utc=record.timestamp_utc,
+            feed_or_pool_address=canon_feed,
+            round_id_or_observation_index=record.round_id_or_observation_index or 0,
+            observation_digest=record.observation_digest,
+        )
+        if not hmac.compare_digest(record.verification_seal, expected_seal):
+            return False, "FORGED_VALUATION_AUTHENTICATION_FLAG"
+        return True, None
+
+
 @dataclasses.dataclass
 class PoolStateSnapshot:
     """Pool state snapshot bound to canonical identity and block provenance."""
@@ -1405,12 +3430,66 @@ class PoolStateSnapshot:
     venue_type: str  # "UNISWAP_V2" or "UNISWAP_V3"
     evidence_v2: Optional[UniswapV2Evidence] = None
     evidence_v3: Optional[UniswapV3Evidence] = None
-    quote_usd_price: float = 1.0
-    native_usd_price: float = 3000.0
+    quote_usd_price: Optional[float] = None
+    native_usd_price: Optional[float] = None
+    quote_usd_price_source: Optional[str] = None
+    native_usd_price_source: Optional[str] = None
+    quote_usd_price_timestamp_utc: Optional[str] = None
+    native_usd_price_timestamp_utc: Optional[str] = None
+    quote_valuation_record: Optional[ValuationEvidenceRecord] = None
+    native_valuation_record: Optional[ValuationEvidenceRecord] = None
     base_fee_per_gas_wei: int = 20_000_000_000  # 20 gwei
     priority_fee_per_gas_wei: int = 2_000_000_000  # 2 gwei
     max_fee_per_gas_wei: Optional[int] = None
     token0_is_quote: bool = True
+
+    def with_valuation_records(self, feed_address: Optional[str] = None) -> "PoolStateSnapshot":
+        """Returns snapshot copy with ValuationEvidenceRecord attached.
+        NOTE: Does NOT manufacture authenticated evidence. Sets is_authenticated=False.
+        Never defaults to fabricated fallback prices (1.0, 3000.0).
+        """
+        default_feed_q = "0x8fffffd4afb6115b954bd326cbe7b4ba576818f6" if self.chain_id == 1 else "0x7e860098f58b3649411852513627710b2ca66624"
+        default_feed_n = "0x5f4ec3df9cbd43714fe2740f5e3616155c5b8419" if self.chain_id == 1 else "0x71041dddad3595f9cef3dccf156597b71c782d68"
+        q_rec = self.quote_valuation_record or (
+            ValuationEvidenceRecord(
+                source=self.quote_usd_price_source or "CHAINLINK_ORACLE",
+                chain_id=self.chain_id,
+                token_address=self.token_address,
+                price_usd=self.quote_usd_price,
+                timestamp_utc=self.quote_usd_price_timestamp_utc or self.source_timestamp_utc,
+                feed_or_pool_address=feed_address or default_feed_q,
+                round_id_or_observation_index=1,
+                is_authenticated=False,
+            ) if self.quote_usd_price is not None and self.quote_usd_price > 0 and self.quote_usd_price_source is not None else None
+        )
+        n_rec = self.native_valuation_record or (
+            ValuationEvidenceRecord(
+                source=self.native_usd_price_source or "CHAINLINK_ORACLE",
+                chain_id=self.chain_id,
+                token_address=self.token_address,
+                price_usd=self.native_usd_price,
+                timestamp_utc=self.native_usd_price_timestamp_utc or self.source_timestamp_utc,
+                feed_or_pool_address=feed_address or default_feed_n,
+                round_id_or_observation_index=1,
+                is_authenticated=False,
+            ) if self.native_usd_price is not None and self.native_usd_price > 0 and self.native_usd_price_source is not None else None
+        )
+        return dataclasses.replace(self, quote_valuation_record=q_rec, native_valuation_record=n_rec)
+
+    def with_authenticated_valuation_records(self) -> "PoolStateSnapshot":
+        """Returns snapshot copy with genuinely authenticated ValuationEvidenceRecords bound to canonical feeds.
+        Strictly requires valid positive quote and native prices; never uses fallback prices (1.0, 3000.0).
+        Fails closed if cryptographic proofs are absent, as oracle observations cannot be caller-asserted.
+        """
+        if self.quote_usd_price is None or self.quote_usd_price <= 0:
+            raise ValueError("Cannot derive authenticated valuation records: missing or non-positive quote_usd_price")
+        if self.native_usd_price is None or self.native_usd_price <= 0:
+            raise ValueError("Cannot derive authenticated valuation records: missing or non-positive native_usd_price")
+
+        raise ValueError(
+            "Cryptographic proof of Chainlink round data (MPT storage proof anchored to authenticated state root) "
+            "is required to establish genuinely authenticated valuation records"
+        )
 
 
 SUPPORTED_EVM_CHAIN_IDS: set[int] = {
@@ -1422,6 +3501,8 @@ SUPPORTED_EVM_CHAIN_IDS: set[int] = {
     42161,  # Arbitrum One
     43114,  # Avalanche C-Chain
 }
+
+MAX_VALUATION_STALENESS_SECONDS: float = 3600.0
 
 
 class TwoLegExecutionSimulator:
@@ -1437,6 +3518,7 @@ class TwoLegExecutionSimulator:
         tranche_usd: float,
         gas_used_buy: int = 150_000,
         gas_used_sell: int = 150_000,
+        require_authenticated_valuation: bool = False,
     ) -> Dict[str, Any]:
         """Executes modeled buy against entry pool state and modeled sell against target touch pool state."""
         # 1. State availability check
@@ -1501,6 +3583,287 @@ class TwoLegExecutionSimulator:
                 "gas_sell_model_label": None,
                 "gas_buy_usd": 0.0,
                 "gas_sell_usd": 0.0,
+                "tranche_usd": tranche_usd,
+            }
+
+        if entry_state.venue_type not in {"UNISWAP_V2", "UNISWAP_V3"}:
+            return {
+                "status": DualTrackTargetStatus.MODELED_ROUNDTRIP_UNRESOLVED_STATE_MISSING.value,
+                "net_return_pct": None,
+                "diagnostic": f"UNSUPPORTED_VENUE_{entry_state.venue_type}",
+                "gas_buy_model_label": None,
+                "gas_sell_model_label": None,
+                "gas_buy_usd": 0.0,
+                "gas_sell_usd": 0.0,
+                "tranche_usd": tranche_usd,
+            }
+        if touch_state.venue_type not in {"UNISWAP_V2", "UNISWAP_V3"}:
+            return {
+                "status": DualTrackTargetStatus.MODELED_ROUNDTRIP_UNRESOLVED_STATE_MISSING.value,
+                "net_return_pct": None,
+                "diagnostic": f"UNSUPPORTED_VENUE_{touch_state.venue_type}",
+                "gas_buy_model_label": None,
+                "gas_sell_model_label": None,
+                "gas_buy_usd": 0.0,
+                "gas_sell_usd": 0.0,
+                "tranche_usd": tranche_usd,
+            }
+
+        # Orientation consistency check for V3
+        if entry_state.venue_type == "UNISWAP_V3" and entry_state.evidence_v3 is not None:
+            ev3 = entry_state.evidence_v3
+            canon_t0 = canonicalize_token_address(ev3.token0_address)
+            canon_t1 = canonicalize_token_address(ev3.token1_address)
+            if canon_entry_token == canon_t0 and entry_state.token0_is_quote:
+                return {
+                    "status": DualTrackTargetStatus.MODELED_ROUNDTRIP_UNRESOLVED_STATE_MISSING.value,
+                    "net_return_pct": None,
+                    "diagnostic": "V3_ORIENTATION_CONFLICT_TOKEN0_BASE_BUT_FLAG_TRUE",
+                    "gas_buy_model_label": None,
+                    "gas_sell_model_label": None,
+                    "gas_buy_usd": 0.0,
+                    "gas_sell_usd": 0.0,
+                    "tranche_usd": tranche_usd,
+                }
+            if canon_entry_token == canon_t1 and not entry_state.token0_is_quote:
+                return {
+                    "status": DualTrackTargetStatus.MODELED_ROUNDTRIP_UNRESOLVED_STATE_MISSING.value,
+                    "net_return_pct": None,
+                    "diagnostic": "V3_ORIENTATION_CONFLICT_TOKEN1_BASE_BUT_FLAG_FALSE",
+                    "gas_buy_model_label": None,
+                    "gas_sell_model_label": None,
+                    "gas_buy_usd": 0.0,
+                    "gas_sell_usd": 0.0,
+                    "tranche_usd": tranche_usd,
+                }
+
+        # 3. Price validation (fails closed if missing, non-positive, or non-finite)
+        if entry_state.quote_usd_price is None or not math.isfinite(entry_state.quote_usd_price) or entry_state.quote_usd_price <= 0:
+            return {
+                "status": DualTrackTargetStatus.MODELED_ROUNDTRIP_UNRESOLVED_STATE_MISSING.value,
+                "net_return_pct": None,
+                "diagnostic": "ENTRY_QUOTE_PRICE_MISSING_OR_NON_POSITIVE",
+                "tranche_usd": tranche_usd,
+            }
+        if entry_state.native_usd_price is None or not math.isfinite(entry_state.native_usd_price) or entry_state.native_usd_price <= 0:
+            return {
+                "status": DualTrackTargetStatus.MODELED_ROUNDTRIP_UNRESOLVED_STATE_MISSING.value,
+                "net_return_pct": None,
+                "diagnostic": "ENTRY_NATIVE_PRICE_MISSING_OR_NON_POSITIVE",
+                "tranche_usd": tranche_usd,
+            }
+        if touch_state.quote_usd_price is None or not math.isfinite(touch_state.quote_usd_price) or touch_state.quote_usd_price <= 0:
+            return {
+                "status": DualTrackTargetStatus.MODELED_ROUNDTRIP_UNRESOLVED_STATE_MISSING.value,
+                "net_return_pct": None,
+                "diagnostic": "TOUCH_QUOTE_PRICE_MISSING_OR_NON_POSITIVE",
+                "tranche_usd": tranche_usd,
+            }
+        if touch_state.native_usd_price is None or not math.isfinite(touch_state.native_usd_price) or touch_state.native_usd_price <= 0:
+            return {
+                "status": DualTrackTargetStatus.MODELED_ROUNDTRIP_UNRESOLVED_STATE_MISSING.value,
+                "net_return_pct": None,
+                "diagnostic": "TOUCH_NATIVE_PRICE_MISSING_OR_NON_POSITIVE",
+                "tranche_usd": tranche_usd,
+            }
+
+        # 4. Valuation Evidence Binding: Source identity, trust registry & observation timestamp validation
+        for prefix, src, snap_rec, snap_price, snap_ts, snap_chain in [
+            ("ENTRY_QUOTE", entry_state.quote_usd_price_source, entry_state.quote_valuation_record, entry_state.quote_usd_price, entry_state.quote_usd_price_timestamp_utc, entry_state.chain_id),
+            ("ENTRY_NATIVE", entry_state.native_usd_price_source, entry_state.native_valuation_record, entry_state.native_usd_price, entry_state.native_usd_price_timestamp_utc, entry_state.chain_id),
+            ("TOUCH_QUOTE", touch_state.quote_usd_price_source, touch_state.quote_valuation_record, touch_state.quote_usd_price, touch_state.quote_usd_price_timestamp_utc, touch_state.chain_id),
+            ("TOUCH_NATIVE", touch_state.native_usd_price_source, touch_state.native_valuation_record, touch_state.native_usd_price, touch_state.native_usd_price_timestamp_utc, touch_state.chain_id),
+        ]:
+            side = "ENTRY" if "ENTRY" in prefix else "TOUCH"
+            if not src or not src.strip():
+                return {
+                    "status": DualTrackTargetStatus.MODELED_ROUNDTRIP_UNRESOLVED_STATE_MISSING.value,
+                    "net_return_pct": None,
+                    "diagnostic": f"{side}_VALUATION_SOURCE_MISSING",
+                    "tranche_usd": tranche_usd,
+                }
+            if src not in TRUSTED_VALUATION_SOURCES:
+                return {
+                    "status": DualTrackTargetStatus.MODELED_ROUNDTRIP_UNRESOLVED_STATE_MISSING.value,
+                    "net_return_pct": None,
+                    "diagnostic": f"{prefix}_VALUATION_SOURCE_UNTRUSTED",
+                    "tranche_usd": tranche_usd,
+                }
+            if not snap_ts or not snap_ts.strip():
+                return {
+                    "status": DualTrackTargetStatus.MODELED_ROUNDTRIP_UNRESOLVED_STATE_MISSING.value,
+                    "net_return_pct": None,
+                    "diagnostic": f"{side}_VALUATION_TIMESTAMP_MISSING",
+                    "tranche_usd": tranche_usd,
+                }
+            # Requirement G: ValuationEvidenceRecord is strictly mandatory for every leg
+            if snap_rec is None:
+                return {
+                    "status": DualTrackTargetStatus.MODELED_ROUNDTRIP_UNRESOLVED_STATE_MISSING.value,
+                    "net_return_pct": None,
+                    "diagnostic": f"{prefix}_VALUATION_RECORD_MANDATORY_MISSING",
+                    "tranche_usd": tranche_usd,
+                }
+            if not isinstance(snap_rec, ValuationEvidenceRecord):
+                return {
+                    "status": DualTrackTargetStatus.MODELED_ROUNDTRIP_UNRESOLVED_STATE_MISSING.value,
+                    "net_return_pct": None,
+                    "diagnostic": f"{prefix}_VALUATION_RECORD_INVALID",
+                    "tranche_usd": tranche_usd,
+                }
+            if not snap_rec.feed_or_pool_address or not str(snap_rec.feed_or_pool_address).strip().startswith("0x"):
+                return {
+                    "status": DualTrackTargetStatus.MODELED_ROUNDTRIP_UNRESOLVED_STATE_MISSING.value,
+                    "net_return_pct": None,
+                    "diagnostic": f"{prefix}_VALUATION_FEED_ADDRESS_INVALID",
+                    "tranche_usd": tranche_usd,
+                }
+            if snap_rec.feed_or_pool_address.lower() in {"0x" + "00" * 20, "0x" + "44" * 20, "0x" + "11" * 20}:
+                return {
+                    "status": DualTrackTargetStatus.MODELED_ROUNDTRIP_UNRESOLVED_STATE_MISSING.value,
+                    "net_return_pct": None,
+                    "diagnostic": f"{prefix}_VALUATION_FEED_ADDRESS_FABRICATED",
+                    "tranche_usd": tranche_usd,
+                }
+            if snap_rec.is_authenticated:
+                ok_auth, err_auth = ValuationEvidenceAuthenticator.verify_record(snap_rec)
+                if not ok_auth:
+                    return {
+                        "status": DualTrackTargetStatus.MODELED_ROUNDTRIP_UNRESOLVED_STATE_MISSING.value,
+                        "net_return_pct": None,
+                        "diagnostic": f"{prefix}_{err_auth}",
+                        "tranche_usd": tranche_usd,
+                    }
+            elif require_authenticated_valuation:
+                return {
+                    "status": DualTrackTargetStatus.MODELED_ROUNDTRIP_UNRESOLVED_STATE_MISSING.value,
+                    "net_return_pct": None,
+                    "diagnostic": f"{prefix}_VALUATION_RECORD_UNAUTHENTICATED",
+                    "tranche_usd": tranche_usd,
+                }
+            if snap_rec.chain_id != snap_chain:
+                return {
+                    "status": DualTrackTargetStatus.MODELED_ROUNDTRIP_UNRESOLVED_STATE_MISSING.value,
+                    "net_return_pct": None,
+                    "diagnostic": f"{prefix}_VALUATION_CHAIN_MISMATCH",
+                    "tranche_usd": tranche_usd,
+                }
+            if snap_rec.source != src:
+                return {
+                    "status": DualTrackTargetStatus.MODELED_ROUNDTRIP_UNRESOLVED_STATE_MISSING.value,
+                    "net_return_pct": None,
+                    "diagnostic": f"{prefix}_VALUATION_SOURCE_MISMATCH",
+                    "tranche_usd": tranche_usd,
+                }
+            if snap_price is not None and not math.isclose(snap_rec.price_usd, snap_price, rel_tol=1e-5):
+                return {
+                    "status": DualTrackTargetStatus.MODELED_ROUNDTRIP_UNRESOLVED_STATE_MISSING.value,
+                    "net_return_pct": None,
+                    "diagnostic": f"{prefix}_VALUATION_PRICE_MISMATCH",
+                    "tranche_usd": tranche_usd,
+                }
+            if snap_rec.timestamp_utc != snap_ts:
+                return {
+                    "status": DualTrackTargetStatus.MODELED_ROUNDTRIP_UNRESOLVED_STATE_MISSING.value,
+                    "net_return_pct": None,
+                    "diagnostic": f"{prefix}_VALUATION_TIMESTAMP_MISMATCH",
+                    "tranche_usd": tranche_usd,
+                }
+
+        # 5. 24-hour holding period & timestamp validation
+        if not entry_state.source_timestamp_utc or not touch_state.source_timestamp_utc:
+            return {
+                "status": DualTrackTargetStatus.MODELED_ROUNDTRIP_UNRESOLVED_STATE_MISSING.value,
+                "net_return_pct": None,
+                "diagnostic": "ENTRY_OR_TOUCH_TIMESTAMP_MISSING",
+                "tranche_usd": tranche_usd,
+            }
+        try:
+            def _parse_iso(raw_ts: str) -> dt.datetime:
+                return dt.datetime.fromisoformat(raw_ts[:-1] + "+00:00" if raw_ts.endswith("Z") else raw_ts)
+
+            t_entry = _parse_iso(entry_state.source_timestamp_utc)
+            t_touch = _parse_iso(touch_state.source_timestamp_utc)
+            t_entry_q = _parse_iso(entry_state.quote_usd_price_timestamp_utc)
+            t_entry_n = _parse_iso(entry_state.native_usd_price_timestamp_utc)
+            t_touch_q = _parse_iso(touch_state.quote_usd_price_timestamp_utc)
+            t_touch_n = _parse_iso(touch_state.native_usd_price_timestamp_utc)
+        except Exception:
+            return {
+                "status": DualTrackTargetStatus.MODELED_ROUNDTRIP_UNRESOLVED_STATE_MISSING.value,
+                "net_return_pct": None,
+                "diagnostic": "MALFORMED_TIMESTAMP_ISO_FORMAT",
+                "tranche_usd": tranche_usd,
+            }
+
+        for t_val, _ in [
+            (t_entry, "ENTRY"),
+            (t_touch, "TOUCH"),
+            (t_entry_q, "ENTRY_QUOTE"),
+            (t_entry_n, "ENTRY_NATIVE"),
+            (t_touch_q, "TOUCH_QUOTE"),
+            (t_touch_n, "TOUCH_NATIVE"),
+        ]:
+            if t_val.tzinfo is None:
+                return {
+                    "status": DualTrackTargetStatus.MODELED_ROUNDTRIP_UNRESOLVED_STATE_MISSING.value,
+                    "net_return_pct": None,
+                    "diagnostic": "TIMEZONE_NAIVE_TIMESTAMP_REJECTED",
+                    "tranche_usd": tranche_usd,
+                }
+
+        if t_touch < t_entry:
+            return {
+                "status": DualTrackTargetStatus.MODELED_ROUNDTRIP_UNRESOLVED_STATE_MISSING.value,
+                "net_return_pct": None,
+                "diagnostic": "TOUCH_PRECEDES_ENTRY_TIMESTAMP",
+                "tranche_usd": tranche_usd,
+            }
+
+        # Freshness validation against snapshot observation time (<= 3600.0s)
+        if abs((t_entry_q - t_entry).total_seconds()) > MAX_VALUATION_STALENESS_SECONDS:
+            return {
+                "status": DualTrackTargetStatus.MODELED_ROUNDTRIP_UNRESOLVED_STATE_MISSING.value,
+                "net_return_pct": None,
+                "diagnostic": "ENTRY_QUOTE_VALUATION_STALE",
+                "tranche_usd": tranche_usd,
+            }
+        if abs((t_entry_n - t_entry).total_seconds()) > MAX_VALUATION_STALENESS_SECONDS:
+            return {
+                "status": DualTrackTargetStatus.MODELED_ROUNDTRIP_UNRESOLVED_STATE_MISSING.value,
+                "net_return_pct": None,
+                "diagnostic": "ENTRY_NATIVE_VALUATION_STALE",
+                "tranche_usd": tranche_usd,
+            }
+        if abs((t_touch_q - t_touch).total_seconds()) > MAX_VALUATION_STALENESS_SECONDS:
+            return {
+                "status": DualTrackTargetStatus.MODELED_ROUNDTRIP_UNRESOLVED_STATE_MISSING.value,
+                "net_return_pct": None,
+                "diagnostic": "TOUCH_QUOTE_VALUATION_STALE",
+                "tranche_usd": tranche_usd,
+            }
+        if abs((t_touch_n - t_touch).total_seconds()) > MAX_VALUATION_STALENESS_SECONDS:
+            return {
+                "status": DualTrackTargetStatus.MODELED_ROUNDTRIP_UNRESOLVED_STATE_MISSING.value,
+                "net_return_pct": None,
+                "diagnostic": "TOUCH_NATIVE_VALUATION_STALE",
+                "tranche_usd": tranche_usd,
+            }
+
+        delta_seconds = (t_touch - t_entry).total_seconds()
+        if delta_seconds < 0:
+            return {
+                "status": DualTrackTargetStatus.MODELED_ROUNDTRIP_UNRESOLVED_STATE_MISSING.value,
+                "net_return_pct": None,
+                "diagnostic": "TOUCH_PRECEDES_ENTRY_TIMESTAMP",
+                "tranche_usd": tranche_usd,
+            }
+
+        if delta_seconds > MAX_HOLDING_HOURS * 3600.0:
+            return {
+                "status": DualTrackTargetStatus.MODELED_ROUNDTRIP_UNRESOLVED_STATE_MISSING.value,
+                "net_return_pct": None,
+                "diagnostic": "HOLDING_WINDOW_EXCEEDED_24H",
                 "tranche_usd": tranche_usd,
             }
 
@@ -1850,6 +4213,18 @@ class TwoLegExecutionSimulator:
             "gas_sell_usd": round(gas_sell_usd, 4),
             "gas_buy_model_label": buy_gas_status,
             "gas_sell_model_label": sell_gas_status,
+            "valuation_authenticated": all([
+                entry_state.quote_valuation_record and entry_state.quote_valuation_record.is_authenticated,
+                entry_state.native_valuation_record and entry_state.native_valuation_record.is_authenticated,
+                touch_state.quote_valuation_record and touch_state.quote_valuation_record.is_authenticated,
+                touch_state.native_valuation_record and touch_state.native_valuation_record.is_authenticated,
+            ]),
+            "valuation_model_label": "AUTHENTICATED_CANONICAL_VALUATION" if all([
+                entry_state.quote_valuation_record and entry_state.quote_valuation_record.is_authenticated,
+                entry_state.native_valuation_record and entry_state.native_valuation_record.is_authenticated,
+                touch_state.quote_valuation_record and touch_state.quote_valuation_record.is_authenticated,
+                touch_state.native_valuation_record and touch_state.native_valuation_record.is_authenticated,
+            ]) else "MODELED_UNAUTHENTICATED_VALUATION_ASSUMPTIONS",
             "tranche_usd": tranche_usd,
             "tokens_acquired": tokens_acquired_raw,
         }
@@ -1935,6 +4310,24 @@ class LiquidityClassificationEngine:
                     "recovery_observed_after_collapse": False,
                     "recovery_confirmed_at_window_end": False,
                 }
+
+        # 1b. Validate all numeric liquidity values are finite and non-negative
+        for r in records:
+            for val, name in [
+                (r.liquidity_usd, "liquidity_usd"),
+                (r.d_ask_plus_2pct, "d_ask_plus_2pct"),
+                (r.d_bid_minus_2pct, "d_bid_minus_2pct"),
+            ]:
+                if val is None or not math.isfinite(val) or val < 0:
+                    return {
+                        "status": LiquidityClassificationStatus.UNRESOLVED_LIQUIDITY.value,
+                        "diagnostic": "NON_FINITE_OR_NEGATIVE_LIQUIDITY_REJECTED",
+                        "window_end_status": "WINDOW_END_UNRESOLVED",
+                        "liquidity_end_usd_observed_unverified": None,
+                        "liquidity_end_usd_authenticated_verified": None,
+                        "recovery_observed_after_collapse": False,
+                        "recovery_confirmed_at_window_end": False,
+                    }
 
         # 2. Parse timestamps and sort chronologically
         try:
@@ -2023,6 +4416,18 @@ class LiquidityClassificationEngine:
         initial_bid = initial_rec.d_bid_minus_2pct
         initial_usd = initial_rec.liquidity_usd
 
+        if initial_usd is None or not math.isfinite(initial_usd) or initial_usd <= 0:
+            return {
+                "status": LiquidityClassificationStatus.UNRESOLVED_LIQUIDITY.value,
+                "diagnostic": "INITIAL_LIQUIDITY_NON_POSITIVE",
+                "window_end_status": window_end_status,
+                "min_depth_ratio": None,
+                "liquidity_end_usd_observed_unverified": liquidity_end_usd_unverified,
+                "liquidity_end_usd_authenticated_verified": None,
+                "recovery_observed_after_collapse": False,
+                "recovery_confirmed_at_window_end": False,
+            }
+
         if initial_ask <= 0 or initial_bid <= 0:
             return {
                 "status": LiquidityClassificationStatus.UNRESOLVED_LIQUIDITY.value,
@@ -2041,7 +4446,7 @@ class LiquidityClassificationEngine:
             if r_end_depth >= 0.80:
                 recovery_confirmed_end = True
 
-        # Priority 1: Check for LP burn events or depth collapse (< 20% on either side)
+        # Priority 1: Check for LP burn events or depth collapse (< 20% on bid/ask depth)
         min_depth_ratio = 1.0
         depth_collapse_detected = False
         depth_min_timestamp = None
@@ -2157,15 +4562,396 @@ class LiquidityClassificationEngine:
         }
 
 
+class TargetTouchClassification(enum.Enum):
+    """Rigorous classification separating unverified candle touches from verifiable execution state."""
+    CANDLE_OBSERVED_TOUCH = "CANDLE_OBSERVED_TOUCH"
+    ONCHAIN_OBSERVED_TOUCH = "ONCHAIN_OBSERVED_TOUCH"
+    VERIFIED_TARGET_BLOCK_STATE = "VERIFIED_TARGET_BLOCK_STATE"
+    TARGET_TIME_STATE_UNAVAILABLE = "TARGET_TIME_STATE_UNAVAILABLE"
+    TARGET_NOT_REACHED = "TARGET_NOT_REACHED"
+
+
+@dataclasses.dataclass
+class TargetBlockStateProofPayload:
+    """Raw cryptographic proof payload submitted for verification against state root."""
+    chain_id: int
+    block_number: int
+    block_hash: str
+    token_address: str
+    pool_address: str
+    state_root: str
+    account_proof: List[bytes]
+    storage_proof: List[bytes]
+    storage_slot: int = 3
+    token0_is_quote: bool = True
+    token0_decimals: int = 18
+    token1_decimals: int = 18
+    venue_type: str = "UNISWAP_V2"
+
+
+@dataclasses.dataclass
+class VerifiedTargetBlockStateResult:
+    """Non-forgeable result sealed by TargetStateProofVerifier."""
+    chain_id: int
+    block_number: int
+    block_hash: str
+    token_address: str
+    pool_address: str
+    state_root: str
+    is_valid: bool
+    target_price_reached: bool
+    spot_price: float
+    proof_type: str = "MPT_STATE_PROOF"
+    verification_seal: str = ""
+
+
+@dataclasses.dataclass
+class TargetBlockStateProofResult:
+    """Caller-constructible proof result (unauthenticated unless sealed by TargetStateProofVerifier)."""
+    chain_id: int
+    block_number: int
+    block_hash: str
+    token_address: str
+    pool_address: str
+    state_root: str
+    is_valid: bool
+    target_price_reached: bool
+    proof_type: str = "MPT_STATE_PROOF"
+
+
+class TargetStateProofVerifier:
+    """Cryptographic proof verifier for pool state at target block.
+
+    Verifies MPT account proof against state_root and MPT storage proof against account storage_root.
+    Issues a tamper-evident VerifiedTargetBlockStateResult protected by a process-isolated HMAC seal.
+    Caller-constructed dataclasses or unsealed results are strictly rejected.
+    """
+    _SEAL_KEY: bytes = os.urandom(32)
+
+    @classmethod
+    def _compute_seal(
+        cls,
+        chain_id: int,
+        block_number: int,
+        block_hash: str,
+        token_address: str,
+        pool_address: str,
+        state_root: str,
+        is_valid: bool,
+        target_price_reached: bool,
+        spot_price: float,
+    ) -> str:
+        data = f"{chain_id}:{block_number}:{block_hash.lower()}:{token_address.lower()}:{pool_address.lower()}:{state_root.lower()}:{is_valid}:{target_price_reached}:{spot_price:.8f}"
+        return hmac.new(cls._SEAL_KEY, data.encode("utf-8"), hashlib.sha256).hexdigest()
+
+    @classmethod
+    def is_authenticated_result(cls, result: Any) -> bool:
+        """Authenticates that a result was genuinely issued by this verifier and has not been tampered with."""
+        if not isinstance(result, VerifiedTargetBlockStateResult):
+            return False
+        if not result.is_valid or not result.verification_seal:
+            return False
+        expected_seal = cls._compute_seal(
+            chain_id=result.chain_id,
+            block_number=result.block_number,
+            block_hash=result.block_hash,
+            token_address=result.token_address,
+            pool_address=result.pool_address,
+            state_root=result.state_root,
+            is_valid=result.is_valid,
+            target_price_reached=result.target_price_reached,
+            spot_price=result.spot_price,
+        )
+        return hmac.compare_digest(result.verification_seal, expected_seal)
+
+    @classmethod
+    def verify_proof(
+        cls,
+        payload: TargetBlockStateProofPayload,
+        entry_price: float,
+        trust_anchor: Optional[BlockHeaderTrustAnchor] = None,
+        pool_metadata: Optional[PoolMetadataTrustAnchor] = None,
+        expected_state_root: Optional[str] = None,
+        expected_chain_id: Optional[int] = None,
+        expected_block_number: Optional[int] = None,
+        expected_block_hash: Optional[str] = None,
+        expected_token_address: Optional[str] = None,
+        expected_pool_address: Optional[str] = None,
+    ) -> Tuple[bool, Optional[VerifiedTargetBlockStateResult], Optional[str]]:
+        """Cryptographically verifies pool account and storage proofs from raw trie nodes,
+        mandatorily anchored to an independently authenticated block header and pool metadata.
+        """
+        if entry_price <= 0 or not math.isfinite(entry_price):
+            return False, None, "INVALID_ENTRY_PRICE"
+
+        # 1. Require independently authenticated block header trust anchor
+        anchor = trust_anchor or BlockHeaderTrustAnchorRegistry.get(
+            payload.chain_id, payload.block_number, payload.block_hash
+        )
+        if anchor is None or not BlockHeaderTrustAnchor.verify_authenticity(anchor):
+            return False, None, "UNAUTHENTICATED_BLOCK_HEADER_TRUST_ANCHOR_REQUIRED"
+
+        if anchor.chain_id != payload.chain_id:
+            return False, None, f"TRUST_ANCHOR_CHAIN_MISMATCH_{anchor.chain_id}_VS_{payload.chain_id}"
+        if anchor.block_number != payload.block_number:
+            return False, None, f"TRUST_ANCHOR_BLOCK_NUMBER_MISMATCH_{anchor.block_number}_VS_{payload.block_number}"
+        if anchor.block_hash.lower() != payload.block_hash.lower():
+            return False, None, "TRUST_ANCHOR_BLOCK_HASH_MISMATCH"
+        if anchor.state_root.lower() != payload.state_root.lower():
+            return False, None, "TRUST_ANCHOR_STATE_ROOT_MISMATCH"
+
+        if expected_state_root is not None and anchor.state_root.lower() != expected_state_root.lower():
+            return False, None, "STATE_ROOT_MISMATCH"
+
+        # 2. Require independently authenticated pool metadata anchor
+        meta = pool_metadata or PoolMetadataTrustAnchorRegistry.get(
+            payload.chain_id, payload.pool_address
+        )
+        if meta is None or not PoolMetadataTrustAnchor.verify_authenticity(meta):
+            return False, None, "UNAUTHENTICATED_POOL_METADATA_TRUST_ANCHOR_REQUIRED"
+
+        if meta.chain_id != payload.chain_id:
+            return False, None, "POOL_METADATA_CHAIN_MISMATCH"
+        if meta.venue_type != "UNISWAP_V2" or payload.storage_slot != 3 or meta.reserves_storage_slot != 3:
+            return False, None, "UNSUPPORTED_POOL_VENUE_OR_STORAGE_SLOT"
+
+        try:
+            canon_payload_token = canonicalize_token_address(payload.token_address)
+            canon_payload_pool = canonicalize_token_address(payload.pool_address)
+            canon_meta_pool = canonicalize_token_address(meta.pool_address)
+            canon_token0 = canonicalize_token_address(meta.token0_address)
+            canon_token1 = canonicalize_token_address(meta.token1_address)
+        except Exception as e:
+            return False, None, f"ADDRESS_CANONICALIZATION_FAILED: {e}"
+
+        if canon_payload_pool != canon_meta_pool:
+            return False, None, "POOL_METADATA_ADDRESS_MISMATCH"
+
+        if canon_payload_token not in {canon_token0, canon_token1}:
+            return False, None, "TOKEN_NOT_IN_POOL"
+
+        if payload.token0_is_quote != meta.token0_is_quote:
+            return False, None, "QUOTE_TOKEN_ORIENTATION_MISMATCH"
+
+        if (
+            payload.token0_decimals != meta.token0_decimals
+            or payload.token1_decimals != meta.token1_decimals
+        ):
+            return False, None, "TOKEN_DECIMALS_MISMATCH"
+
+        # 3. Identity bindings
+        if expected_chain_id is not None and payload.chain_id != expected_chain_id:
+            return False, None, f"CHAIN_ID_MISMATCH_{payload.chain_id}_VS_{expected_chain_id}"
+        if expected_block_number is not None and payload.block_number != expected_block_number:
+            return False, None, f"BLOCK_NUMBER_MISMATCH_{payload.block_number}_VS_{expected_block_number}"
+        if expected_block_hash is not None and payload.block_hash.lower() != expected_block_hash.lower():
+            return False, None, "BLOCK_HASH_MISMATCH"
+        if expected_token_address is not None:
+            if canon_payload_token != canonicalize_token_address(expected_token_address):
+                return False, None, "TOKEN_ADDRESS_MISMATCH"
+        if expected_pool_address is not None:
+            if canon_payload_pool != canonicalize_token_address(expected_pool_address):
+                return False, None, "POOL_ADDRESS_MISMATCH"
+
+        # 4. Format validation
+        if not payload.state_root.startswith("0x") or len(payload.state_root) != 66:
+            return False, None, "INVALID_STATE_ROOT_HEX_FORMAT"
+        if not payload.block_hash.startswith("0x") or len(payload.block_hash) != 66:
+            return False, None, "INVALID_BLOCK_HASH_HEX_FORMAT"
+        if not payload.account_proof or not isinstance(payload.account_proof, list):
+            return False, None, "ACCOUNT_PROOF_EMPTY"
+        if not payload.storage_proof or not isinstance(payload.storage_proof, list):
+            return False, None, "STORAGE_PROOF_EMPTY"
+
+        # 5. Cryptographic Account Proof Verification against authenticated state_root
+        try:
+            state_root_bytes = bytes.fromhex(anchor.state_root[2:])
+            pool_raw_bytes = bytes.fromhex(canon_payload_pool[2:])
+            account_search_key = keccak256(pool_raw_bytes)
+
+            acct_result = verify_mpt_proof(
+                root_hash=state_root_bytes,
+                search_key_bytes=account_search_key,
+                proof_nodes=payload.account_proof,
+            )
+            if not acct_result.is_valid or not acct_result.is_included or not acct_result.value_bytes:
+                return False, None, f"ACCOUNT_MPT_PROOF_INVALID: {acct_result.error}"
+
+            account_leaf = AccountStateLeaf.from_rlp(acct_result.value_bytes)
+            if not account_leaf.is_valid:
+                return False, None, f"ACCOUNT_LEAF_INVALID: {account_leaf.error}"
+            storage_root = account_leaf.storage_root
+        except Exception as e:
+            return False, None, f"ACCOUNT_PROOF_VERIFICATION_EXCEPTION: {e}"
+
+        # 6. Cryptographic Storage Proof Verification against storage_root
+        try:
+            storage_search_key = UniswapV2Slot3Decoder.compute_storage_key(payload.storage_slot)
+            storage_result = verify_mpt_proof(
+                root_hash=storage_root,
+                search_key_bytes=storage_search_key,
+                proof_nodes=payload.storage_proof,
+            )
+            if not storage_result.is_valid or not storage_result.is_included or not storage_result.value_bytes:
+                return False, None, f"STORAGE_MPT_PROOF_INVALID: {storage_result.error}"
+
+            # Storage values in Ethereum MPT are RLP-encoded bytes
+            val = storage_result.value_bytes
+            try:
+                decoded_val = rlp_decode(val)
+                if isinstance(decoded_val, bytes):
+                    val = decoded_val
+            except Exception:
+                pass
+
+            decoded_res = UniswapV2Slot3Decoder.decode_storage_word(val)
+            if not decoded_res.is_valid:
+                return False, None, f"RESERVES_DECODE_FAILED: {decoded_res.error}"
+
+            r0 = decoded_res.reserve0
+            r1 = decoded_res.reserve1
+            if r0 <= 0 or r1 <= 0:
+                return False, None, "NON_POSITIVE_RESERVES"
+
+            adj0 = 10 ** meta.token0_decimals
+            adj1 = 10 ** meta.token1_decimals
+            if meta.token0_is_quote:
+                spot_price = (r0 / r1) * (adj1 / adj0)
+            else:
+                spot_price = (r1 / r0) * (adj0 / adj1)
+
+            target_price = entry_price * (1.0 + TECHNICAL_TP_PCT / 100.0)
+            target_reached = spot_price >= target_price
+
+            seal = cls._compute_seal(
+                chain_id=payload.chain_id,
+                block_number=payload.block_number,
+                block_hash=payload.block_hash,
+                token_address=payload.token_address,
+                pool_address=payload.pool_address,
+                state_root=anchor.state_root,
+                is_valid=True,
+                target_price_reached=target_reached,
+                spot_price=spot_price,
+            )
+
+            result = VerifiedTargetBlockStateResult(
+                chain_id=payload.chain_id,
+                block_number=payload.block_number,
+                block_hash=payload.block_hash,
+                token_address=payload.token_address,
+                pool_address=payload.pool_address,
+                state_root=anchor.state_root,
+                is_valid=True,
+                target_price_reached=target_reached,
+                spot_price=spot_price,
+                proof_type="MPT_STATE_PROOF",
+                verification_seal=seal,
+            )
+            return True, result, None
+        except Exception as e:
+            return False, None, f"STORAGE_PROOF_VERIFICATION_EXCEPTION: {e}"
+
+
 class DualTrackOutcomeEvaluator:
     """Evaluates technical pattern attainment independently from modeled execution."""
+
+    @classmethod
+    def classify_target_touch(
+        cls,
+        entry_price: float,
+        max_candle_high_24h: Optional[float] = None,
+        onchain_touch_observed: bool = False,
+        target_state_proof: Optional[Any] = None,
+        target_state_proof_payload: Optional[TargetBlockStateProofPayload] = None,
+        trust_anchor: Optional[BlockHeaderTrustAnchor] = None,
+        pool_metadata: Optional[PoolMetadataTrustAnchor] = None,
+        target_time_state_available: bool = True,
+        expected_chain_id: Optional[int] = None,
+        expected_block_number: Optional[int] = None,
+        expected_block_hash: Optional[str] = None,
+        expected_token_address: Optional[str] = None,
+        expected_pool_address: Optional[str] = None,
+        expected_state_root: Optional[str] = None,
+        target_block_state_verified: Any = None,
+        **kwargs: Any,
+    ) -> TargetTouchClassification:
+        """Classifies target touch evidence separating candle observation from on-chain and block state.
+
+        OHLC candle high alone cannot establish execution timing or verifiable state.
+        Caller-supplied Booleans (e.g. target_block_state_verified=True) are strictly rejected.
+        VERIFIED_TARGET_BLOCK_STATE requires a cryptographically validated result sealed by TargetStateProofVerifier
+        mandatorily anchored to an independently authenticated block header and pool metadata.
+        """
+        if entry_price <= 0 or not math.isfinite(entry_price) or not target_time_state_available:
+            return TargetTouchClassification.TARGET_TIME_STATE_UNAVAILABLE
+
+        target_price = entry_price * (1.0 + TECHNICAL_TP_PCT / 100.0)
+        candle_reached = (
+            max_candle_high_24h is not None
+            and math.isfinite(max_candle_high_24h)
+            and max_candle_high_24h >= target_price
+        )
+
+        verified_state = False
+        if target_state_proof_payload is not None and isinstance(target_state_proof_payload, TargetBlockStateProofPayload):
+            ok, res, _ = TargetStateProofVerifier.verify_proof(
+                payload=target_state_proof_payload,
+                entry_price=entry_price,
+                trust_anchor=trust_anchor,
+                pool_metadata=pool_metadata,
+                expected_state_root=expected_state_root,
+                expected_chain_id=expected_chain_id,
+                expected_block_number=expected_block_number,
+                expected_block_hash=expected_block_hash,
+                expected_token_address=expected_token_address,
+                expected_pool_address=expected_pool_address,
+            )
+            if ok and res is not None and res.target_price_reached:
+                verified_state = True
+        elif target_state_proof is not None:
+            if TargetStateProofVerifier.is_authenticated_result(target_state_proof):
+                proof = target_state_proof
+                chain_match = (expected_chain_id is None) or (proof.chain_id == expected_chain_id)
+                block_num_match = (expected_block_number is None) or (proof.block_number == expected_block_number)
+                block_hash_match = (expected_block_hash is None) or (proof.block_hash.lower() == expected_block_hash.lower())
+                state_root_match = (expected_state_root is None) or (proof.state_root.lower() == expected_state_root.lower())
+                try:
+                    token_match = (expected_token_address is None) or (
+                        canonicalize_token_address(proof.token_address) == canonicalize_token_address(expected_token_address)
+                    )
+                    pool_match = (expected_pool_address is None) or (
+                        canonicalize_token_address(proof.pool_address) == canonicalize_token_address(expected_pool_address)
+                    )
+                except Exception:
+                    token_match = False
+                    pool_match = False
+
+                if (
+                    proof.target_price_reached
+                    and chain_match
+                    and block_num_match
+                    and block_hash_match
+                    and state_root_match
+                    and token_match
+                    and pool_match
+                ):
+                    verified_state = True
+
+        if verified_state:
+            return TargetTouchClassification.VERIFIED_TARGET_BLOCK_STATE
+        if onchain_touch_observed:
+            return TargetTouchClassification.ONCHAIN_OBSERVED_TOUCH
+        if candle_reached:
+            return TargetTouchClassification.CANDLE_OBSERVED_TOUCH
+        return TargetTouchClassification.TARGET_NOT_REACHED
 
     @staticmethod
     def evaluate_market_technical_tp(
         entry_price: float,
         max_candle_high_24h: float,
     ) -> bool:
-        """Evaluates whether market price reached technical +40.00% TP within 24h."""
+        """Evaluates whether market price reached technical +40.00% TP within 24h (candle high only)."""
         if entry_price <= 0:
             return False
         target_price = entry_price * (1.0 + TECHNICAL_TP_PCT / 100.0)
@@ -2190,16 +4976,6 @@ class DualTrackOutcomeEvaluator:
 # ==============================================================================
 # 7. Dataset A Trade Journal Financial Reconciliation
 # ==============================================================================
-
-def canonicalize_token_address(token_identifier: str) -> str:
-    """Extracts canonical on-chain token address by stripping network namespace prefixes.
-    e.g. 'ethereum:0x1111' -> '0x1111', 'solana:token-a' -> 'token-a', '0x1111' -> '0x1111'
-    """
-    s = str(token_identifier).strip().lower()
-    if ":" in s:
-        s = s.split(":")[-1].strip()
-    return s
-
 
 @dataclasses.dataclass
 class OnChainTransferEvent:
@@ -2422,17 +5198,38 @@ class DatasetAReconciliationEngine:
             )
 
         # 4d. Verify transfer log amounts matching acquired and sold quantities with canonical token_address
-        canonical_entry_token = canonicalize_token_address(entry.token_id)
-        canonical_exit_token = canonicalize_token_address(exit_exec.token_id)
+        def _matches_canon(addr: str, expected_canon: str) -> bool:
+            try:
+                return canonicalize_token_address(addr) == expected_canon
+            except (ValueError, Exception):
+                return False
+
+        try:
+            canonical_entry_token = canonicalize_token_address(entry.token_id)
+            canonical_exit_token = canonicalize_token_address(exit_exec.token_id)
+        except (ValueError, Exception):
+            return ReconciledTrancheOutcome(
+                status=EvidenceTier.RECEIPT_VERIFICATION_FAILED,
+                discrepancy_reason="MALFORMED_JOURNAL_TOKEN_ADDRESS",
+                alpha_ratio=0.0,
+                allocated_expenditure=0.0,
+                allocated_entry_gas=0.0,
+                allocated_entry_fees=0.0,
+                realized_net_pl=0.0,
+                realized_net_return_pct=0.0,
+                tokens_remaining=entry.tokens_acquired,
+                cost_basis_remaining=entry.quote_expenditure,
+                contributes_to_verified_pl=False,
+            )
 
         has_entry_transfer = any(
-            canonicalize_token_address(t.token_address) == canonical_entry_token
+            _matches_canon(t.token_address, canonical_entry_token)
             and t.to_address.lower() == entry.wallet_address.lower()
             and math.isclose(t.amount, entry.tokens_acquired, rel_tol=1e-4)
             for t in entry_receipt.transfers
         )
         has_exit_transfer = any(
-            canonicalize_token_address(t.token_address) == canonical_exit_token
+            _matches_canon(t.token_address, canonical_exit_token)
             and t.from_address.lower() == exit_exec.wallet_address.lower()
             and math.isclose(t.amount, exit_exec.tokens_sold, rel_tol=1e-4)
             for t in exit_receipt.transfers

@@ -5807,67 +5807,241 @@ class ProductionGateHardeningTests(ProvenanceIntegrityAdversarialTests):
 
 
 class TestLiveProviderIntegrations(unittest.TestCase):
-    """Integration tests running against actual live public provider endpoints when internet is available."""
+    """Network-isolated provider integration tests using blocked network interfaces and deterministic fixtures."""
+
+    @staticmethod
+    def _strict_network_guard():
+        from contextlib import contextmanager
+        from unittest.mock import patch
+
+        @contextmanager
+        def guard():
+            with patch("urllib.request.urlopen", side_effect=AssertionError("Outbound urllib request attempted in offline test")) as mock_url, \
+                 patch("socket.socket.connect", side_effect=AssertionError("Outbound socket connection attempted in offline test")) as mock_sock, \
+                 patch("http.client.HTTPConnection.connect", side_effect=AssertionError("Outbound HTTPConnection attempted in offline test")) as mock_http, \
+                 patch("http.client.HTTPSConnection.connect", side_effect=AssertionError("Outbound HTTPSConnection attempted in offline test")) as mock_https, \
+                 patch("requests.Session.send", side_effect=AssertionError("Outbound requests.Session.send attempted in offline test")) as mock_req:
+                yield {
+                    "urlopen": mock_url,
+                    "socket": mock_sock,
+                    "http": mock_http,
+                    "https": mock_https,
+                    "requests": mock_req,
+                }
+        return guard()
+
+    def test_network_isolation_blocks_all_transports(self):
+        """Verifies that the isolation harness strictly intercepts urllib, socket, http.client, and requests."""
+        import http.client
+        import socket
+        import urllib.request
+        import requests
+
+        with self._strict_network_guard():
+            # 1. urllib
+            with self.assertRaises(AssertionError) as cm:
+                urllib.request.urlopen("https://127.0.0.1:80")
+            self.assertIn("Outbound urllib request attempted", str(cm.exception))
+
+            # 2. socket
+            with self.assertRaises(AssertionError) as cm:
+                with socket.socket() as s:
+                    s.connect(("127.0.0.1", 80))
+            self.assertIn("Outbound socket connection attempted", str(cm.exception))
+
+            # 3. http.client.HTTPConnection
+            with self.assertRaises(AssertionError) as cm:
+                h = http.client.HTTPConnection("127.0.0.1", 80)
+                h.connect()
+            self.assertIn("Outbound HTTPConnection attempted", str(cm.exception))
+
+            # 4. http.client.HTTPSConnection
+            with self.assertRaises(AssertionError) as cm:
+                hs = http.client.HTTPSConnection("127.0.0.1", 443)
+                hs.connect()
+            self.assertIn("Outbound HTTPSConnection attempted", str(cm.exception))
+
+            # 5. requests.Session.send
+            with self.assertRaises(AssertionError) as cm:
+                req = requests.Request("GET", "https://127.0.0.1").prepare()
+                requests.Session().send(req)
+            self.assertIn("Outbound requests.Session.send attempted", str(cm.exception))
 
     def test_live_coinbase_ticker_integration(self):
-        try:
-            obs = acquire_provider_observation("coinbase", "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48", "ethereum", market_or_feed_id="ETH-USD")
-            if obs.get("status") == "PROVIDER_DATA_UNAVAILABLE":
-                raise unittest.SkipTest(f"Live Coinbase endpoint unavailable: {obs.get('reason')}")
-            self.assertIsNotNone(obs.get("price_usd"))
-            self.assertGreater(obs["price_usd"], 0)
-            self.assertEqual(obs["provider"], "coinbase")
-            self.assertEqual(obs["transport_type"], "LIVE_HTTP")
-        except (Exception, BaseException) as e:
-            raise unittest.SkipTest(f"Live network test skipped due to connectivity or network guard: {e}")
+        """Verifies Coinbase ticker parsing with mocked transport and proves zero real network requests across all transports."""
+        import json
+
+        def mock_coinbase_transport(url, data=None, headers=None, timeout=5.0):
+            payload = {"price": "3150.50", "bid": "3150.40", "ask": "3150.60", "time": "2026-11-15T12:00:00Z"}
+            return 200, json.dumps(payload).encode("utf-8")
+
+        with self._strict_network_guard() as mocks:
+            obs = acquire_provider_observation(
+                "coinbase", "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48", "ethereum",
+                market_or_feed_id="ETH-USD", transport=mock_coinbase_transport,
+            )
+            self.assertNotEqual(obs.get("status"), "PROVIDER_DATA_UNAVAILABLE")
+            self.assertTrue(obs.get("provider_acquired"))
+            self.assertEqual(obs.get("price_usd"), 3150.50)
+            self.assertEqual(obs.get("provider"), "coinbase")
+            self.assertEqual(obs.get("transport_type"), "MOCKED_TRANSPORT")
+            for m in mocks.values():
+                m.assert_not_called()
+
+            # Verify fail-closed behavior when network transport encounters connection denial
+            def failing_transport(url, data=None, headers=None, timeout=5.0):
+                raise ConnectionRefusedError("Offline connection denied")
+
+            fail_obs = acquire_provider_observation(
+                "coinbase", "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48", "ethereum",
+                market_or_feed_id="ETH-USD", transport=failing_transport,
+            )
+            self.assertEqual(fail_obs.get("status"), "PROVIDER_DATA_UNAVAILABLE")
+            self.assertIsNone(fail_obs.get("price_usd"))
 
     def test_live_binance_ticker_integration(self):
-        try:
-            obs = acquire_provider_observation("binance", "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48", "ethereum", market_or_feed_id="ETHUSDT")
-            if obs.get("status") == "PROVIDER_DATA_UNAVAILABLE":
-                raise unittest.SkipTest(f"Live Binance endpoint unavailable: {obs.get('reason')}")
-            self.assertIsNotNone(obs.get("price_usd"))
-            self.assertGreater(obs["price_usd"], 0)
-            self.assertEqual(obs["provider"], "binance")
-            self.assertEqual(obs["transport_type"], "LIVE_HTTP")
-        except (Exception, BaseException) as e:
-            raise unittest.SkipTest(f"Live network test skipped due to connectivity or network guard: {e}")
+        """Verifies Binance ticker parsing with mocked transport and proves zero real network requests across all transports."""
+        import json
+
+        def mock_binance_transport(url, data=None, headers=None, timeout=5.0):
+            payload = {"symbol": "ETHUSDT", "lastPrice": "3150.50", "bidPrice": "3150.40", "askPrice": "3150.60", "closeTime": 1794744000000}
+            return 200, json.dumps(payload).encode("utf-8")
+
+        with self._strict_network_guard() as mocks:
+            obs = acquire_provider_observation(
+                "binance", "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48", "ethereum",
+                market_or_feed_id="ETHUSDT", transport=mock_binance_transport,
+            )
+            self.assertNotEqual(obs.get("status"), "PROVIDER_DATA_UNAVAILABLE")
+            self.assertTrue(obs.get("provider_acquired"))
+            self.assertEqual(obs.get("price_usd"), 3150.50)
+            self.assertEqual(obs.get("provider"), "binance")
+            self.assertEqual(obs.get("transport_type"), "MOCKED_TRANSPORT")
+            for m in mocks.values():
+                m.assert_not_called()
+
+            def failing_transport(url, data=None, headers=None, timeout=5.0):
+                raise ConnectionRefusedError("Offline connection denied")
+
+            fail_obs = acquire_provider_observation(
+                "binance", "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48", "ethereum",
+                market_or_feed_id="ETHUSDT", transport=failing_transport,
+            )
+            self.assertEqual(fail_obs.get("status"), "PROVIDER_DATA_UNAVAILABLE")
+            self.assertIsNone(fail_obs.get("price_usd"))
 
     def test_live_kraken_ticker_integration(self):
-        try:
-            obs = acquire_provider_observation("kraken", "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48", "ethereum", market_or_feed_id="ETHUSD")
-            if obs.get("status") == "PROVIDER_DATA_UNAVAILABLE":
-                raise unittest.SkipTest(f"Live Kraken endpoint unavailable: {obs.get('reason')}")
-            self.assertIsNotNone(obs.get("price_usd"))
-            self.assertGreater(obs["price_usd"], 0)
-            self.assertEqual(obs["provider"], "kraken")
-            self.assertEqual(obs["transport_type"], "LIVE_HTTP")
-        except (Exception, BaseException) as e:
-            raise unittest.SkipTest(f"Live network test skipped due to connectivity or network guard: {e}")
+        """Verifies Kraken ticker parsing with mocked transport and proves zero real network requests across all transports."""
+        import json
+
+        def mock_kraken_transport(url, data=None, headers=None, timeout=5.0):
+            payload = {"error": [], "result": {"ETHUSD": {"c": ["3150.50", "1.0"], "b": ["3150.40", "1"], "a": ["3150.60", "1"]}}}
+            return 200, json.dumps(payload).encode("utf-8")
+
+        with self._strict_network_guard() as mocks:
+            obs = acquire_provider_observation(
+                "kraken", "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48", "ethereum",
+                market_or_feed_id="ETHUSD", transport=mock_kraken_transport,
+            )
+            self.assertNotEqual(obs.get("status"), "PROVIDER_DATA_UNAVAILABLE")
+            self.assertTrue(obs.get("provider_acquired"))
+            self.assertEqual(obs.get("price_usd"), 3150.50)
+            self.assertEqual(obs.get("provider"), "kraken")
+            self.assertEqual(obs.get("transport_type"), "MOCKED_TRANSPORT")
+            for m in mocks.values():
+                m.assert_not_called()
+
+            def failing_transport(url, data=None, headers=None, timeout=5.0):
+                raise ConnectionRefusedError("Offline connection denied")
+
+            fail_obs = acquire_provider_observation(
+                "kraken", "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48", "ethereum",
+                market_or_feed_id="ETHUSD", transport=failing_transport,
+            )
+            self.assertEqual(fail_obs.get("status"), "PROVIDER_DATA_UNAVAILABLE")
+            self.assertIsNone(fail_obs.get("price_usd"))
 
     def test_live_defillama_prices_integration(self):
-        try:
-            obs = acquire_provider_observation("defillama", "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48", "ethereum")
-            if obs.get("status") == "PROVIDER_DATA_UNAVAILABLE":
-                raise unittest.SkipTest(f"Live DefiLlama endpoint unavailable: {obs.get('reason')}")
-            self.assertIsNotNone(obs.get("price_usd"))
-            self.assertAlmostEqual(obs["price_usd"], 1.0, delta=0.05)
-            self.assertEqual(obs["provider"], "defillama")
-            self.assertEqual(obs["transport_type"], "LIVE_HTTP")
-        except (Exception, BaseException) as e:
-            raise unittest.SkipTest(f"Live network test skipped due to connectivity or network guard: {e}")
+        """Verifies DefiLlama prices parsing with mocked transport and proves zero real network requests across all transports."""
+        import json
+
+        def mock_llama_transport(url, data=None, headers=None, timeout=5.0):
+            payload = {"coins": {"ethereum:0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48": {"price": 1.0001, "symbol": "USDC", "timestamp": 1794744000}}}
+            return 200, json.dumps(payload).encode("utf-8")
+
+        with self._strict_network_guard() as mocks:
+            obs = acquire_provider_observation(
+                "defillama", "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48", "ethereum",
+                transport=mock_llama_transport,
+            )
+            self.assertNotEqual(obs.get("status"), "PROVIDER_DATA_UNAVAILABLE")
+            self.assertTrue(obs.get("provider_acquired"))
+            self.assertAlmostEqual(obs["price_usd"], 1.0001, delta=0.001)
+            self.assertEqual(obs.get("provider"), "defillama")
+            self.assertEqual(obs.get("transport_type"), "MOCKED_TRANSPORT")
+            for m in mocks.values():
+                m.assert_not_called()
+
+            def failing_transport(url, data=None, headers=None, timeout=5.0):
+                raise ConnectionRefusedError("Offline connection denied")
+
+            fail_obs = acquire_provider_observation(
+                "defillama", "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48", "ethereum",
+                transport=failing_transport,
+            )
+            self.assertEqual(fail_obs.get("status"), "PROVIDER_DATA_UNAVAILABLE")
+            self.assertIsNone(fail_obs.get("price_usd"))
 
     def test_live_chainlink_rpc_integration(self):
-        try:
-            obs = acquire_provider_observation("chainlink", "0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2", "ethereum", market_or_feed_id="0x5f4ec3df9cbd43714fe2740f5e3616155c5b8419")
-            if obs.get("status") == "PROVIDER_DATA_UNAVAILABLE":
-                raise unittest.SkipTest(f"Live Chainlink RPC unavailable: {obs.get('reason')}")
-            self.assertIsNotNone(obs.get("price_usd"))
+        """Verifies Chainlink RPC parsing with mocked transport and proves zero real network requests across all transports."""
+        import json
+
+        def mock_chainlink_transport(url, data=None, headers=None, timeout=5.0):
+            payload = json.loads(data if isinstance(data, str) else data.decode("utf-8"))
+            method = payload.get("method")
+            p_id = payload.get("id", 1)
+            if method == "eth_chainId":
+                return 200, json.dumps({"jsonrpc": "2.0", "id": p_id, "result": "0x1"}).encode("utf-8")
+            elif method == "eth_call":
+                call_data = payload.get("params", [{}])[0].get("data", "")
+                if "313ce567" in call_data:  # decimals()
+                    dec_hex = (8).to_bytes(32, "big").hex()
+                    return 200, json.dumps({"jsonrpc": "2.0", "id": p_id, "result": "0x" + dec_hex}).encode("utf-8")
+                elif "feaf968e" in call_data:  # latestRoundData()
+                    r_id = (1).to_bytes(32, "big").hex()
+                    ans = (315050000000).to_bytes(32, "big").hex()
+                    s_at = (1794744000).to_bytes(32, "big").hex()
+                    u_at = (1794744000).to_bytes(32, "big").hex()
+                    a_in_r = (1).to_bytes(32, "big").hex()
+                    res_hex = "0x" + r_id + ans + s_at + u_at + a_in_r
+                    return 200, json.dumps({"jsonrpc": "2.0", "id": p_id, "result": res_hex}).encode("utf-8")
+            return 400, b"{}"
+
+        with self._strict_network_guard() as mocks:
+            obs = acquire_provider_observation(
+                "chainlink", "0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2", "ethereum",
+                market_or_feed_id="0x5f4ec3df9cbd43714fe2740f5e3616155c5b8419",
+                transport=mock_chainlink_transport,
+            )
+            self.assertNotEqual(obs.get("status"), "PROVIDER_DATA_UNAVAILABLE")
+            self.assertTrue(obs.get("provider_acquired"))
             self.assertGreater(obs["price_usd"], 100)
-            self.assertEqual(obs["provider"], "chainlink")
-            self.assertEqual(obs["transport_type"], "LIVE_RPC")
-        except (Exception, BaseException) as e:
-            raise unittest.SkipTest(f"Live network test skipped due to connectivity or network guard: {e}")
+            self.assertEqual(obs["price_usd"], 3150.50)
+            self.assertEqual(obs.get("provider"), "chainlink")
+            self.assertEqual(obs.get("transport_type"), "MOCKED_TRANSPORT")
+            for m in mocks.values():
+                m.assert_not_called()
+
+            def failing_transport(url, data=None, headers=None, timeout=5.0):
+                raise ConnectionRefusedError("Offline connection denied")
+
+            fail_obs = acquire_provider_observation(
+                "chainlink", "0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2", "ethereum",
+                market_or_feed_id="0x5f4ec3df9cbd43714fe2740f5e3616155c5b8419",
+                transport=failing_transport,
+            )
+            self.assertEqual(fail_obs.get("status"), "PROVIDER_DATA_UNAVAILABLE")
+            self.assertIsNone(fail_obs.get("price_usd"))
 
 
 if __name__ == "__main__":

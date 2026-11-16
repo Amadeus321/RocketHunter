@@ -1,6 +1,7 @@
 import datetime as dt
 import email.utils
 import hashlib
+import io
 import json
 import tempfile
 import time
@@ -68,7 +69,7 @@ class WatchlistObservationCollectorTests(unittest.TestCase):
         ])
 
     def test_duration_over_three_hour_limit_is_rejected(self):
-        with patch.object(collector, "collect") as collect:
+        with patch.object(collector, "collect") as collect, patch("sys.stderr", new_callable=io.StringIO):
             with self.assertRaises(SystemExit) as raised:
                 collector.main([
                     "--memory-dir", str(self.memory),

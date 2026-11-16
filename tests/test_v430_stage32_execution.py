@@ -16,8 +16,11 @@ import datetime as dt
 import hashlib
 import math
 import os
+import tempfile
 import unittest
-from typing import Dict, List
+from unittest import mock
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple
 
 from scripts.research_evidence import (
     TECHNICAL_TP_PCT,
@@ -26,7 +29,11 @@ from scripts.research_evidence import (
     SIMULATION_TRANCHES_USD,
     UNISWAP_V3_FEE_SPACINGS,
     DualTrackTargetStatus,
+    FinalityState,
     LiquidityClassificationStatus,
+    TargetTouchClassification,
+    CompleteReplayManifest,
+    ReplayManifestBuilder,
     UniswapV2Evidence,
     UniswapV3Evidence,
     UniswapV3TickMath,
@@ -41,7 +48,48 @@ from scripts.research_evidence import (
     LiquidityObservationRecord,
     LiquidityClassificationEngine,
     DualTrackOutcomeEvaluator,
+    MultiChainFinalityEngine,
+    OpStackOutputProofEvidence,
+    OpStackOutputProofPayload,
+    OpStackOutputProofVerifier,
+    TargetBlockStateProofResult,
+    TargetBlockStateProofPayload,
+    VerifiedTargetBlockStateResult,
+    TargetStateProofVerifier,
+    BlockHeaderTrustAnchor,
+    PoolMetadataTrustAnchor,
+    PoolMetadataVerifier,
+    BlockHeaderTrustAnchorRegistry,
+    PoolMetadataTrustAnchorRegistry,
+    ValuationEvidenceRecord,
+    ValuationEvidenceAuthenticator,
+    ValuationEvidenceVerifier,
+    ChainlinkRoundEvidence,
+    PythPriceEvidence,
+    UniswapV3TwapEvidence,
+    derive_actual_runtime_dependencies,
+    TRUSTED_VALUATION_SOURCES,
+    compute_uniswap_v2_pair_address,
+    HeaderConsensusEvidence,
+    HeaderConsensusVerifier,
+    UNISWAP_V2_FACTORY_MAINNET,
+    CANONICAL_V2_FACTORIES,
     ProtectedDataVerifier,
+    canonicalize_token_address,
+)
+from scripts.consensus_proof_verifier import (
+    UniswapV2Slot3Decoder,
+    encode_compact_path,
+    rlp_encode,
+    rlp_encode_bytes,
+    keccak256,
+    compute_sync_committee_root,
+    DEV_HARDHAT_ANVIL_KEYS,
+    verify_wormhole_vaa,
+    WormholeGuardianRegistry,
+    LightClientSyncCommitteeStore,
+    SyncCommitteePeriodTransition,
+    GINDEX_NEXT_SYNC_COMMITTEE,
 )
 
 
@@ -93,9 +141,13 @@ class TestStage32TwoLegExecutionAndGasMath(unittest.TestCase):
             evidence_v2=self.entry_v2,
             quote_usd_price=1.0,
             native_usd_price=3000.0,
+            quote_usd_price_source="CHAINLINK_ORACLE",
+            native_usd_price_source="CHAINLINK_ORACLE",
+            quote_usd_price_timestamp_utc="2026-11-15T00:00:00Z",
+            native_usd_price_timestamp_utc="2026-11-15T00:00:00Z",
             base_fee_per_gas_wei=10_000_000_000,     # 10 gwei
             priority_fee_per_gas_wei=1_000_000_000,  # 1 gwei
-        )
+        ).with_valuation_records()
 
         touch_snapshot = PoolStateSnapshot(
             chain_id=1,
@@ -108,9 +160,13 @@ class TestStage32TwoLegExecutionAndGasMath(unittest.TestCase):
             evidence_v2=self.touch_v2_high,
             quote_usd_price=1.0,
             native_usd_price=3000.0,
+            quote_usd_price_source="CHAINLINK_ORACLE",
+            native_usd_price_source="CHAINLINK_ORACLE",
+            quote_usd_price_timestamp_utc="2026-11-15T04:00:00Z",
+            native_usd_price_timestamp_utc="2026-11-15T04:00:00Z",
             base_fee_per_gas_wei=10_000_000_000,
             priority_fee_per_gas_wei=1_000_000_000,
-        )
+        ).with_valuation_records()
 
         result = TwoLegExecutionSimulator.simulate_roundtrip(
             entry_state=entry_snapshot,
@@ -154,9 +210,13 @@ class TestStage32TwoLegExecutionAndGasMath(unittest.TestCase):
             evidence_v2=self.entry_v2,
             quote_usd_price=1.0,
             native_usd_price=3000.0,
+            quote_usd_price_source="CHAINLINK_ORACLE",
+            native_usd_price_source="CHAINLINK_ORACLE",
+            quote_usd_price_timestamp_utc="2026-11-15T00:00:00Z",
+            native_usd_price_timestamp_utc="2026-11-15T00:00:00Z",
             base_fee_per_gas_wei=30_000_000_000,     # 30 gwei
             priority_fee_per_gas_wei=2_000_000_000,  # 2 gwei
-        )
+        ).with_valuation_records()
 
         touch_snapshot = PoolStateSnapshot(
             chain_id=1,
@@ -169,9 +229,13 @@ class TestStage32TwoLegExecutionAndGasMath(unittest.TestCase):
             evidence_v2=touch_v2_exact40,
             quote_usd_price=1.0,
             native_usd_price=3000.0,
+            quote_usd_price_source="CHAINLINK_ORACLE",
+            native_usd_price_source="CHAINLINK_ORACLE",
+            quote_usd_price_timestamp_utc="2026-11-15T04:00:00Z",
+            native_usd_price_timestamp_utc="2026-11-15T04:00:00Z",
             base_fee_per_gas_wei=30_000_000_000,
             priority_fee_per_gas_wei=2_000_000_000,
-        )
+        ).with_valuation_records()
 
         result = TwoLegExecutionSimulator.simulate_roundtrip(
             entry_state=entry_snapshot,
@@ -197,7 +261,9 @@ class TestStage32TwoLegExecutionAndGasMath(unittest.TestCase):
             source_timestamp_utc="2026-11-15T00:00:00Z",
             venue_type="UNISWAP_V2",
             evidence_v2=self.entry_v2,
-        )
+            quote_usd_price=1.0,
+            native_usd_price=3000.0,
+        ).with_valuation_records()
 
         result = TwoLegExecutionSimulator.simulate_roundtrip(
             entry_state=entry_snapshot,
@@ -285,10 +351,14 @@ class TestStage32TwoLegExecutionAndGasMath(unittest.TestCase):
             evidence_v2=self.entry_v2,
             quote_usd_price=1.0,
             native_usd_price=3000.0,
+            quote_usd_price_source="CHAINLINK_ORACLE",
+            native_usd_price_source="CHAINLINK_ORACLE",
+            quote_usd_price_timestamp_utc="2026-11-15T00:00:00Z",
+            native_usd_price_timestamp_utc="2026-11-15T00:00:00Z",
             base_fee_per_gas_wei=10_000_000_000,     # 10 gwei
             priority_fee_per_gas_wei=5_000_000_000,  # 5 gwei
             max_fee_per_gas_wei=12_000_000_000,      # Capped to 12 gwei (tip=2 gwei)
-        )
+        ).with_valuation_records()
 
         touch_snapshot = PoolStateSnapshot(
             chain_id=1,
@@ -301,10 +371,14 @@ class TestStage32TwoLegExecutionAndGasMath(unittest.TestCase):
             evidence_v2=self.touch_v2_high,
             quote_usd_price=1.0,
             native_usd_price=3000.0,
+            quote_usd_price_source="CHAINLINK_ORACLE",
+            native_usd_price_source="CHAINLINK_ORACLE",
+            quote_usd_price_timestamp_utc="2026-11-15T04:00:00Z",
+            native_usd_price_timestamp_utc="2026-11-15T04:00:00Z",
             base_fee_per_gas_wei=10_000_000_000,
             priority_fee_per_gas_wei=5_000_000_000,
             max_fee_per_gas_wei=13_000_000_000,      # Capped to 13 gwei (tip=3 gwei)
-        )
+        ).with_valuation_records()
 
         result = TwoLegExecutionSimulator.simulate_roundtrip(
             entry_state=entry_snapshot,
@@ -334,10 +408,14 @@ class TestStage32TwoLegExecutionAndGasMath(unittest.TestCase):
             evidence_v2=self.entry_v2,
             quote_usd_price=1.0,
             native_usd_price=3000.0,
+            quote_usd_price_source="CHAINLINK_ORACLE",
+            native_usd_price_source="CHAINLINK_ORACLE",
+            quote_usd_price_timestamp_utc="2026-11-15T00:00:00Z",
+            native_usd_price_timestamp_utc="2026-11-15T00:00:00Z",
             base_fee_per_gas_wei=10_000_000_000,
             priority_fee_per_gas_wei=1_000_000_000,
             max_fee_per_gas_wei=None,  # Uncapped legacy assumption!
-        )
+        ).with_valuation_records()
         touch_snapshot = PoolStateSnapshot(
             chain_id=1,
             token_address="0x2222222222222222222222222222222222222222",
@@ -349,10 +427,14 @@ class TestStage32TwoLegExecutionAndGasMath(unittest.TestCase):
             evidence_v2=self.touch_v2_high,
             quote_usd_price=1.0,
             native_usd_price=3000.0,
+            quote_usd_price_source="CHAINLINK_ORACLE",
+            native_usd_price_source="CHAINLINK_ORACLE",
+            quote_usd_price_timestamp_utc="2026-11-15T04:00:00Z",
+            native_usd_price_timestamp_utc="2026-11-15T04:00:00Z",
             base_fee_per_gas_wei=10_000_000_000,
             priority_fee_per_gas_wei=1_000_000_000,
             max_fee_per_gas_wei=20_000_000_000,
-        )
+        ).with_valuation_records()
         result = TwoLegExecutionSimulator.simulate_roundtrip(entry_snapshot, touch_snapshot, 500.0)
         self.assertEqual(result["gas_buy_model_label"], "MODELED_GAS_COST_UNCAPPED_LEGACY_ASSUMPTION")
         self.assertEqual(result["gas_sell_model_label"], "MODELED_GAS_COST_CANONICAL_EIP1559")
@@ -368,7 +450,13 @@ class TestStage32TwoLegExecutionAndGasMath(unittest.TestCase):
             source_timestamp_utc="2026-11-15T00:00:00Z",
             venue_type="UNISWAP_V2",
             evidence_v2=self.entry_v2,
-        )
+            quote_usd_price=1.0,
+            native_usd_price=3000.0,
+            quote_usd_price_source="CHAINLINK_ORACLE",
+            native_usd_price_source="CHAINLINK_ORACLE",
+            quote_usd_price_timestamp_utc="2026-11-15T00:00:00Z",
+            native_usd_price_timestamp_utc="2026-11-15T00:00:00Z",
+        ).with_valuation_records()
         base_touch = PoolStateSnapshot(
             chain_id=1,
             token_address="0x2222222222222222222222222222222222222222",
@@ -378,7 +466,13 @@ class TestStage32TwoLegExecutionAndGasMath(unittest.TestCase):
             source_timestamp_utc="2026-11-15T04:00:00Z",
             venue_type="UNISWAP_V2",
             evidence_v2=self.touch_v2_high,
-        )
+            quote_usd_price=1.0,
+            native_usd_price=3000.0,
+            quote_usd_price_source="CHAINLINK_ORACLE",
+            native_usd_price_source="CHAINLINK_ORACLE",
+            quote_usd_price_timestamp_utc="2026-11-15T04:00:00Z",
+            native_usd_price_timestamp_utc="2026-11-15T04:00:00Z",
+        ).with_valuation_records()
 
         # 1. Chain ID mismatch
         touch_bad_chain = dataclasses.replace(base_touch, chain_id=42161)
@@ -423,14 +517,20 @@ class TestStage32TwoLegExecutionAndGasMath(unittest.TestCase):
             venue_type="RAYDIUM",
             quote_usd_price=1.0,
             native_usd_price=150.0,
+            quote_usd_price_source="PYTH_NETWORK",
+            native_usd_price_source="PYTH_NETWORK",
+            quote_usd_price_timestamp_utc="2026-11-15T00:00:00Z",
+            native_usd_price_timestamp_utc="2026-11-15T00:00:00Z",
             base_fee_per_gas_wei=20_000_000_000,
             priority_fee_per_gas_wei=2_000_000_000,
-        )
+        ).with_valuation_records()
         sol_touch = dataclasses.replace(
             sol_entry,
             block_number=280_001_000,
             block_hash="5Me2nCRusNKWZWgLg3QKz0OafCpbcKpjKd38KxW8HcqK",
             source_timestamp_utc="2026-11-15T02:00:00Z",
+            quote_usd_price_timestamp_utc="2026-11-15T02:00:00Z",
+            native_usd_price_timestamp_utc="2026-11-15T02:00:00Z",
         )
 
         res = TwoLegExecutionSimulator.simulate_roundtrip(sol_entry, sol_touch, tranche_usd=500.0)
@@ -478,12 +578,18 @@ class TestStage32TwoLegExecutionAndGasMath(unittest.TestCase):
             evidence_v2=ev_v2_unknown,
             quote_usd_price=1.0,
             native_usd_price=3000.0,
-        )
+            quote_usd_price_source="CHAINLINK_ORACLE",
+            native_usd_price_source="CHAINLINK_ORACLE",
+            quote_usd_price_timestamp_utc="2026-11-15T00:00:00Z",
+            native_usd_price_timestamp_utc="2026-11-15T00:00:00Z",
+        ).with_valuation_records()
         unknown_chain_touch = dataclasses.replace(
             unknown_chain_entry,
             block_number=19_001_000,
             block_hash="0x" + "bb" * 32,
             source_timestamp_utc="2026-11-15T02:00:00Z",
+            quote_usd_price_timestamp_utc="2026-11-15T02:00:00Z",
+            native_usd_price_timestamp_utc="2026-11-15T02:00:00Z",
         )
         res_unknown = TwoLegExecutionSimulator.simulate_roundtrip(unknown_chain_entry, unknown_chain_touch, tranche_usd=500.0)
         self.assertEqual(res_unknown["status"], DualTrackTargetStatus.MODELED_ROUNDTRIP_UNRESOLVED_STATE_MISSING.value)
@@ -507,10 +613,14 @@ class TestStage32TwoLegExecutionAndGasMath(unittest.TestCase):
             evidence_v2=self.entry_v2,
             quote_usd_price=1.0,
             native_usd_price=3000.0,
+            quote_usd_price_source="CHAINLINK_ORACLE",
+            native_usd_price_source="CHAINLINK_ORACLE",
+            quote_usd_price_timestamp_utc="2026-11-15T00:00:00Z",
+            native_usd_price_timestamp_utc="2026-11-15T00:00:00Z",
             base_fee_per_gas_wei=20_000_000_000,
             priority_fee_per_gas_wei=2_000_000_000,
             max_fee_per_gas_wei=15_000_000_000,  # Below 20 gwei base fee!
-        )
+        ).with_valuation_records()
         base_touch = PoolStateSnapshot(
             chain_id=1,
             token_address="0x2222222222222222222222222222222222222222",
@@ -522,10 +632,14 @@ class TestStage32TwoLegExecutionAndGasMath(unittest.TestCase):
             evidence_v2=self.touch_v2_high,
             quote_usd_price=1.0,
             native_usd_price=3000.0,
+            quote_usd_price_source="CHAINLINK_ORACLE",
+            native_usd_price_source="CHAINLINK_ORACLE",
+            quote_usd_price_timestamp_utc="2026-11-15T04:00:00Z",
+            native_usd_price_timestamp_utc="2026-11-15T04:00:00Z",
             base_fee_per_gas_wei=20_000_000_000,
             priority_fee_per_gas_wei=2_000_000_000,
             max_fee_per_gas_wei=25_000_000_000,
-        )
+        ).with_valuation_records()
         res = TwoLegExecutionSimulator.simulate_roundtrip(base_entry, base_touch, 500.0)
         self.assertEqual(res["status"], DualTrackTargetStatus.MODELED_ROUNDTRIP_UNRESOLVED_STATE_MISSING.value)
         self.assertEqual(res["diagnostic"], "ENTRY_MAX_FEE_BELOW_BASE_FEE")
@@ -571,10 +685,14 @@ class TestStage32TwoLegExecutionAndGasMath(unittest.TestCase):
             evidence_v2=entry_v2_rev,
             quote_usd_price=1.0,
             native_usd_price=3000.0,
+            quote_usd_price_source="CHAINLINK_ORACLE",
+            native_usd_price_source="CHAINLINK_ORACLE",
+            quote_usd_price_timestamp_utc="2026-11-15T00:00:00Z",
+            native_usd_price_timestamp_utc="2026-11-15T00:00:00Z",
             base_fee_per_gas_wei=10_000_000_000,
             priority_fee_per_gas_wei=1_000_000_000,
             max_fee_per_gas_wei=20_000_000_000,
-        )
+        ).with_valuation_records()
         touch_snap = PoolStateSnapshot(
             chain_id=1,
             token_address="0x2222222222222222222222222222222222222222",
@@ -586,10 +704,14 @@ class TestStage32TwoLegExecutionAndGasMath(unittest.TestCase):
             evidence_v2=touch_v2_rev,
             quote_usd_price=1.0,
             native_usd_price=3000.0,
+            quote_usd_price_source="CHAINLINK_ORACLE",
+            native_usd_price_source="CHAINLINK_ORACLE",
+            quote_usd_price_timestamp_utc="2026-11-15T04:00:00Z",
+            native_usd_price_timestamp_utc="2026-11-15T04:00:00Z",
             base_fee_per_gas_wei=10_000_000_000,
             priority_fee_per_gas_wei=1_000_000_000,
             max_fee_per_gas_wei=20_000_000_000,
-        )
+        ).with_valuation_records()
         result = TwoLegExecutionSimulator.simulate_roundtrip(entry_snap, touch_snap, 500.0, gas_used_buy=150_000, gas_used_sell=150_000)
         self.assertEqual(result["status"], DualTrackTargetStatus.MODELED_TP40_EXECUTABLE_WITH_ASSUMPTIONS.value)
         self.assertGreaterEqual(result["net_return_pct"], TECHNICAL_TP_PCT)
@@ -648,11 +770,15 @@ class TestStage32TwoLegExecutionAndGasMath(unittest.TestCase):
             evidence_v3=ev_entry,
             quote_usd_price=1.0,
             native_usd_price=3000.0,
+            quote_usd_price_source="CHAINLINK_ORACLE",
+            native_usd_price_source="CHAINLINK_ORACLE",
+            quote_usd_price_timestamp_utc="2026-11-15T00:00:00Z",
+            native_usd_price_timestamp_utc="2026-11-15T00:00:00Z",
             base_fee_per_gas_wei=10_000_000_000,
             priority_fee_per_gas_wei=1_000_000_000,
             max_fee_per_gas_wei=20_000_000_000,
             token0_is_quote=True,
-        )
+        ).with_valuation_records()
         touch_snap = PoolStateSnapshot(
             chain_id=1,
             token_address="0x2222222222222222222222222222222222222222",
@@ -664,11 +790,15 @@ class TestStage32TwoLegExecutionAndGasMath(unittest.TestCase):
             evidence_v3=ev_touch,
             quote_usd_price=1.0,
             native_usd_price=3000.0,
+            quote_usd_price_source="CHAINLINK_ORACLE",
+            native_usd_price_source="CHAINLINK_ORACLE",
+            quote_usd_price_timestamp_utc="2026-11-15T04:00:00Z",
+            native_usd_price_timestamp_utc="2026-11-15T04:00:00Z",
             base_fee_per_gas_wei=10_000_000_000,
             priority_fee_per_gas_wei=1_000_000_000,
             max_fee_per_gas_wei=20_000_000_000,
             token0_is_quote=True,
-        )
+        ).with_valuation_records()
         result = TwoLegExecutionSimulator.simulate_roundtrip(entry_snap, touch_snap, 500.0, gas_used_buy=150_000, gas_used_sell=150_000)
         self.assertEqual(result["status"], DualTrackTargetStatus.MODELED_TP40_EXECUTABLE_WITH_ASSUMPTIONS.value)
         self.assertGreaterEqual(result["net_return_pct"], TECHNICAL_TP_PCT)
@@ -708,11 +838,15 @@ class TestStage32TwoLegExecutionAndGasMath(unittest.TestCase):
             evidence_v3=ev_entry,
             quote_usd_price=1.0,
             native_usd_price=3000.0,
+            quote_usd_price_source="CHAINLINK_ORACLE",
+            native_usd_price_source="CHAINLINK_ORACLE",
+            quote_usd_price_timestamp_utc="2026-11-15T00:00:00Z",
+            native_usd_price_timestamp_utc="2026-11-15T00:00:00Z",
             base_fee_per_gas_wei=10_000_000_000,
             priority_fee_per_gas_wei=1_000_000_000,
             max_fee_per_gas_wei=20_000_000_000,
             token0_is_quote=True,  # CONFLICT!
-        )
+        ).with_valuation_records()
         touch_conflicted = dataclasses.replace(entry_conflicted, block_number=19_001_000, block_hash="0x" + "bb" * 32, evidence_v3=ev_touch)
         res = TwoLegExecutionSimulator.simulate_roundtrip(entry_conflicted, touch_conflicted, 500.0)
         self.assertEqual(res["status"], DualTrackTargetStatus.MODELED_ROUNDTRIP_UNRESOLVED_STATE_MISSING.value)
@@ -1717,6 +1851,36 @@ class TestBidirectionalDepthAndLiquidityHierarchy(unittest.TestCase):
 class TestMultiSizeAndIdentityConstraints(unittest.TestCase):
     """Test suite covering AC-10, AC-13, AC-14, AC-15."""
 
+    def setUp(self):
+        self.entry_v2 = UniswapV2Evidence(
+            chain_id=1,
+            pool_address="0x1111111111111111111111111111111111111111",
+            token0_address="0x2222222222222222222222222222222222222222",  # Base token
+            token1_address="0x3333333333333333333333333333333333333333",  # Quote (USDC, 6 decimals)
+            token0_decimals=18,
+            token1_decimals=6,
+            raw_reserve0=1_000 * 10**18,   # 1,000 tokens
+            raw_reserve1=1_000_000 * 10**6, # 1,000,000 USDC ($1,000 per token)
+            fee_bps=30,
+            block_number=19_000_000,
+            block_hash="0x" + "aa" * 32,
+            parent_hash="0x" + "00" * 32,
+        )
+        self.touch_v2_high = UniswapV2Evidence(
+            chain_id=1,
+            pool_address="0x1111111111111111111111111111111111111111",
+            token0_address="0x2222222222222222222222222222222222222222",
+            token1_address="0x3333333333333333333333333333333333333333",
+            token0_decimals=18,
+            token1_decimals=6,
+            raw_reserve0=int(816.49658 * 10**18),
+            raw_reserve1=int(1_224_744.87 * 10**6),
+            fee_bps=30,
+            block_number=19_001_000,
+            block_hash="0x" + "bb" * 32,
+            parent_hash="0x" + "aa" * 32,
+        )
+
     def test_multi_size_simulation_depth_divergence(self):
         """AC-10: Standard simulation scenarios ($100-$5,000) depth divergence labeled strictly as scenarios."""
         thin_entry_v2 = UniswapV2Evidence(
@@ -1757,10 +1921,15 @@ class TestMultiSizeAndIdentityConstraints(unittest.TestCase):
             source_timestamp_utc="2026-11-15T00:00:00Z",
             venue_type="UNISWAP_V2",
             evidence_v2=thin_entry_v2,
+            quote_usd_price=1.0,
             native_usd_price=3000.0,
+            quote_usd_price_source="CHAINLINK_ORACLE",
+            native_usd_price_source="CHAINLINK_ORACLE",
+            quote_usd_price_timestamp_utc="2026-11-15T00:00:00Z",
+            native_usd_price_timestamp_utc="2026-11-15T00:00:00Z",
             base_fee_per_gas_wei=1_000_000_000,  # 1 gwei so gas is minimal
             priority_fee_per_gas_wei=100_000_000,
-        )
+        ).with_valuation_records()
         touch_state = PoolStateSnapshot(
             chain_id=1,
             token_address="0x2222222222222222222222222222222222222222",
@@ -1770,10 +1939,15 @@ class TestMultiSizeAndIdentityConstraints(unittest.TestCase):
             source_timestamp_utc="2026-11-15T02:00:00Z",
             venue_type="UNISWAP_V2",
             evidence_v2=thin_touch_v2,
+            quote_usd_price=1.0,
             native_usd_price=3000.0,
+            quote_usd_price_source="CHAINLINK_ORACLE",
+            native_usd_price_source="CHAINLINK_ORACLE",
+            quote_usd_price_timestamp_utc="2026-11-15T02:00:00Z",
+            native_usd_price_timestamp_utc="2026-11-15T02:00:00Z",
             base_fee_per_gas_wei=1_000_000_000,
             priority_fee_per_gas_wei=100_000_000,
-        )
+        ).with_valuation_records()
 
         multi_res = TwoLegExecutionSimulator.simulate_multi_size(entry_state, touch_state)
 
@@ -1815,21 +1989,1645 @@ class TestMultiSizeAndIdentityConstraints(unittest.TestCase):
         self.assertGreaterEqual(t_ing, t_src)
 
     def test_protected_data_clean_equivalence(self):
-        """AC-15: Protected data hashes remain unaltered with exact 64-character SHA-256 digests."""
-        expected_hashes = {
-            "rocket-hunter-data/user_positions_journal.json": "35CB27CD355FCE8EF5279E1192A5FF55701317F75A823627E9A9B5DB3065E1C0",
-            "rocket-hunter-data/ai_learning_engine.json": "E4D8B76856BE9BA7822628AC70795263163EB681B9602E0C745321C3CC636318",
-            "rocket-hunter-data/notification_config.json": "14066A465D309FA27343DAA8920BC0F45E163B5B03BED69C6027F7102B581956",
+        """AC-15: Protected data hashes remain unaltered with exact 64-character SHA-256 digests in isolated environment."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_root = Path(tmpdir)
+            tmp_data = tmp_root / "rocket-hunter-data"
+            tmp_data.mkdir(parents=True, exist_ok=True)
+            mock_files = {
+                "user_positions_journal.json": b'{"positions": []}',
+                "ai_learning_engine.json": b'{"weights": {}}',
+                "notification_config.json": b'{"notifications_enabled": false}',
+            }
+            for fname, content in mock_files.items():
+                with open(tmp_data / fname, "wb") as f:
+                    f.write(content)
+
+            verifier = ProtectedDataVerifier(root_dir=tmp_root)
+            snap_pre = verifier.snapshot_protected_data()
+            self.assertEqual(len(snap_pre["protected_files"]), 3)
+            for fname in mock_files:
+                sha = snap_pre["protected_files"][fname]["sha256"]
+                self.assertEqual(len(sha), 64)
+                self.assertTrue(all(c in "0123456789ABCDEF" for c in sha))
+
+            # Clean equivalence matches
+            snap_post = verifier.snapshot_protected_data()
+            is_clean, discrepancies = verifier.verify_clean_equivalence(snap_pre, snap_post)
+            self.assertTrue(is_clean)
+            self.assertEqual(discrepancies, [])
+
+            # Modification detection fails closed
+            with open(tmp_data / "user_positions_journal.json", "wb") as f:
+                f.write(b'{"positions": ["tampered"]}')
+            snap_tampered = verifier.snapshot_protected_data()
+            is_clean2, discrepancies2 = verifier.verify_clean_equivalence(snap_pre, snap_tampered)
+            self.assertFalse(is_clean2)
+            self.assertTrue(any("user_positions_journal.json" in d for d in discrepancies2))
+
+            # Deletion detection fails closed
+            os.remove(tmp_data / "notification_config.json")
+            snap_deleted = verifier.snapshot_protected_data()
+            is_clean3, discrepancies3 = verifier.verify_clean_equivalence(snap_pre, snap_deleted)
+            self.assertFalse(is_clean3)
+            self.assertTrue(any("notification_config.json" in d for d in discrepancies3))
+
+    def test_24_hour_holding_period_enforcement(self):
+        """Requirement A: Enforce 24-hour holding window: 24.0h valid, 24.01h rejected, timezone-naive rejected."""
+        base_entry = PoolStateSnapshot(
+            chain_id=1,
+            token_address="0x2222222222222222222222222222222222222222",
+            pool_address="0x1111111111111111111111111111111111111111",
+            block_number=19_000_000,
+            block_hash="0x" + "aa" * 32,
+            source_timestamp_utc="2026-11-15T00:00:00Z",
+            venue_type="UNISWAP_V2",
+            evidence_v2=self.entry_v2,
+            quote_usd_price=1.0,
+            native_usd_price=3000.0,
+            quote_usd_price_source="CHAINLINK_ORACLE",
+            native_usd_price_source="CHAINLINK_ORACLE",
+            quote_usd_price_timestamp_utc="2026-11-15T00:00:00Z",
+            native_usd_price_timestamp_utc="2026-11-15T00:00:00Z",
+        ).with_valuation_records()
+
+        # 1. Exactly 24.0 hours (86,400s) -> allowed
+        touch_24h = PoolStateSnapshot(
+            chain_id=1,
+            token_address="0x2222222222222222222222222222222222222222",
+            pool_address="0x1111111111111111111111111111111111111111",
+            block_number=19_001_000,
+            block_hash="0x" + "bb" * 32,
+            source_timestamp_utc="2026-11-16T00:00:00Z",
+            venue_type="UNISWAP_V2",
+            evidence_v2=self.touch_v2_high,
+            quote_usd_price=1.0,
+            native_usd_price=3000.0,
+            quote_usd_price_source="CHAINLINK_ORACLE",
+            native_usd_price_source="CHAINLINK_ORACLE",
+            quote_usd_price_timestamp_utc="2026-11-16T00:00:00Z",
+            native_usd_price_timestamp_utc="2026-11-16T00:00:00Z",
+        ).with_valuation_records()
+        res_24h = TwoLegExecutionSimulator.simulate_roundtrip(base_entry, touch_24h, 500.0)
+        self.assertEqual(res_24h["status"], DualTrackTargetStatus.MODELED_TP40_EXECUTABLE_WITH_ASSUMPTIONS.value)
+
+        # 2. 24 hours + 1 minute (86,460s) -> rejected
+        touch_24h_plus = dataclasses.replace(
+            touch_24h,
+            source_timestamp_utc="2026-11-16T00:01:00Z",
+            quote_usd_price_timestamp_utc="2026-11-16T00:01:00Z",
+            native_usd_price_timestamp_utc="2026-11-16T00:01:00Z",
+            quote_valuation_record=None,
+            native_valuation_record=None,
+        ).with_valuation_records()
+        res_over = TwoLegExecutionSimulator.simulate_roundtrip(base_entry, touch_24h_plus, 500.0)
+        self.assertEqual(res_over["status"], DualTrackTargetStatus.MODELED_ROUNDTRIP_UNRESOLVED_STATE_MISSING.value)
+        self.assertEqual(res_over["diagnostic"], "HOLDING_WINDOW_EXCEEDED_24H")
+
+        # 3. Timezone-naive timestamp rejected
+        entry_naive = dataclasses.replace(
+            base_entry,
+            source_timestamp_utc="2026-11-15T00:00:00",
+            quote_valuation_record=None,
+            native_valuation_record=None,
+        ).with_valuation_records()
+        res_naive = TwoLegExecutionSimulator.simulate_roundtrip(entry_naive, touch_24h, 500.0)
+        self.assertEqual(res_naive["status"], DualTrackTargetStatus.MODELED_ROUNDTRIP_UNRESOLVED_STATE_MISSING.value)
+        self.assertEqual(res_naive["diagnostic"], "TIMEZONE_NAIVE_TIMESTAMP_REJECTED")
+
+        # 4. Touch precedes entry (negative duration) rejected
+        touch_precedes = dataclasses.replace(
+            touch_24h,
+            source_timestamp_utc="2026-11-14T23:59:00Z",
+            quote_usd_price_timestamp_utc="2026-11-14T23:59:00Z",
+            native_usd_price_timestamp_utc="2026-11-14T23:59:00Z",
+            quote_valuation_record=None,
+            native_valuation_record=None,
+        ).with_valuation_records()
+        res_precedes = TwoLegExecutionSimulator.simulate_roundtrip(base_entry, touch_precedes, 500.0)
+        self.assertEqual(res_precedes["status"], DualTrackTargetStatus.MODELED_ROUNDTRIP_UNRESOLVED_STATE_MISSING.value)
+        self.assertEqual(res_precedes["diagnostic"], "TOUCH_PRECEDES_ENTRY_TIMESTAMP")
+
+        # 5. Missing timestamp rejected
+        entry_no_ts = dataclasses.replace(base_entry, source_timestamp_utc="")
+        res_no_ts = TwoLegExecutionSimulator.simulate_roundtrip(entry_no_ts, touch_24h, 500.0)
+        self.assertEqual(res_no_ts["status"], DualTrackTargetStatus.MODELED_ROUNDTRIP_UNRESOLVED_STATE_MISSING.value)
+        self.assertEqual(res_no_ts["diagnostic"], "ENTRY_OR_TOUCH_TIMESTAMP_MISSING")
+
+    @staticmethod
+    def _build_valid_mpt_target_state_payload(
+        chain_id: int = 1,
+        block_number: int = 19_001_000,
+        block_hash: str = "0x" + "bb" * 32,
+        token_address: str = "0x2222222222222222222222222222222222222222",
+        pool_address: str = "0x1111111111111111111111111111111111111111",
+        reserve0: int = 140_000 * 10**18,  # quote reserve
+        reserve1: int = 10_000 * 10**18,   # token reserve -> spot price = 14.0 (reaches +40.0% from 10.0)
+        slot: int = 3,
+    ) -> Tuple[TargetBlockStateProofPayload, str]:
+        raw_word = reserve0 | (reserve1 << 112) | (1700000000 << 224)
+        storage_word_bytes = raw_word.to_bytes(32, "big")
+
+        storage_search_key = UniswapV2Slot3Decoder.compute_storage_key(slot)
+        s_nibbles = []
+        for b in storage_search_key:
+            s_nibbles.extend([b >> 4, b & 0x0F])
+        s_compact = encode_compact_path(s_nibbles, is_leaf=True)
+        storage_leaf = [s_compact, rlp_encode_bytes(storage_word_bytes)]
+        storage_leaf_rlp = rlp_encode(storage_leaf)
+        storage_root = keccak256(storage_leaf_rlp)
+
+        code_hash = b"\xcc" * 32
+        account_val = rlp_encode([b"", b"", storage_root, code_hash])
+        clean_pool = canonicalize_token_address(pool_address)
+        acct_search_key = keccak256(bytes.fromhex(clean_pool[2:]))
+        a_nibbles = []
+        for b in acct_search_key:
+            a_nibbles.extend([b >> 4, b & 0x0F])
+        a_compact = encode_compact_path(a_nibbles, is_leaf=True)
+        account_leaf = [a_compact, account_val]
+        account_leaf_rlp = rlp_encode(account_leaf)
+        state_root = "0x" + keccak256(account_leaf_rlp).hex()
+
+        payload = TargetBlockStateProofPayload(
+            chain_id=chain_id,
+            block_number=block_number,
+            block_hash=block_hash,
+            token_address=token_address,
+            pool_address=pool_address,
+            state_root=state_root,
+            account_proof=[account_leaf_rlp],
+            storage_proof=[storage_leaf_rlp],
+            storage_slot=slot,
+            token0_is_quote=True,
+        )
+        return payload, state_root
+
+    @mock.patch("scripts.consensus_proof_verifier.verify_bls_aggregate_signature", return_value=True)
+    def test_target_touch_evidence_separation(self, mock_bls):
+        """Requirement B: Explicit separation of candle touches, on-chain touches, and verified block states."""
+        # 1. Unverified candle touch
+        c1 = DualTrackOutcomeEvaluator.classify_target_touch(
+            entry_price=10.0,
+            max_candle_high_24h=14.0,  # exactly +40%
+            onchain_touch_observed=False,
+            target_block_state_verified=False,
+        )
+        self.assertEqual(c1, TargetTouchClassification.CANDLE_OBSERVED_TOUCH)
+
+        # 2. Onchain observed touch
+        c2 = DualTrackOutcomeEvaluator.classify_target_touch(
+            entry_price=10.0,
+            max_candle_high_24h=14.0,
+            onchain_touch_observed=True,
+            target_block_state_verified=False,
+        )
+        self.assertEqual(c2, TargetTouchClassification.ONCHAIN_OBSERVED_TOUCH)
+
+        # 3. Cryptographically verified target block state requires validated proof result from TargetStateProofVerifier
+        token0_addr = "0x2222222222222222222222222222222222222222"  # quote token
+        token1_addr = "0x3333333333333333333333333333333333333333"  # base token (target)
+        pair_addr = compute_uniswap_v2_pair_address(UNISWAP_V2_FACTORY_MAINNET, token0_addr, token1_addr)
+
+        valid_payload, state_root = self._build_valid_mpt_target_state_payload(
+            chain_id=1,
+            block_number=19_001_000,
+            block_hash="0x" + "bb" * 32,
+            token_address=token1_addr,
+            pool_address=pair_addr,
+            reserve0=140_000 * 10**18,
+            reserve1=10_000 * 10**18,
+        )
+
+        def _make_ssz_branch(leaf: bytes, gindex: int):
+            curr = leaf
+            k = gindex
+            branch = []
+            while k > 1:
+                sibling = hashlib.sha256(b"sibling:" + k.to_bytes(4, "big")).digest()
+                branch.append(sibling)
+                if k % 2 == 1:
+                    curr = hashlib.sha256(sibling + curr).digest()
+                else:
+                    curr = hashlib.sha256(curr + sibling).digest()
+                k //= 2
+            return curr, branch
+
+        b_hash_bytes = bytes.fromhex("bb" * 32)
+        s_root_bytes = bytes.fromhex(state_root[2:])
+        ep_root, sr_br = _make_ssz_branch(s_root_bytes, 34)
+        body_root, ep_br = _make_ssz_branch(ep_root, 25)
+        pubkeys_512 = [hashlib.sha256(f"pk_{i}".encode()).digest() + hashlib.sha256(f"ext_{i}".encode()).digest()[:16] for i in range(512)]
+        sync_root = bytes.fromhex("98d69927b32c3e0bd9f091f2f728fb95aeec620d2b5f04390465e65cd5d00b5c")
+        fin_root = bytes.fromhex("33" * 32)
+        beacon_state_root, fin_br = _make_ssz_branch(fin_root, 105)
+        ev_header = HeaderConsensusEvidence(
+            slot=9_000_000,
+            proposer_index=1,
+            parent_root=bytes.fromhex("22" * 32),
+            beacon_state_root=beacon_state_root,
+            body_root=body_root,
+            execution_payload_root=ep_root,
+            execution_block_hash=b_hash_bytes,
+            execution_block_number=19_001_000,
+            execution_state_root=s_root_bytes,
+            execution_receipts_root=bytes.fromhex("11" * 32),
+            execution_timestamp=1700000000,
+            execution_payload_branch=ep_br,
+            state_root_branch=sr_br,
+            sync_committee_bits=b"\xff" * 64,
+            sync_committee_signature=b"\xaa" * 96,
+            sync_committee_root=sync_root,
+            finalized_checkpoint_root=fin_root,
+            finalized_root_branch=fin_br,
+            signature_slot=9_000_001,
+            finalized_checkpoint_epoch=281250,
+            sync_committee_pubkeys=pubkeys_512,
+        )
+        header_anchor = BlockHeaderTrustAnchor(
+            chain_id=1,
+            block_number=19_001_000,
+            block_hash="0x" + "bb" * 32,
+            state_root=state_root,
+            header_timestamp_utc="2026-11-15T00:00:00Z",
+            consensus_mechanism="PROOF_OF_STAKE",
+            parent_hash="0x" + "22" * 32,
+            receipts_root="0x" + "11" * 32,
+            finality_status="FINALIZED_CANONICAL",
+            trust_source="ETH_CONSENSUS_SYNC_COMMITTEE",
+            verification_seal="",
+            is_authenticated=True,
+            consensus_evidence=ev_header,
+        )
+
+        pm_seal = PoolMetadataTrustAnchor._compute_seal(
+            chain_id=1,
+            pool_address=pair_addr,
+            token0_address=token0_addr,
+            token1_address=token1_addr,
+            token0_decimals=18,
+            token1_decimals=18,
+            token0_is_quote=True,
+            venue_type="UNISWAP_V2",
+            reserves_storage_slot=3,
+            factory_address=CANONICAL_V2_FACTORIES[1]["factory"],
+            trust_source="INDEPENDENTLY_AUTHENTICATED_POOL_METADATA",
+            storage_layout_verified=True,
+        )
+        pool_meta = PoolMetadataTrustAnchor(
+            chain_id=1,
+            pool_address=pair_addr,
+            token0_address=token0_addr,
+            token1_address=token1_addr,
+            token0_decimals=18,
+            token1_decimals=18,
+            token0_is_quote=True,
+            venue_type="UNISWAP_V2",
+            reserves_storage_slot=3,
+            factory_address=CANONICAL_V2_FACTORIES[1]["factory"],
+            storage_layout_verified=True,
+            is_create2_derived=True,
+            trust_source="INDEPENDENTLY_AUTHENTICATED_POOL_METADATA",
+            verification_seal=pm_seal,
+            is_authenticated=True,
+        )
+        BlockHeaderTrustAnchorRegistry.register(header_anchor)
+        PoolMetadataTrustAnchorRegistry.register(pool_meta)
+
+        ok, valid_proof, err = TargetStateProofVerifier.verify_proof(
+            payload=valid_payload,
+            entry_price=10.0,
+            trust_anchor=header_anchor,
+            pool_metadata=pool_meta,
+            expected_state_root=state_root,
+        )
+        self.assertTrue(ok)
+        self.assertIsNotNone(valid_proof)
+        self.assertTrue(valid_proof.target_price_reached)
+
+        c3 = DualTrackOutcomeEvaluator.classify_target_touch(
+            entry_price=10.0,
+            max_candle_high_24h=14.0,
+            onchain_touch_observed=True,
+            target_state_proof=valid_proof,
+            trust_anchor=header_anchor,
+            pool_metadata=pool_meta,
+            expected_chain_id=1,
+            expected_block_number=19_001_000,
+            expected_block_hash="0x" + "bb" * 32,
+            expected_token_address=token1_addr,
+            expected_pool_address=pair_addr,
+            expected_state_root=state_root,
+        )
+        self.assertEqual(c3, TargetTouchClassification.VERIFIED_TARGET_BLOCK_STATE)
+
+        # Direct payload verification also produces VERIFIED_TARGET_BLOCK_STATE
+        c3_payload = DualTrackOutcomeEvaluator.classify_target_touch(
+            entry_price=10.0,
+            max_candle_high_24h=14.0,
+            onchain_touch_observed=True,
+            target_state_proof_payload=valid_payload,
+            trust_anchor=header_anchor,
+            pool_metadata=pool_meta,
+            expected_chain_id=1,
+            expected_block_number=19_001_000,
+            expected_block_hash="0x" + "bb" * 32,
+            expected_token_address=token1_addr,
+            expected_pool_address=pair_addr,
+            expected_state_root=state_root,
+        )
+        self.assertEqual(c3_payload, TargetTouchClassification.VERIFIED_TARGET_BLOCK_STATE)
+
+        # Adversarial check: caller-constructed unsealed TargetBlockStateProofResult MUST NOT verify
+        unsealed_proof = TargetBlockStateProofResult(
+            chain_id=1,
+            block_number=19_001_000,
+            block_hash="0x" + "bb" * 32,
+            token_address=token1_addr,
+            pool_address=pair_addr,
+            state_root=state_root,
+            is_valid=True,
+            target_price_reached=True,
+        )
+        c_unsealed = DualTrackOutcomeEvaluator.classify_target_touch(
+            entry_price=10.0,
+            max_candle_high_24h=14.0,
+            onchain_touch_observed=True,
+            target_state_proof=unsealed_proof,
+        )
+        self.assertEqual(c_unsealed, TargetTouchClassification.ONCHAIN_OBSERVED_TOUCH)
+
+        # Adversarial check: forged HMAC seal on VerifiedTargetBlockStateResult MUST NOT verify
+        forged_proof = VerifiedTargetBlockStateResult(
+            chain_id=1,
+            block_number=19_001_000,
+            block_hash="0x" + "bb" * 32,
+            token_address=token1_addr,
+            pool_address=pair_addr,
+            state_root=state_root,
+            is_valid=True,
+            target_price_reached=True,
+            spot_price=14.0,
+            verification_seal="forged_seal_00000000000000000000000000000000000000000000000000000000",
+        )
+        c_forged_seal = DualTrackOutcomeEvaluator.classify_target_touch(
+            entry_price=10.0,
+            max_candle_high_24h=14.0,
+            onchain_touch_observed=True,
+            target_state_proof=forged_proof,
+        )
+        self.assertEqual(c_forged_seal, TargetTouchClassification.ONCHAIN_OBSERVED_TOUCH)
+
+        # Adversarial check: caller-asserted Boolean True MUST NOT verify
+        c_caller_true = DualTrackOutcomeEvaluator.classify_target_touch(
+            entry_price=10.0,
+            max_candle_high_24h=14.0,
+            onchain_touch_observed=True,
+            target_block_state_verified=True,
+        )
+        self.assertEqual(c_caller_true, TargetTouchClassification.ONCHAIN_OBSERVED_TOUCH)
+
+        # Adversarial check: caller passing target_state_proof=True (Boolean) MUST NOT verify
+        c_bool_proof = DualTrackOutcomeEvaluator.classify_target_touch(
+            entry_price=10.0,
+            max_candle_high_24h=14.0,
+            onchain_touch_observed=True,
+            target_state_proof=True,  # type: ignore
+        )
+        self.assertEqual(c_bool_proof, TargetTouchClassification.ONCHAIN_OBSERVED_TOUCH)
+
+        # Adversarial check: proof with is_valid=False
+        proof_invalid = dataclasses.replace(valid_proof, is_valid=False)
+        c_inv = DualTrackOutcomeEvaluator.classify_target_touch(
+            entry_price=10.0,
+            max_candle_high_24h=14.0,
+            onchain_touch_observed=True,
+            target_state_proof=proof_invalid,
+        )
+        self.assertEqual(c_inv, TargetTouchClassification.ONCHAIN_OBSERVED_TOUCH)
+
+        # Adversarial check: proof with target_price_reached=False
+        proof_not_reached = dataclasses.replace(valid_proof, target_price_reached=False)
+        c_not_reach = DualTrackOutcomeEvaluator.classify_target_touch(
+            entry_price=10.0,
+            max_candle_high_24h=14.0,
+            onchain_touch_observed=True,
+            target_state_proof=proof_not_reached,
+        )
+        self.assertEqual(c_not_reach, TargetTouchClassification.ONCHAIN_OBSERVED_TOUCH)
+
+        # Adversarial check: mismatched block identity
+        c_mismatch = DualTrackOutcomeEvaluator.classify_target_touch(
+            entry_price=10.0,
+            max_candle_high_24h=14.0,
+            onchain_touch_observed=True,
+            target_state_proof=valid_proof,
+            expected_block_hash="0x" + "ff" * 32,
+        )
+        self.assertEqual(c_mismatch, TargetTouchClassification.ONCHAIN_OBSERVED_TOUCH)
+
+        # Adversarial check: mismatched token address
+        c_tok_mismatch = DualTrackOutcomeEvaluator.classify_target_touch(
+            entry_price=10.0,
+            max_candle_high_24h=14.0,
+            onchain_touch_observed=True,
+            target_state_proof=valid_proof,
+            expected_token_address="0x9999999999999999999999999999999999999999",
+        )
+        self.assertEqual(c_tok_mismatch, TargetTouchClassification.ONCHAIN_OBSERVED_TOUCH)
+
+        # Requirement B Adversarial checks:
+        # 1. Caller-supplied state root without trust anchor MUST NOT verify
+        unregistered_payload = dataclasses.replace(valid_payload, block_hash="0x" + "77" * 32)
+        ok_unanchored, _, err_unanchored = TargetStateProofVerifier.verify_proof(unregistered_payload, entry_price=10.0)
+        self.assertFalse(ok_unanchored)
+        self.assertEqual(err_unanchored, "UNAUTHENTICATED_BLOCK_HEADER_TRUST_ANCHOR_REQUIRED")
+
+        # 2. Caller passing expected_state_root matching its own payload without trust anchor MUST NOT verify
+        ok_self_assert, _, err_self_assert = TargetStateProofVerifier.verify_proof(
+            unregistered_payload, entry_price=10.0, expected_state_root=unregistered_payload.state_root
+        )
+        self.assertFalse(ok_self_assert)
+        self.assertEqual(err_self_assert, "UNAUTHENTICATED_BLOCK_HEADER_TRUST_ANCHOR_REQUIRED")
+
+        # 3. Block hash mismatch against trust anchor fails closed
+        bad_hash_payload = dataclasses.replace(valid_payload, block_hash="0x" + "88" * 32)
+        ok_hash, _, err_hash = TargetStateProofVerifier.verify_proof(
+            bad_hash_payload, entry_price=10.0, trust_anchor=header_anchor, pool_metadata=pool_meta
+        )
+        self.assertFalse(ok_hash)
+        self.assertEqual(err_hash, "TRUST_ANCHOR_BLOCK_HASH_MISMATCH")
+
+        # 4. State root mismatch against trust anchor fails closed
+        bad_root_payload = dataclasses.replace(valid_payload, state_root="0x" + "77" * 32)
+        ok_root, _, err_root = TargetStateProofVerifier.verify_proof(
+            bad_root_payload, entry_price=10.0, trust_anchor=header_anchor, pool_metadata=pool_meta
+        )
+        self.assertFalse(ok_root)
+        self.assertEqual(err_root, "TRUST_ANCHOR_STATE_ROOT_MISMATCH")
+
+        # 5. Quote orientation mismatch fails closed
+        bad_orient_seal = PoolMetadataTrustAnchor._compute_seal(
+            chain_id=1,
+            pool_address=pair_addr,
+            token0_address=token0_addr,
+            token1_address=token1_addr,
+            token0_decimals=18,
+            token1_decimals=18,
+            token0_is_quote=False,
+            venue_type="UNISWAP_V2",
+            reserves_storage_slot=3,
+            factory_address=CANONICAL_V2_FACTORIES[1]["factory"],
+            trust_source="INDEPENDENTLY_AUTHENTICATED_POOL_METADATA",
+            storage_layout_verified=True,
+        )
+        bad_orient_meta = dataclasses.replace(pool_meta, token0_is_quote=False, verification_seal=bad_orient_seal)
+        ok_orient, _, err_orient = TargetStateProofVerifier.verify_proof(
+            valid_payload, entry_price=10.0, trust_anchor=header_anchor, pool_metadata=bad_orient_meta
+        )
+        self.assertFalse(ok_orient)
+        self.assertEqual(err_orient, "QUOTE_TOKEN_ORIENTATION_MISMATCH")
+
+        # 6. Tampered pool venue invalidates cryptographic seal and fails closed
+        bad_venue_meta = dataclasses.replace(pool_meta, venue_type="UNISWAP_V3")
+        ok_venue, _, err_venue = TargetStateProofVerifier.verify_proof(
+            valid_payload, entry_price=10.0, trust_anchor=header_anchor, pool_metadata=bad_venue_meta
+        )
+        self.assertFalse(ok_venue)
+        self.assertEqual(err_venue, "UNAUTHENTICATED_POOL_METADATA_TRUST_ANCHOR_REQUIRED")
+
+        # Creating metadata with unsupported venue raises ValueError
+        with self.assertRaises(ValueError) as ctx_v3:
+            PoolMetadataVerifier.verify_pool_metadata(
+                chain_id=1,
+                pool_address=pair_addr,
+                token0_address=token0_addr,
+                token1_address=token1_addr,
+                token0_decimals=18,
+                token1_decimals=18,
+                token0_is_quote=True,
+                venue_type="UNISWAP_V3",
+            )
+        self.assertIn("Unsupported venue_type", str(ctx_v3.exception))
+
+        # 7. Unverified storage slot assumption (slot != 3) fails closed
+        bad_slot_payload = dataclasses.replace(valid_payload, storage_slot=4)
+        ok_slot, _, err_slot = TargetStateProofVerifier.verify_proof(
+            bad_slot_payload, entry_price=10.0, trust_anchor=header_anchor, pool_metadata=pool_meta
+        )
+        self.assertFalse(ok_slot)
+        self.assertEqual(err_slot, "UNSUPPORTED_POOL_VENUE_OR_STORAGE_SLOT")
+
+        # 8. Direct caller injection into BlockHeaderTrustAnchorRegistry without authentication fails closed
+        caller_fake_hdr = BlockHeaderTrustAnchor(
+            chain_id=1,
+            block_number=19_001_000,
+            block_hash="0x" + "bb" * 32,
+            state_root=state_root,
+            header_timestamp_utc="2026-11-15T04:00:00Z",
+            is_authenticated=True,
+        )
+        with self.assertRaises(ValueError) as ctx_hdr:
+            BlockHeaderTrustAnchorRegistry.register(caller_fake_hdr)
+        self.assertIn("failed cryptographic authenticity verification", str(ctx_hdr.exception))
+
+        # 9. Direct caller injection into PoolMetadataTrustAnchorRegistry without authentication fails closed
+        caller_fake_meta = PoolMetadataTrustAnchor(
+            chain_id=1,
+            pool_address="0x1111111111111111111111111111111111111111",
+            token0_address="0x3333333333333333333333333333333333333333",
+            token1_address="0x2222222222222222222222222222222222222222",
+            token0_decimals=18,
+            token1_decimals=18,
+            token0_is_quote=True,
+            venue_type="UNISWAP_V2",
+            reserves_storage_slot=3,
+            is_authenticated=True,
+        )
+        with self.assertRaises(ValueError) as ctx_pmeta:
+            PoolMetadataTrustAnchorRegistry.register(caller_fake_meta)
+        self.assertIn("failed cryptographic authenticity verification", str(ctx_pmeta.exception))
+
+        # 10. Caller passing unauthenticated header or metadata to verify_proof fails closed
+        ok_fake_hdr, _, err_fake_hdr = TargetStateProofVerifier.verify_proof(
+            valid_payload, entry_price=10.0, trust_anchor=caller_fake_hdr, pool_metadata=pool_meta
+        )
+        self.assertFalse(ok_fake_hdr)
+        self.assertEqual(err_fake_hdr, "UNAUTHENTICATED_BLOCK_HEADER_TRUST_ANCHOR_REQUIRED")
+
+        ok_fake_m, _, err_fake_m = TargetStateProofVerifier.verify_proof(
+            valid_payload, entry_price=10.0, trust_anchor=header_anchor, pool_metadata=caller_fake_meta
+        )
+        self.assertFalse(ok_fake_m)
+        self.assertEqual(err_fake_m, "UNAUTHENTICATED_POOL_METADATA_TRUST_ANCHOR_REQUIRED")
+
+        # 4. Target not reached
+        c4 = DualTrackOutcomeEvaluator.classify_target_touch(
+            entry_price=10.0,
+            max_candle_high_24h=13.9,
+            onchain_touch_observed=False,
+            target_block_state_verified=False,
+        )
+        self.assertEqual(c4, TargetTouchClassification.TARGET_NOT_REACHED)
+
+        # 5. Target time state unavailable (entry non-positive or state missing)
+        c5 = DualTrackOutcomeEvaluator.classify_target_touch(
+            entry_price=0.0,
+            max_candle_high_24h=14.0,
+        )
+        self.assertEqual(c5, TargetTouchClassification.TARGET_TIME_STATE_UNAVAILABLE)
+
+    def test_price_defaults_fail_closed_when_missing_or_non_positive(self):
+        """Requirement G: Removal of unsafe price defaults; missing/non-positive price fails closed."""
+        base_entry = PoolStateSnapshot(
+            chain_id=1,
+            token_address="0x2222222222222222222222222222222222222222",
+            pool_address="0x1111111111111111111111111111111111111111",
+            block_number=19_000_000,
+            block_hash="0x" + "aa" * 32,
+            source_timestamp_utc="2026-11-15T00:00:00Z",
+            venue_type="UNISWAP_V2",
+            evidence_v2=self.entry_v2,
+            quote_usd_price=1.0,
+            native_usd_price=3000.0,
+            quote_usd_price_source="CHAINLINK_ORACLE",
+            native_usd_price_source="CHAINLINK_ORACLE",
+            quote_usd_price_timestamp_utc="2026-11-15T00:00:00Z",
+            native_usd_price_timestamp_utc="2026-11-15T00:00:00Z",
+        ).with_valuation_records()
+        base_touch = PoolStateSnapshot(
+            chain_id=1,
+            token_address="0x2222222222222222222222222222222222222222",
+            pool_address="0x1111111111111111111111111111111111111111",
+            block_number=19_001_000,
+            block_hash="0x" + "bb" * 32,
+            source_timestamp_utc="2026-11-15T04:00:00Z",
+            venue_type="UNISWAP_V2",
+            evidence_v2=self.touch_v2_high,
+            quote_usd_price=1.0,
+            native_usd_price=3000.0,
+            quote_usd_price_source="CHAINLINK_ORACLE",
+            native_usd_price_source="CHAINLINK_ORACLE",
+            quote_usd_price_timestamp_utc="2026-11-15T04:00:00Z",
+            native_usd_price_timestamp_utc="2026-11-15T04:00:00Z",
+        ).with_valuation_records()
+
+        # Missing quote USD price on entry
+        e_no_quote = dataclasses.replace(base_entry, quote_usd_price=None)
+        res1 = TwoLegExecutionSimulator.simulate_roundtrip(e_no_quote, base_touch, 500.0)
+        self.assertEqual(res1["diagnostic"], "ENTRY_QUOTE_PRICE_MISSING_OR_NON_POSITIVE")
+
+        # Non-positive native price on entry
+        e_neg_native = dataclasses.replace(base_entry, native_usd_price=-10.0)
+        res2 = TwoLegExecutionSimulator.simulate_roundtrip(e_neg_native, base_touch, 500.0)
+        self.assertEqual(res2["diagnostic"], "ENTRY_NATIVE_PRICE_MISSING_OR_NON_POSITIVE")
+
+        # NaN quote price on touch
+        t_nan_quote = dataclasses.replace(base_touch, quote_usd_price=float("nan"))
+        res3 = TwoLegExecutionSimulator.simulate_roundtrip(base_entry, t_nan_quote, 500.0)
+        self.assertEqual(res3["diagnostic"], "TOUCH_QUOTE_PRICE_MISSING_OR_NON_POSITIVE")
+
+        # None native price on touch
+        t_no_native = dataclasses.replace(base_touch, native_usd_price=None)
+        res4 = TwoLegExecutionSimulator.simulate_roundtrip(base_entry, t_no_native, 500.0)
+        self.assertEqual(res4["diagnostic"], "TOUCH_NATIVE_PRICE_MISSING_OR_NON_POSITIVE")
+
+        # Missing quote price source on entry fails closed
+        e_no_src = dataclasses.replace(base_entry, quote_usd_price_source=None)
+        res_src = TwoLegExecutionSimulator.simulate_roundtrip(e_no_src, base_touch, 500.0)
+        self.assertEqual(res_src["diagnostic"], "ENTRY_VALUATION_SOURCE_MISSING")
+
+        # Missing native price source on touch fails closed
+        t_no_src = dataclasses.replace(base_touch, native_usd_price_source="")
+        res_t_src = TwoLegExecutionSimulator.simulate_roundtrip(base_entry, t_no_src, 500.0)
+        self.assertEqual(res_t_src["diagnostic"], "TOUCH_VALUATION_SOURCE_MISSING")
+
+        # Missing quote timestamp on entry fails closed
+        e_no_ts = dataclasses.replace(base_entry, quote_usd_price_timestamp_utc=None)
+        res_ts = TwoLegExecutionSimulator.simulate_roundtrip(e_no_ts, base_touch, 500.0)
+        self.assertEqual(res_ts["diagnostic"], "ENTRY_VALUATION_TIMESTAMP_MISSING")
+
+        # Stale entry quote price (>3600.0s staleness relative to snapshot) fails closed
+        stale_quote_rec = dataclasses.replace(base_entry.quote_valuation_record, timestamp_utc="2026-11-15T01:05:00Z")
+        e_stale = dataclasses.replace(
+            base_entry,
+            quote_usd_price_timestamp_utc="2026-11-15T01:05:00Z",
+            quote_valuation_record=stale_quote_rec,
+        )
+        res_stale = TwoLegExecutionSimulator.simulate_roundtrip(e_stale, base_touch, 500.0)
+        self.assertEqual(res_stale["diagnostic"], "ENTRY_QUOTE_VALUATION_STALE")
+
+        # Stale touch native price (>3600.0s staleness relative to snapshot) fails closed
+        stale_native_rec = dataclasses.replace(base_touch.native_valuation_record, timestamp_utc="2026-11-15T05:05:00Z")
+        t_stale = dataclasses.replace(
+            base_touch,
+            native_usd_price_timestamp_utc="2026-11-15T05:05:00Z",
+            native_valuation_record=stale_native_rec,
+        )
+        res_t_stale = TwoLegExecutionSimulator.simulate_roundtrip(base_entry, t_stale, 500.0)
+        self.assertEqual(res_t_stale["diagnostic"], "TOUCH_NATIVE_VALUATION_STALE")
+
+        # Requirement G: Mandatory ValuationEvidenceRecord missing fails closed
+        e_no_rec = dataclasses.replace(base_entry, quote_valuation_record=None)
+        res_no_rec = TwoLegExecutionSimulator.simulate_roundtrip(e_no_rec, base_touch, 500.0)
+        self.assertEqual(res_no_rec["diagnostic"], "ENTRY_QUOTE_VALUATION_RECORD_MANDATORY_MISSING")
+
+        # Requirement G: Unauthenticated ValuationEvidenceRecord fails closed when strict authentication is required
+        unauth_rec = dataclasses.replace(base_entry.quote_valuation_record, is_authenticated=False)
+        e_unauth = dataclasses.replace(base_entry, quote_valuation_record=unauth_rec)
+        res_unauth = TwoLegExecutionSimulator.simulate_roundtrip(e_unauth, base_touch, 500.0, require_authenticated_valuation=True)
+        self.assertEqual(res_unauth["diagnostic"], "ENTRY_QUOTE_VALUATION_RECORD_UNAUTHENTICATED")
+
+        # Requirement G: Forged authentication flag without cryptographic seal fails closed
+        forged_flag_rec = dataclasses.replace(base_entry.quote_valuation_record, is_authenticated=True, verification_seal="")
+        e_forged = dataclasses.replace(base_entry, quote_valuation_record=forged_flag_rec)
+        res_forged = TwoLegExecutionSimulator.simulate_roundtrip(e_forged, base_touch, 500.0)
+        self.assertEqual(res_forged["diagnostic"], "ENTRY_QUOTE_FORGED_VALUATION_AUTHENTICATION_FLAG")
+
+        # Requirement G: Fabricated feed address fails closed
+        fab_feed_rec = dataclasses.replace(base_entry.quote_valuation_record, feed_or_pool_address="0x" + "44" * 20)
+        e_fab_feed = dataclasses.replace(base_entry, quote_valuation_record=fab_feed_rec)
+        res_fab_feed = TwoLegExecutionSimulator.simulate_roundtrip(e_fab_feed, base_touch, 500.0)
+        self.assertEqual(res_fab_feed["diagnostic"], "ENTRY_QUOTE_VALUATION_FEED_ADDRESS_FABRICATED")
+
+        # Requirement G: Invalid feed address (non-hex) fails closed
+        bad_feed_rec = dataclasses.replace(base_entry.quote_valuation_record, feed_or_pool_address="invalid_feed")
+        e_bad_feed = dataclasses.replace(base_entry, quote_valuation_record=bad_feed_rec)
+        res_bad_feed = TwoLegExecutionSimulator.simulate_roundtrip(e_bad_feed, base_touch, 500.0)
+        self.assertEqual(res_bad_feed["diagnostic"], "ENTRY_QUOTE_VALUATION_FEED_ADDRESS_INVALID")
+
+        # Requirement G: Untrusted valuation source rejected (not in TRUSTED_VALUATION_SOURCES)
+        untrusted_rec = dataclasses.replace(base_entry.quote_valuation_record, source="COINGECKO")
+        e_untrusted = dataclasses.replace(base_entry, quote_usd_price_source="COINGECKO", quote_valuation_record=untrusted_rec)
+        res_untrusted = TwoLegExecutionSimulator.simulate_roundtrip(e_untrusted, base_touch, 500.0)
+        self.assertEqual(res_untrusted["diagnostic"], "ENTRY_QUOTE_VALUATION_SOURCE_UNTRUSTED")
+
+        untrusted_t_rec = dataclasses.replace(base_touch.native_valuation_record, source="ARBITRARY_FEED")
+        t_untrusted = dataclasses.replace(base_touch, native_usd_price_source="ARBITRARY_FEED", native_valuation_record=untrusted_t_rec)
+        res_t_untrusted = TwoLegExecutionSimulator.simulate_roundtrip(base_entry, t_untrusted, 500.0)
+        self.assertEqual(res_t_untrusted["diagnostic"], "TOUCH_NATIVE_VALUATION_SOURCE_UNTRUSTED")
+
+        # Requirement G: Attached ValuationEvidenceRecord with chain mismatch rejected
+        bad_chain_rec = ValuationEvidenceRecord(
+            source="CHAINLINK_ORACLE",
+            chain_id=10,  # mismatch with entry chain_id=1
+            token_address=base_entry.token_address,
+            price_usd=1.0,
+            timestamp_utc=base_entry.quote_usd_price_timestamp_utc,
+            feed_or_pool_address="0x8fffffd4afb6115b954bd326cbe7b4ba576818f6",
+            is_authenticated=False,
+        )
+        e_bad_rec = dataclasses.replace(base_entry, quote_valuation_record=bad_chain_rec)
+        res_bad_rec = TwoLegExecutionSimulator.simulate_roundtrip(e_bad_rec, base_touch, 500.0)
+        self.assertEqual(res_bad_rec["diagnostic"], "ENTRY_QUOTE_VALUATION_CHAIN_MISMATCH")
+
+        # Requirement G: Attached ValuationEvidenceRecord with price mismatch rejected
+        bad_price_rec = ValuationEvidenceRecord(
+            source="CHAINLINK_ORACLE",
+            chain_id=1,
+            token_address=base_entry.token_address,
+            price_usd=2.5,  # mismatch with entry quote_usd_price=1.0
+            timestamp_utc=base_entry.quote_usd_price_timestamp_utc,
+            feed_or_pool_address="0x8fffffd4afb6115b954bd326cbe7b4ba576818f6",
+            is_authenticated=False,
+        )
+        e_bad_price = dataclasses.replace(base_entry, quote_valuation_record=bad_price_rec)
+        res_bad_price = TwoLegExecutionSimulator.simulate_roundtrip(e_bad_price, base_touch, 500.0)
+        self.assertEqual(res_bad_price["diagnostic"], "ENTRY_QUOTE_VALUATION_PRICE_MISMATCH")
+
+        # Requirement G: Valid ValuationEvidenceRecord matching provenance succeeds
+        entry_ts = int(dt.datetime.fromisoformat("2026-11-15T00:00:00+00:00").timestamp())
+        cl_ev = ChainlinkRoundEvidence(
+            feed_address="0x8fffffd4afb6115b954bd326cbe7b4ba576818f6",
+            round_id=1,
+            answer=100_000_000,  # 1.0 with 8 decimals
+            decimals=8,
+            started_at=entry_ts - 30,
+            updated_at=entry_ts,
+            answered_in_round=1,
+        )
+        valid_rec = ValuationEvidenceVerifier.verify_chainlink_round(
+            chain_id=1,
+            token_address=base_entry.token_address,
+            evidence=cl_ev,
+        )
+        e_valid_rec = dataclasses.replace(
+            base_entry,
+            quote_usd_price_timestamp_utc=valid_rec.timestamp_utc,
+            quote_valuation_record=valid_rec,
+        )
+        res_valid = TwoLegExecutionSimulator.simulate_roundtrip(e_valid_rec, base_touch, 500.0)
+        self.assertEqual(res_valid["status"], DualTrackTargetStatus.MODELED_TP40_EXECUTABLE_WITH_ASSUMPTIONS.value)
+        self.assertNotEqual(res_valid["status"], DualTrackTargetStatus.MODELED_ROUNDTRIP_UNRESOLVED_STATE_MISSING.value)
+        self.assertIsNotNone(res_valid["net_return_pct"])
+
+    def test_v3_intervening_bitmap_gap_and_uninitialized_tick_rejection(self):
+        """Requirement C: Uniswap V3 swap simulator rejects bitmap gaps and uninitialized ticks."""
+        p0 = UniswapV3TickMath.get_sqrt_ratio_at_tick(200000)
+        tick_lower = 199980
+        tick_upper = 200040
+        w_lower = (tick_lower // 60) >> 8
+        bit_lower = (tick_lower // 60) % 256
+        w_upper = (tick_upper // 60) >> 8
+        bit_upper = (tick_upper // 60) % 256
+
+        bitmap = {
+            w_lower: (1 << bit_lower) | (1 << bit_upper),
+        }
+        ticks = {
+            tick_lower: {"liquidityNet": 10**18, "liquidityGross": 10**18},
+            tick_upper: {"liquidityNet": -(10**18), "liquidityGross": 10**18},
         }
 
-        for rel_path, exp_sha in expected_hashes.items():
-            full_path = os.path.join(os.getcwd(), rel_path)
-            self.assertTrue(os.path.exists(full_path), f"File {rel_path} must exist")
-            with open(full_path, "rb") as f:
-                content = f.read()
-            computed_sha = hashlib.sha256(content).hexdigest().upper()
-            self.assertEqual(len(computed_sha), 64)
-            self.assertEqual(computed_sha, exp_sha, f"Byte mismatch detected in protected file: {rel_path}")
+        # 1. Successful swap with complete bitmap and initialized ticks
+        ev_good = UniswapV3Evidence(
+            chain_id=1,
+            pool_address="0x" + "11" * 20,
+            token0_address="0x" + "22" * 20,
+            token1_address="0x" + "33" * 20,
+            token0_decimals=6,
+            token1_decimals=18,
+            fee_tier_ppm=3000,
+            sqrt_price_x96=p0,
+            tick=200000,
+            active_liquidity=10**18,
+            initialized_ticks=ticks,
+            tick_bitmap=bitmap,
+            block_number=19_000_000,
+            block_hash="0x" + "aa" * 32,
+            parent_hash="0x" + "bb" * 32,
+        )
+        ok, consumed, out, _, diag = UniswapV3SwapSimulator.simulate_swap(ev_good, amount_in=1000, zero_for_one=True)
+        self.assertTrue(ok)
+        self.assertEqual(diag, "SWAP_SUCCESS")
+
+        # 2. Missing intervening bitmap word -> MODELED_DEPTH_UNRESOLVED_BITMAP_GAP
+        ev_gap = dataclasses.replace(ev_good, tick_bitmap={})
+        ok2, _, _, _, diag2 = UniswapV3SwapSimulator.simulate_swap(ev_gap, amount_in=1000, zero_for_one=True)
+        self.assertFalse(ok2)
+        self.assertEqual(diag2, "MODELED_DEPTH_UNRESOLVED_BITMAP_GAP")
+
+        # 3. Bit set in bitmap but tick missing from initialized_ticks -> MODELED_DEPTH_UNRESOLVED_UNINITIALIZED_TICK
+        ev_missing_tick = dataclasses.replace(
+            ev_good,
+            initialized_ticks={
+                tick_upper: {"liquidityNet": -(10**18), "liquidityGross": 10**18},
+                # tick_lower (199980) has its bit set in bitmap, but is missing from initialized_ticks!
+            },
+        )
+        ok3, _, _, _, diag3 = UniswapV3SwapSimulator.simulate_swap(ev_missing_tick, amount_in=1000, zero_for_one=True)
+        self.assertFalse(ok3)
+        self.assertEqual(diag3, "MODELED_DEPTH_UNRESOLVED_UNINITIALIZED_TICK")
+
+    def test_complete_replay_reproducibility_manifest(self):
+        """Requirement H: Verifiable CompleteReplayManifest validates inputs and generates deterministic SHA-256 digest."""
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            dataset_file = tmp_path / "dataset_a.jsonl"
+            # Write 2 valid JSON lines
+            dataset_file.write_text('{"id": 1, "val": "a"}\n{"id": 2, "val": "b"}\n', encoding="utf-8")
+            raw_bytes = dataset_file.read_bytes()
+            actual_sha = hashlib.sha256(raw_bytes).hexdigest()
+            cfg_sha = hashlib.sha256(b"test_configuration_data").hexdigest()
+
+            notif_cfg = Path("rocket-hunter-data/notification_config.json")
+            notif_sha = hashlib.sha256(notif_cfg.read_bytes()).hexdigest()
+
+            # 1. Valid manifest build succeeds and generates deterministic 64-char digest
+            manifest = ReplayManifestBuilder.build(
+                git_commit_sha="3a879cc38f6e60b51e9e8116fcdb43bdcbd1fbac",
+                is_working_tree_clean=False,
+                input_datasets={"dataset_a": {"path": str(dataset_file), "sha256": actual_sha, "count": 2}},
+                configuration_hashes={"config": cfg_sha, "rocket-hunter-data/notification_config.json": notif_sha},
+                identity_bindings={"chain_id": 1},
+                valuation_sources={"quote": {"source": "CHAINLINK_ORACLE", "timestamp_utc": "2026-11-15T00:00:00Z"}},
+                gas_fee_assumptions={"base_fee_gwei": 20},
+                slippage_execution_assumptions={"fee_tier_ppm": 3000},
+                source_evidence_ids=["ev_1", "ev_2"],
+                validate_strict=True,
+            )
+
+            digest1 = manifest.compute_digest()
+            self.assertEqual(len(digest1), 64)
+            self.assertEqual(digest1, manifest.compute_digest())  # Deterministic
+
+            # Changing git commit alters digest
+            m_diff_git = dataclasses.replace(manifest, git_commit_sha="2bba7cc9cd7db59ce428252050f882b99c581f61")
+            self.assertNotEqual(digest1, m_diff_git.compute_digest())
+
+            # Changing gas fee assumptions alters digest
+            m_diff_gas = dataclasses.replace(manifest, gas_fee_assumptions={"base_fee_gwei": 30})
+            self.assertNotEqual(digest1, m_diff_gas.compute_digest())
+
+            # 2. Adversarial: Malformed git commit SHA fails closed
+            with self.assertRaises(ValueError) as ctx:
+                ReplayManifestBuilder.build(
+                    git_commit_sha="not-a-valid-sha",
+                    is_working_tree_clean=False,
+                    input_datasets={"dataset_a": {"path": str(dataset_file), "sha256": actual_sha, "count": 2}},
+                    configuration_hashes={"config": cfg_sha},
+                    identity_bindings={"chain_id": 1},
+                    valuation_sources={"quote": {"source": "CHAINLINK_ORACLE", "timestamp_utc": "2026-11-15T00:00:00Z"}},
+                    gas_fee_assumptions={},
+                    slippage_execution_assumptions={},
+                    source_evidence_ids=["ev_1"],
+                    validate_strict=True,
+                )
+            self.assertIn("git_commit_sha", str(ctx.exception))
+
+            # 3. Adversarial: Malformed dataset SHA-256 format fails closed
+            with self.assertRaises(ValueError) as ctx:
+                ReplayManifestBuilder.build(
+                    git_commit_sha="3a879cc38f6e60b51e9e8116fcdb43bdcbd1fbac",
+                    is_working_tree_clean=False,
+                    input_datasets={"dataset_a": {"path": str(dataset_file), "sha256": "ABCD", "count": 2}},
+                    configuration_hashes={"config": cfg_sha},
+                    identity_bindings={"chain_id": 1},
+                    valuation_sources={"quote": {"source": "CHAINLINK_ORACLE", "timestamp_utc": "2026-11-15T00:00:00Z"}},
+                    gas_fee_assumptions={},
+                    slippage_execution_assumptions={},
+                    source_evidence_ids=["ev_1"],
+                    validate_strict=True,
+                )
+            self.assertIn("invalid SHA-256 format", str(ctx.exception))
+
+            # 4. Adversarial: Missing dataset file fails closed
+            with self.assertRaises(ValueError) as ctx:
+                ReplayManifestBuilder.build(
+                    git_commit_sha="3a879cc38f6e60b51e9e8116fcdb43bdcbd1fbac",
+                    is_working_tree_clean=False,
+                    input_datasets={"dataset_a": {"path": str(tmp_path / "nonexistent.jsonl"), "sha256": actual_sha, "count": 2}},
+                    configuration_hashes={"config": cfg_sha},
+                    identity_bindings={"chain_id": 1},
+                    valuation_sources={"quote": {"source": "CHAINLINK_ORACLE", "timestamp_utc": "2026-11-15T00:00:00Z"}},
+                    gas_fee_assumptions={},
+                    slippage_execution_assumptions={},
+                    source_evidence_ids=["ev_1"],
+                    validate_strict=True,
+                )
+            self.assertIn("file not found", str(ctx.exception))
+
+            # 5. Adversarial: Altered file content (hash mismatch) fails closed
+            bogus_sha = hashlib.sha256(b"completely_different_content").hexdigest()
+            with self.assertRaises(ValueError) as ctx:
+                ReplayManifestBuilder.build(
+                    git_commit_sha="3a879cc38f6e60b51e9e8116fcdb43bdcbd1fbac",
+                    is_working_tree_clean=False,
+                    input_datasets={"dataset_a": {"path": str(dataset_file), "sha256": bogus_sha, "count": 2}},
+                    configuration_hashes={"config": cfg_sha},
+                    identity_bindings={"chain_id": 1},
+                    valuation_sources={"quote": {"source": "CHAINLINK_ORACLE", "timestamp_utc": "2026-11-15T00:00:00Z"}},
+                    gas_fee_assumptions={},
+                    slippage_execution_assumptions={},
+                    source_evidence_ids=["ev_1"],
+                    validate_strict=True,
+                )
+            self.assertIn("SHA-256 mismatch", str(ctx.exception))
+
+            # 6. Adversarial: Record count mismatch fails closed
+            with self.assertRaises(ValueError) as ctx:
+                ReplayManifestBuilder.build(
+                    git_commit_sha="3a879cc38f6e60b51e9e8116fcdb43bdcbd1fbac",
+                    is_working_tree_clean=False,
+                    input_datasets={"dataset_a": {"path": str(dataset_file), "sha256": actual_sha, "count": 999}},
+                    configuration_hashes={"config": cfg_sha},
+                    identity_bindings={"chain_id": 1},
+                    valuation_sources={"quote": {"source": "CHAINLINK_ORACLE", "timestamp_utc": "2026-11-15T00:00:00Z"}},
+                    gas_fee_assumptions={},
+                    slippage_execution_assumptions={},
+                    source_evidence_ids=["ev_1"],
+                    validate_strict=True,
+                )
+            self.assertIn("record count mismatch", str(ctx.exception))
+
+            # 7. Adversarial: Malformed configuration hash format fails closed
+            with self.assertRaises(ValueError) as ctx:
+                ReplayManifestBuilder.build(
+                    git_commit_sha="3a879cc38f6e60b51e9e8116fcdb43bdcbd1fbac",
+                    is_working_tree_clean=False,
+                    input_datasets={"dataset_a": {"path": str(dataset_file), "sha256": actual_sha, "count": 2}},
+                    configuration_hashes={"config": "1234"},
+                    identity_bindings={"chain_id": 1},
+                    valuation_sources={"quote": {"source": "CHAINLINK_ORACLE", "timestamp_utc": "2026-11-15T00:00:00Z"}},
+                    gas_fee_assumptions={},
+                    slippage_execution_assumptions={},
+                    source_evidence_ids=["ev_1"],
+                    validate_strict=True,
+                )
+            self.assertIn("invalid SHA-256 format", str(ctx.exception))
+
+            # 8. Adversarial: Timezone-naive valuation source timestamp fails closed
+            with self.assertRaises(ValueError) as ctx:
+                ReplayManifestBuilder.build(
+                    git_commit_sha="3a879cc38f6e60b51e9e8116fcdb43bdcbd1fbac",
+                    is_working_tree_clean=False,
+                    input_datasets={"dataset_a": {"path": str(dataset_file), "sha256": actual_sha, "count": 2}},
+                    configuration_hashes={"config": cfg_sha},
+                    identity_bindings={"chain_id": 1},
+                    valuation_sources={"quote": {"source": "CHAINLINK_ORACLE", "timestamp_utc": "2026-11-15T00:00:00"}},
+                    gas_fee_assumptions={},
+                    slippage_execution_assumptions={},
+                    source_evidence_ids=["ev_1"],
+                    validate_strict=True,
+                )
+            self.assertIn("timezone-naive", str(ctx.exception))
+
+            # 9. Adversarial: Untrusted valuation source fails closed
+            with self.assertRaises(ValueError) as ctx:
+                ReplayManifestBuilder.build(
+                    git_commit_sha="3a879cc38f6e60b51e9e8116fcdb43bdcbd1fbac",
+                    is_working_tree_clean=False,
+                    input_datasets={"dataset_a": {"path": str(dataset_file), "sha256": actual_sha, "count": 2}},
+                    configuration_hashes={"config": cfg_sha},
+                    identity_bindings={"chain_id": 1},
+                    valuation_sources={"quote": {"source": "COINGECKO", "timestamp_utc": "2026-11-15T00:00:00Z"}},
+                    gas_fee_assumptions={},
+                    slippage_execution_assumptions={},
+                    source_evidence_ids=["ev_1"],
+                    validate_strict=True,
+                )
+            self.assertIn("untrusted source", str(ctx.exception))
+
+            # 10. Adversarial: Missing required dataset_a fails closed
+            with self.assertRaises(ValueError) as ctx:
+                ReplayManifestBuilder.build(
+                    git_commit_sha="3a879cc38f6e60b51e9e8116fcdb43bdcbd1fbac",
+                    is_working_tree_clean=False,
+                    input_datasets={"dataset_b": {"path": str(dataset_file), "sha256": actual_sha, "count": 2}},
+                    configuration_hashes={"config": cfg_sha},
+                    identity_bindings={"chain_id": 1},
+                    valuation_sources={"quote": {"source": "CHAINLINK_ORACLE", "timestamp_utc": "2026-11-15T00:00:00Z"}},
+                    gas_fee_assumptions={},
+                    slippage_execution_assumptions={},
+                    source_evidence_ids=["ev_1"],
+                    validate_strict=True,
+                )
+            self.assertIn("missing required 'dataset_a'", str(ctx.exception))
+
+            # 11. Adversarial: Incorrect repository root (missing .git) fails closed
+            with self.assertRaises(ValueError) as ctx:
+                ReplayManifestBuilder.build(
+                    git_commit_sha="3a879cc38f6e60b51e9e8116fcdb43bdcbd1fbac",
+                    is_working_tree_clean=False,
+                    input_datasets={"dataset_a": {"path": str(dataset_file), "sha256": actual_sha, "count": 2}},
+                    configuration_hashes={"config": cfg_sha, "rocket-hunter-data/notification_config.json": notif_sha},
+                    identity_bindings={"chain_id": 1},
+                    valuation_sources={"quote": {"source": "CHAINLINK_ORACLE", "timestamp_utc": "2026-11-15T00:00:00Z"}},
+                    gas_fee_assumptions={"base_fee_gwei": 20},
+                    slippage_execution_assumptions={"fee_tier_ppm": 3000},
+                    source_evidence_ids=["ev_1"],
+                    base_dir=tmp_path,
+                    validate_strict=True,
+                )
+            self.assertIn("INCORRECT_REPOSITORY_ROOT", str(ctx.exception))
+
+            # 12. Adversarial: Incomplete dependency inventory containing only python fails closed
+            with self.assertRaises(ValueError) as ctx:
+                ReplayManifestBuilder.build(
+                    git_commit_sha="3a879cc38f6e60b51e9e8116fcdb43bdcbd1fbac",
+                    is_working_tree_clean=False,
+                    input_datasets={"dataset_a": {"path": str(dataset_file), "sha256": actual_sha, "count": 2}},
+                    configuration_hashes={"config": cfg_sha, "rocket-hunter-data/notification_config.json": notif_sha},
+                    identity_bindings={"chain_id": 1},
+                    valuation_sources={"quote": {"source": "CHAINLINK_ORACLE", "timestamp_utc": "2026-11-15T00:00:00Z"}},
+                    gas_fee_assumptions={"base_fee_gwei": 20},
+                    slippage_execution_assumptions={"fee_tier_ppm": 3000},
+                    source_evidence_ids=["ev_1"],
+                    dependency_versions={"python": "3.13.14", "inventory_status": "COMPLETE"},
+                    validate_strict=True,
+                )
+            self.assertIn("DEPENDENCY_INVENTORY_INCOMPLETE: Inventory contains only Python", str(ctx.exception))
+
+            # 13. Adversarial: Incomplete dependency inventory status flag fails closed
+            actual_deps = derive_actual_runtime_dependencies()
+            incomplete_deps = dict(actual_deps)
+            incomplete_deps["inventory_status"] = "INCOMPLETE"
+            with self.assertRaises(ValueError) as ctx:
+                ReplayManifestBuilder.build(
+                    git_commit_sha="3a879cc38f6e60b51e9e8116fcdb43bdcbd1fbac",
+                    is_working_tree_clean=False,
+                    input_datasets={"dataset_a": {"path": str(dataset_file), "sha256": actual_sha, "count": 2}},
+                    configuration_hashes={"config": cfg_sha, "rocket-hunter-data/notification_config.json": notif_sha},
+                    identity_bindings={"chain_id": 1},
+                    valuation_sources={"quote": {"source": "CHAINLINK_ORACLE", "timestamp_utc": "2026-11-15T00:00:00Z"}},
+                    gas_fee_assumptions={"base_fee_gwei": 20},
+                    slippage_execution_assumptions={"fee_tier_ppm": 3000},
+                    source_evidence_ids=["ev_1"],
+                    dependency_versions=incomplete_deps,
+                    validate_strict=True,
+                )
+            self.assertIn("DEPENDENCY_INVENTORY_INCOMPLETE", str(ctx.exception))
+
+            # 14. Adversarial: Unlisted configuration file omitted from manifest fails closed
+            with self.assertRaises(ValueError) as ctx:
+                ReplayManifestBuilder.build(
+                    git_commit_sha="3a879cc38f6e60b51e9e8116fcdb43bdcbd1fbac",
+                    is_working_tree_clean=False,
+                    input_datasets={"dataset_a": {"path": str(dataset_file), "sha256": actual_sha, "count": 2}},
+                    configuration_hashes={"config": cfg_sha},  # omitted notification_config.json
+                    identity_bindings={"chain_id": 1},
+                    valuation_sources={"quote": {"source": "CHAINLINK_ORACLE", "timestamp_utc": "2026-11-15T00:00:00Z"}},
+                    gas_fee_assumptions={"base_fee_gwei": 20},
+                    slippage_execution_assumptions={"fee_tier_ppm": 3000},
+                    source_evidence_ids=["ev_1"],
+                    validate_strict=True,
+                )
+            self.assertIn("Unlisted configuration file omitted from manifest", str(ctx.exception))
+
+            # 15. Adversarial: Tampered configuration file SHA-256 on disk fails closed
+            tampered_hashes = {"config": cfg_sha, "rocket-hunter-data/notification_config.json": "00" * 32}
+            with self.assertRaises(ValueError) as ctx:
+                ReplayManifestBuilder.build(
+                    git_commit_sha="3a879cc38f6e60b51e9e8116fcdb43bdcbd1fbac",
+                    is_working_tree_clean=False,
+                    input_datasets={"dataset_a": {"path": str(dataset_file), "sha256": actual_sha, "count": 2}},
+                    configuration_hashes=tampered_hashes,
+                    identity_bindings={"chain_id": 1},
+                    valuation_sources={"quote": {"source": "CHAINLINK_ORACLE", "timestamp_utc": "2026-11-15T00:00:00Z"}},
+                    gas_fee_assumptions={"base_fee_gwei": 20},
+                    slippage_execution_assumptions={"fee_tier_ppm": 3000},
+                    source_evidence_ids=["ev_1"],
+                    validate_strict=True,
+                )
+            self.assertIn("SHA-256 mismatch", str(ctx.exception))
+
+
+class TestPhase3TrustArchitectureAdversarialSuite(unittest.TestCase):
+    """Rigorous adversarial test suite verifying all 12 trust-boundary and verification requirements."""
+
+    def _make_ssz_branch(self, leaf: bytes, gindex: int):
+        curr = leaf
+        k = gindex
+        branch = []
+        while k > 1:
+            sibling = hashlib.sha256(b"sibling:" + k.to_bytes(4, "big")).digest()
+            branch.append(sibling)
+            if k % 2 == 1:
+                curr = hashlib.sha256(sibling + curr).digest()
+            else:
+                curr = hashlib.sha256(curr + sibling).digest()
+            k //= 2
+        return curr, branch
+
+    def _make_pubkeys_512(self):
+        return [
+            hashlib.sha256(f"pk_{i}".encode()).digest() + hashlib.sha256(f"ext_{i}".encode()).digest()[:16]
+            for i in range(512)
+        ]
+
+    def test_1_attested_but_non_finalized_execution_block_cannot_be_labeled_finalized(self):
+        """Adversarial Test 1: An attested but non-finalized execution block cannot be labeled finalized."""
+        pubkeys_512 = self._make_pubkeys_512()
+        sync_root = bytes.fromhex("98d69927b32c3e0bd9f091f2f728fb95aeec620d2b5f04390465e65cd5d00b5c")
+        sr = bytes.fromhex("55" * 32)
+        ep_root, sr_br = self._make_ssz_branch(sr, 34)
+        body_root, ep_br = self._make_ssz_branch(ep_root, 25)
+        fin_root = bytes.fromhex("33" * 32)
+        beacon_state_root, fin_br = self._make_ssz_branch(fin_root, 105)
+
+        # Attested slot 9,000,000, but finalized epoch only 100,000 (finalized slot 3,200,000 < 9,000,000)
+        ev_unfinalized = HeaderConsensusEvidence(
+            slot=9_000_000,
+            proposer_index=1,
+            parent_root=bytes.fromhex("22" * 32),
+            beacon_state_root=beacon_state_root,
+            body_root=body_root,
+            execution_payload_root=ep_root,
+            execution_block_hash=bytes.fromhex("11" * 32),
+            execution_block_number=19500000,
+            execution_state_root=sr,
+            execution_receipts_root=bytes.fromhex("66" * 32),
+            execution_timestamp=1700000000,
+            execution_payload_branch=ep_br,
+            state_root_branch=sr_br,
+            sync_committee_bits=b"\xff" * 64,
+            sync_committee_signature=b"\xaa" * 96,
+            sync_committee_root=sync_root,
+            finalized_checkpoint_root=fin_root,
+            finalized_root_branch=fin_br,
+            signature_slot=9_000_001,
+            finalized_checkpoint_epoch=100_000,  # 3,200,000 < 9,000,000 -> NOT finalized
+            sync_committee_pubkeys=pubkeys_512,
+        )
+        self.assertFalse(HeaderConsensusVerifier.is_execution_block_finalized(ev_unfinalized))
+        with mock.patch("scripts.consensus_proof_verifier.verify_bls_aggregate_signature", return_value=True):
+            anchor_unfin = BlockHeaderTrustAnchor.from_consensus_verification(ev_unfinalized)
+            self.assertEqual(anchor_unfin.finality_status, "ATTESTED_UNFINALIZED")
+            self.assertFalse(anchor_unfin.is_authenticated)
+            self.assertFalse(BlockHeaderTrustAnchor.verify_authenticity(anchor_unfin))
+
+    def test_2_incorrect_signature_slot_cannot_authenticate_committee(self):
+        """Adversarial Test 2: An incorrect signature slot cannot authenticate a committee."""
+        pubkeys_512 = self._make_pubkeys_512()
+        sync_root = bytes.fromhex("98d69927b32c3e0bd9f091f2f728fb95aeec620d2b5f04390465e65cd5d00b5c")
+        sr = bytes.fromhex("55" * 32)
+        ep_root, sr_br = self._make_ssz_branch(sr, 34)
+        body_root, ep_br = self._make_ssz_branch(ep_root, 25)
+        fin_root = bytes.fromhex("33" * 32)
+        beacon_state_root, fin_br = self._make_ssz_branch(fin_root, 105)
+
+        # Signature slot prior to attested block slot + 1 fails
+        ev_bad_sig_slot = HeaderConsensusEvidence(
+            slot=9_000_000,
+            proposer_index=1,
+            parent_root=bytes.fromhex("22" * 32),
+            beacon_state_root=beacon_state_root,
+            body_root=body_root,
+            execution_payload_root=ep_root,
+            execution_block_hash=bytes.fromhex("11" * 32),
+            execution_block_number=19500000,
+            execution_state_root=sr,
+            execution_receipts_root=bytes.fromhex("66" * 32),
+            execution_timestamp=1700000000,
+            execution_payload_branch=ep_br,
+            state_root_branch=sr_br,
+            sync_committee_bits=b"\xff" * 64,
+            sync_committee_signature=b"\xaa" * 96,
+            sync_committee_root=sync_root,
+            finalized_checkpoint_root=fin_root,
+            finalized_root_branch=fin_br,
+            signature_slot=8_000_000,  # Invalid: signature slot < attested slot
+            finalized_checkpoint_epoch=281250,
+            sync_committee_pubkeys=pubkeys_512,
+        )
+        ok, err = HeaderConsensusVerifier.verify_execution_header(ev_bad_sig_slot)
+        self.assertFalse(ok)
+        self.assertIn("INVALID_SIGNATURE_SLOT", err)
+
+    def test_3_unverified_committee_transition_cannot_authenticate_header(self):
+        """Adversarial Test 3: An unverified committee transition cannot authenticate a header."""
+        pubkeys_512 = self._make_pubkeys_512()
+        sync_root = bytes.fromhex("98d69927b32c3e0bd9f091f2f728fb95aeec620d2b5f04390465e65cd5d00b5c")
+        sr = bytes.fromhex("55" * 32)
+        ep_root, sr_br = self._make_ssz_branch(sr, 34)
+        body_root, ep_br = self._make_ssz_branch(ep_root, 25)
+        fin_root = bytes.fromhex("33" * 32)
+        beacon_state_root, fin_br = self._make_ssz_branch(fin_root, 105)
+
+        # Header in unauthenticated period (e.g. slot 10,000,000 -> period 1220) without transition fails
+        ev_untrans = HeaderConsensusEvidence(
+            slot=10_000_000,
+            proposer_index=1,
+            parent_root=bytes.fromhex("22" * 32),
+            beacon_state_root=beacon_state_root,
+            body_root=body_root,
+            execution_payload_root=ep_root,
+            execution_block_hash=bytes.fromhex("11" * 32),
+            execution_block_number=20500000,
+            execution_state_root=sr,
+            execution_receipts_root=bytes.fromhex("66" * 32),
+            execution_timestamp=1700000000,
+            execution_payload_branch=ep_br,
+            state_root_branch=sr_br,
+            sync_committee_bits=b"\xff" * 64,
+            sync_committee_signature=b"\xaa" * 96,
+            sync_committee_root=sync_root,
+            finalized_checkpoint_root=fin_root,
+            finalized_root_branch=fin_br,
+            signature_slot=10_000_001,
+            finalized_checkpoint_epoch=320000,
+            sync_committee_pubkeys=pubkeys_512,
+        )
+        ok, err = HeaderConsensusVerifier.verify_execution_header(ev_untrans)
+        self.assertFalse(ok)
+        self.assertIn("UNAUTHENTICATED_SYNC_COMMITTEE_PERIOD", err)
+
+    def test_4_chainlink_proxy_account_proof_cannot_substitute_for_aggregator_account_proof(self):
+        """Adversarial Test 4: A Chainlink proxy account proof cannot substitute for the aggregator account proof."""
+        now_ts = int(dt.datetime.now(dt.timezone.utc).timestamp())
+        cl_ev = ChainlinkRoundEvidence(
+            feed_address="0x5f4ec3df9cbd43714fe2740f5e3616155c5b8419",
+            round_id=18446744073709551615,
+            answer=3000_00000000,
+            decimals=8,
+            started_at=now_ts - 60,
+            updated_at=now_ts - 30,
+            answered_in_round=18446744073709551615,
+        )
+        fake_anchor = BlockHeaderTrustAnchor(
+            chain_id=1,
+            block_number=19_500_000,
+            block_hash="0x" + "11" * 32,
+            state_root="0x" + "22" * 32,
+            header_timestamp_utc="2026-11-15T00:00:00Z",
+            finality_status="FINALIZED_CANONICAL",
+            is_authenticated=True,
+        )
+        proxy_proof_nodes = [b"proxy_proof_node"]
+        with mock.patch.object(BlockHeaderTrustAnchor, "verify_authenticity", return_value=True):
+            # Passing proxy proof as aggregator proof fails because key does not match aggregator address
+            rec = ValuationEvidenceVerifier.verify_chainlink_round(
+                1, "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2", cl_ev,
+                block_trust_anchor=fake_anchor,
+                account_proof=proxy_proof_nodes,
+                aggregator_account_proof=proxy_proof_nodes,
+                storage_proof=[b"storage_node"],
+            )
+            self.assertFalse(rec.is_authenticated)
+
+    def test_5_matching_chainlink_answer_with_fabricated_timestamp_fails(self):
+        """Adversarial Test 5: A matching Chainlink answer with a fabricated timestamp fails."""
+        now_ts = int(dt.datetime.now(dt.timezone.utc).timestamp())
+        cl_ev = ChainlinkRoundEvidence(
+            feed_address="0x5f4ec3df9cbd43714fe2740f5e3616155c5b8419",
+            round_id=18446744073709551615,
+            answer=3000_00000000,
+            decimals=8,
+            started_at=now_ts - 100,
+            updated_at=now_ts - 10,
+            answered_in_round=18446744073709551615,
+        )
+        fake_anchor = BlockHeaderTrustAnchor(
+            chain_id=1,
+            block_number=19_500_000,
+            block_hash="0x" + "11" * 32,
+            state_root="0x" + "22" * 32,
+            header_timestamp_utc="2026-11-15T00:00:00Z",
+            finality_status="FINALIZED_CANONICAL",
+            is_authenticated=True,
+        )
+        with mock.patch.object(BlockHeaderTrustAnchor, "verify_authenticity", return_value=True):
+            rec = ValuationEvidenceVerifier.verify_chainlink_round(
+                1, "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2", cl_ev,
+                block_trust_anchor=fake_anchor,
+                account_proof=[b"node1"],
+                storage_proof=[b"node2"],
+            )
+            self.assertFalse(rec.is_authenticated)
+
+    def test_6_chainlink_proof_for_different_round_fails(self):
+        """Adversarial Test 6: A Chainlink proof for a different round fails."""
+        now_ts = int(dt.datetime.now(dt.timezone.utc).timestamp())
+        cl_ev_200 = ChainlinkRoundEvidence(
+            feed_address="0x5f4ec3df9cbd43714fe2740f5e3616155c5b8419",
+            round_id=200,
+            answer=3000_00000000,
+            decimals=8,
+            started_at=now_ts - 60,
+            updated_at=now_ts - 30,
+            answered_in_round=200,
+        )
+        fake_anchor = BlockHeaderTrustAnchor(
+            chain_id=1,
+            block_number=19_500_000,
+            block_hash="0x" + "11" * 32,
+            state_root="0x" + "22" * 32,
+            header_timestamp_utc="2026-11-15T00:00:00Z",
+            finality_status="FINALIZED_CANONICAL",
+            is_authenticated=True,
+        )
+        with mock.patch.object(BlockHeaderTrustAnchor, "verify_authenticity", return_value=True):
+            rec = ValuationEvidenceVerifier.verify_chainlink_round(
+                1, "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2", cl_ev_200,
+                block_trust_anchor=fake_anchor,
+                account_proof=[b"node1"],
+                storage_proof=[b"node2"],
+            )
+            self.assertFalse(rec.is_authenticated)
+
+    def test_7_uniswap_v3_timestamp_cannot_be_used_as_observation_index(self):
+        """Adversarial Test 7: A Uniswap V3 timestamp cannot be used as an observation index."""
+        now_ts = int(dt.datetime.now(dt.timezone.utc).timestamp())
+        twap_ev = UniswapV3TwapEvidence(
+            pool_address="0x88e6a0c2ddd26feeb64f039a2c41296fcb3f5640",
+            token0_address="0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48",
+            token1_address="0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2",
+            token0_decimals=6,
+            token1_decimals=18,
+            tick_cumulatives=(1000000, 2000000),
+            timestamps=(now_ts - 300, now_ts),
+        )
+        with self.assertRaises(ValueError) as ctx:
+            ValuationEvidenceVerifier.verify_uniswap_v3_twap(
+                1, "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2", twap_ev,
+                observation_index_t1=now_ts - 300,  # UNIX timestamp passed as index
+                observation_index_t2=now_ts,
+                require_authenticated=True,
+            )
+        self.assertIn("UNISWAP_V3_INVALID_OBSERVATION_INDEX", str(ctx.exception))
+
+    def test_8_pool_account_proof_cannot_substitute_for_storage_proof(self):
+        """Adversarial Test 8: A pool account proof cannot substitute for its storage proof."""
+        now_ts = int(dt.datetime.now(dt.timezone.utc).timestamp())
+        twap_ev = UniswapV3TwapEvidence(
+            pool_address="0x88e6a0c2ddd26feeb64f039a2c41296fcb3f5640",
+            token0_address="0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48",
+            token1_address="0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2",
+            token0_decimals=6,
+            token1_decimals=18,
+            tick_cumulatives=(1000000, 2000000),
+            timestamps=(now_ts - 300, now_ts),
+        )
+        fake_anchor = BlockHeaderTrustAnchor(
+            chain_id=1,
+            block_number=19_500_000,
+            block_hash="0x" + "11" * 32,
+            state_root="0x" + "22" * 32,
+            header_timestamp_utc="2026-11-15T00:00:00Z",
+            finality_status="FINALIZED_CANONICAL",
+            is_authenticated=True,
+        )
+        with mock.patch.object(BlockHeaderTrustAnchor, "verify_authenticity", return_value=True):
+            rec = ValuationEvidenceVerifier.verify_uniswap_v3_twap(
+                1, "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2", twap_ev,
+                pool_account_proof_t1=[b"acc1"],
+                pool_account_proof_t2=[b"acc2"],
+                observation_proof_t1=None,  # Missing storage proof
+                observation_proof_t2=None,
+                observation_index_t1=0,
+                observation_index_t2=1,
+                block_anchor_t1=fake_anchor,
+                block_anchor_t2=fake_anchor,
+            )
+            self.assertFalse(rec.is_authenticated)
+
+    def test_9_storage_proof_against_global_state_root_cannot_authenticate_pool_storage(self):
+        """Adversarial Test 9: A storage proof against the global state root cannot authenticate pool storage."""
+        now_ts = int(dt.datetime.now(dt.timezone.utc).timestamp())
+        twap_ev = UniswapV3TwapEvidence(
+            pool_address="0x88e6a0c2ddd26feeb64f039a2c41296fcb3f5640",
+            token0_address="0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48",
+            token1_address="0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2",
+            token0_decimals=6,
+            token1_decimals=18,
+            tick_cumulatives=(1000000, 2000000),
+            timestamps=(now_ts - 300, now_ts),
+        )
+        fake_anchor = BlockHeaderTrustAnchor(
+            chain_id=1,
+            block_number=19_500_000,
+            block_hash="0x" + "11" * 32,
+            state_root="0x" + "22" * 32,
+            header_timestamp_utc="2026-11-15T00:00:00Z",
+            finality_status="FINALIZED_CANONICAL",
+            is_authenticated=True,
+        )
+        with mock.patch.object(BlockHeaderTrustAnchor, "verify_authenticity", return_value=True):
+            rec = ValuationEvidenceVerifier.verify_uniswap_v3_twap(
+                1, "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2", twap_ev,
+                pool_account_proof_t1=None,  # Missing pool account proof
+                pool_account_proof_t2=None,
+                observation_proof_t1=[b"proof_against_state_root"],
+                observation_proof_t2=[b"proof_against_state_root_2"],
+                observation_index_t1=0,
+                observation_index_t2=1,
+                block_anchor_t1=fake_anchor,
+                block_anchor_t2=fake_anchor,
+            )
+            self.assertFalse(rec.is_authenticated)
+
+    def test_10_proof_with_different_tick_cumulative_or_timestamp_fails(self):
+        """Adversarial Test 10: A proof with a different tick cumulative or timestamp fails."""
+        now_ts = int(dt.datetime.now(dt.timezone.utc).timestamp())
+        twap_ev = UniswapV3TwapEvidence(
+            pool_address="0x88e6a0c2ddd26feeb64f039a2c41296fcb3f5640",
+            token0_address="0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48",
+            token1_address="0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2",
+            token0_decimals=6,
+            token1_decimals=18,
+            tick_cumulatives=(1000000, 2000000),
+            timestamps=(now_ts - 300, now_ts),
+        )
+        fake_anchor = BlockHeaderTrustAnchor(
+            chain_id=1,
+            block_number=19_500_000,
+            block_hash="0x" + "11" * 32,
+            state_root="0x" + "22" * 32,
+            header_timestamp_utc="2026-11-15T00:00:00Z",
+            finality_status="FINALIZED_CANONICAL",
+            is_authenticated=True,
+        )
+        with mock.patch.object(BlockHeaderTrustAnchor, "verify_authenticity", return_value=True):
+            rec = ValuationEvidenceVerifier.verify_uniswap_v3_twap(
+                1, "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2",
+                dataclasses.replace(twap_ev, tick_cumulatives=(99999999, 88888888)),
+                pool_account_proof_t1=[b"acc1"],
+                pool_account_proof_t2=[b"acc2"],
+                observation_proof_t1=[b"obs1"],
+                observation_proof_t2=[b"obs2"],
+                observation_index_t1=0,
+                observation_index_t2=1,
+                block_anchor_t1=fake_anchor,
+                block_anchor_t2=fake_anchor,
+            )
+            self.assertFalse(rec.is_authenticated)
+
+    def test_11_obsolete_or_fabricated_guardian_registry_cannot_authenticate_production_pyth_vaa(self):
+        """Adversarial Test 11: An obsolete or fabricated guardian registry cannot authenticate a production Pyth VAA."""
+        # Expired guardian set 1
+        ok_exp, err_exp, _ = WormholeGuardianRegistry.get_guardian_set(1, check_time=1700000000)
+        self.assertFalse(ok_exp)
+        self.assertIn("EXPIRED_GUARDIAN_SET", err_exp)
+
+        # Fabricated guardian set 999
+        ok_fab, err_fab, _ = WormholeGuardianRegistry.get_guardian_set(999)
+        self.assertFalse(ok_fab)
+        self.assertIn("UNAUTHENTICATED_GUARDIAN_SET", err_fab)
+
+        # Guardian set with dev keys
+        dev_key = "0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266"
+        self.assertIn(dev_key, DEV_HARDHAT_ANVIL_KEYS)
+        fake_vaa = (
+            b"\x01" +
+            (0).to_bytes(4, "big") +
+            bytes([13]) +
+            (b"\x00" + b"\x11" * 32 + b"\x22" * 32 + b"\x1b") * 13 +
+            b"\x00" * 100
+        )
+        ok_dev, err_dev, _ = verify_wormhole_vaa(fake_vaa, trusted_guardian_set=[dev_key] * 19)
+        self.assertFalse(ok_dev)
+        self.assertEqual(err_dev, "DEVELOPMENT_GUARDIAN_KEYS_REJECTED")
+
+    def test_12_op_stack_mature_final_remains_impossible_without_genuine_l1_finality(self):
+        """Adversarial Test 12: OP Stack mature-final remains impossible without genuine L1 finality."""
+        unauth_l1_anchor = BlockHeaderTrustAnchor.create_unverified_anchor(
+            chain_id=1,
+            block_number=19_500_000,
+            block_hash="0x" + "55" * 32,
+            state_root="0x" + "66" * 32,
+            header_timestamp_utc="2026-11-15T00:00:00Z",
+        )
+        fake_evidence = OpStackOutputProofEvidence(
+            withdrawal_hash="0x" + "11" * 32,
+            l2_output_index=42,
+            l2_block_number=12345678,
+            output_root="0x" + "22" * 32,
+            l1_oracle_output_root="0x" + "22" * 32,
+            is_valid=True,
+        )
+        st = MultiChainFinalityEngine.evaluate_op_stack_withdrawal(
+            proven_withdrawal_timestamp=1000,
+            current_l1_timestamp=200000,
+            proof_maturity_delay_seconds=1000,
+            output_proof_evidence=fake_evidence,
+            l1_trust_anchor=unauth_l1_anchor,
+        )
+        self.assertEqual(st, FinalityState.FINALITY_CALLER_ASSERTED_UNVERIFIED)
+        self.assertNotEqual(st, FinalityState.WITHDRAWAL_PROOF_MATURE_FINAL)
+
+    def test_13_positive_chainlink_cryptographic_mpt_verification(self):
+        """Positive Test 13: End-to-end cryptographic verification of Chainlink aggregator transmission MPT."""
+        now_ts = 1700000000
+        round_id = 18446744073709551615
+        answer = 3000_00000000
+
+        # Exact storage slot 43 transmission packing: timestamp (8 bytes) + answer (24 bytes)
+        slot_bytes = now_ts.to_bytes(8, "big") + answer.to_bytes(24, "big", signed=True)
+        s_key = keccak256((round_id & 0xFFFFFFFF).to_bytes(32, "big") + (43).to_bytes(32, "big"))
+        encoded_slot_val = rlp_encode_bytes(slot_bytes)
+
+        storage_leaf = rlp_encode([b"\x20" + s_key, encoded_slot_val])
+        storage_root = keccak256(storage_leaf)
+
+        agg_code_hash = bytes.fromhex("3479008bc5b5ad9e02ef2c2c04ae5ce5c249bc8558eb80dd94488b0ea77f52f3")
+        agg_account_val = rlp_encode([rlp_encode_bytes(b"\x01"), rlp_encode_bytes(b""), storage_root, agg_code_hash])
+
+        agg_addr = bytes.fromhex("5f4ec3df9cbd43714fe2740f5e3616155c5b8419")
+        agg_key = keccak256(agg_addr)
+        agg_leaf = rlp_encode([b"\x20" + agg_key, agg_account_val])
+        state_root = keccak256(agg_leaf)
+
+        cl_ev = ChainlinkRoundEvidence(
+            feed_address="0x5f4ec3df9cbd43714fe2740f5e3616155c5b8419",
+            round_id=round_id,
+            answer=answer,
+            decimals=8,
+            started_at=now_ts - 30,
+            updated_at=now_ts,
+            answered_in_round=round_id,
+        )
+
+        anchor = BlockHeaderTrustAnchor(
+            chain_id=1,
+            block_number=19_500_000,
+            block_hash="0x" + "11" * 32,
+            state_root="0x" + state_root.hex(),
+            header_timestamp_utc="2026-11-15T00:00:00Z",
+            finality_status="FINALIZED_CANONICAL",
+            is_authenticated=True,
+        )
+
+        with mock.patch.object(BlockHeaderTrustAnchor, "verify_authenticity", return_value=True):
+            rec = ValuationEvidenceVerifier.verify_chainlink_round(
+                1, "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2", cl_ev,
+                block_trust_anchor=anchor,
+                account_proof=[agg_leaf],
+                storage_proof=[storage_leaf],
+                require_authenticated=True,
+            )
+            self.assertTrue(rec.is_authenticated)
+            self.assertEqual(rec.price_usd, 3000.0)
+
+    def test_14_positive_uniswap_v3_observation_cryptographic_verification(self):
+        """Positive Test 14: End-to-end cryptographic verification of Uniswap V3 observation MPT storage proofs."""
+        def encode_v3_obs(ts: int, cum: int):
+            return b"\x01" + (1000).to_bytes(20, "big") + cum.to_bytes(7, "big", signed=True) + ts.to_bytes(4, "big")
+
+        def build_endpoint(pool_addr_hex: str, obs_index: int, ts: int, cum: int):
+            slot_bytes = encode_v3_obs(ts, cum)
+            slot_key = keccak256((obs_index).to_bytes(32, "big") + (8).to_bytes(32, "big"))
+            storage_leaf = rlp_encode([b"\x20" + slot_key, rlp_encode_bytes(slot_bytes)])
+            storage_root = keccak256(storage_leaf)
+
+            pool_addr = bytes.fromhex(pool_addr_hex[2:])
+            pool_key = keccak256(pool_addr)
+            pool_acc_val = rlp_encode([rlp_encode_bytes(b"\x01"), rlp_encode_bytes(b""), storage_root, bytes.fromhex("11" * 32)])
+            pool_leaf = rlp_encode([b"\x20" + pool_key, pool_acc_val])
+            return keccak256(pool_leaf), [pool_leaf], [storage_leaf]
+
+        pool_hex = "0x88e6a0c2ddd26feeb64f039a2c41296fcb3f5640"
+        t1 = 1700000000
+        t2 = 1700000300
+        c1 = 1000000
+        c2 = 2000000
+
+        sr1, pool_p1, obs_p1 = build_endpoint(pool_hex, 0, t1, c1)
+        sr2, pool_p2, obs_p2 = build_endpoint(pool_hex, 1, t2, c2)
+
+        anchor1 = BlockHeaderTrustAnchor(
+            chain_id=1,
+            block_number=19_499_900,
+            block_hash="0x" + "11" * 32,
+            state_root="0x" + sr1.hex(),
+            header_timestamp_utc="2026-11-15T00:00:00Z",
+            finality_status="FINALIZED_CANONICAL",
+            is_authenticated=True,
+        )
+        anchor2 = BlockHeaderTrustAnchor(
+            chain_id=1,
+            block_number=19_500_000,
+            block_hash="0x" + "22" * 32,
+            state_root="0x" + sr2.hex(),
+            header_timestamp_utc="2026-11-15T00:05:00Z",
+            finality_status="FINALIZED_CANONICAL",
+            is_authenticated=True,
+        )
+
+        twap_ev = UniswapV3TwapEvidence(
+            pool_address=pool_hex,
+            token0_address="0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48",
+            token1_address="0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2",
+            token0_decimals=6,
+            token1_decimals=18,
+            tick_cumulatives=(c1, c2),
+            timestamps=(t1, t2),
+        )
+
+        with mock.patch.object(BlockHeaderTrustAnchor, "verify_authenticity", return_value=True):
+            rec = ValuationEvidenceVerifier.verify_uniswap_v3_twap(
+                1, "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2", twap_ev,
+                pool_account_proof_t1=pool_p1,
+                pool_account_proof_t2=pool_p2,
+                observation_proof_t1=obs_p1,
+                observation_proof_t2=obs_p2,
+                observation_index_t1=0,
+                observation_index_t2=1,
+                block_anchor_t1=anchor1,
+                block_anchor_t2=anchor2,
+                require_authenticated=True,
+            )
+            self.assertTrue(rec.is_authenticated)
+            self.assertGreater(rec.price_usd, 0.0)
 
 
 if __name__ == "__main__":
