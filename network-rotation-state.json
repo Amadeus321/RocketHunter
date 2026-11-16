@@ -19,7 +19,7 @@
   "discovered_networks_total": 223,
   "last_rotation_offset": 0,
   "last_rotation_slot": 0,
-  "last_run_id": "43836790175",
+  "last_run_id": "43857192490",
   "last_selected_network_count": 12,
   "last_selected_networks": [
     "solana",
@@ -35,7 +35,7 @@
     "aptos",
     "blast"
   ],
-  "last_updated_utc": "2026-11-16T09:24:57Z",
+  "last_updated_utc": "2026-11-16T11:40:59Z",
   "pipeline_version": "4.19.0",
   "registry_complete": true,
   "registry_size_known": true,
