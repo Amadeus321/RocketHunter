@@ -1,6 +1,7 @@
 """Offline regression tests for the read-only DEX on-chain evidence adapters."""
 import unittest
 from datetime import datetime, timezone
+from unittest.mock import patch
 
 from scripts import dex_onchain_evidence as evidence
 from scripts import dex_loss_guard
@@ -14,6 +15,23 @@ QUOTE = "0x3333333333333333333333333333333333333333"
 
 
 class OnchainEvidenceTests(unittest.TestCase):
+    def test_rugcheck_credentials_are_redacted_from_provider_call_metadata(self):
+        captured = {}
+        secret = "rugcheck-secret-value"
+
+        def fail_request(request, timeout):
+            captured["url"] = request.full_url
+            raise OSError("request failed for " + request.full_url)
+
+        with patch.dict(evidence.os.environ, {"RUGCHECK_API_KEY": secret}):
+            with patch.object(evidence.urllib.request, "urlopen", side_effect=fail_request):
+                _, metadata = evidence._http_json(evidence._rugcheck_url("/test"))
+
+        self.assertIn(secret, captured["url"])
+        self.assertNotIn(secret, metadata["url"])
+        self.assertNotIn(secret, metadata["error"])
+        self.assertIn("REDACTED", metadata["url"])
+
     def test_rugcheck_holder_percentage_is_not_scaled_as_fraction(self):
         self.assertEqual(evidence._pct(0.5), 0.5)
         self.assertEqual(evidence._pct("79.3"), 79.3)

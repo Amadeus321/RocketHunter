@@ -154,14 +154,26 @@ class CandleOutcomeAnalysisTests(unittest.TestCase):
         (partial_dir / "observations.jsonl").write_text(
             json.dumps(self.observation("partial-observation")) + "\n", encoding="utf-8"
         )
+        running_dir = self.observations / "collection-running"
+        running_dir.mkdir()
+        (running_dir / "manifest.json").write_text(json.dumps({
+            "status": "IN_PROGRESS",
+            "collection_run_id": "running",
+            "record_count": 1,
+        }), encoding="utf-8")
+        (running_dir / "observations.jsonl").write_text(
+            "corrupt partial bytes must remain unread\n", encoding="utf-8"
+        )
 
         output = self.run_analysis()
         report = self.report(output)
 
         self.assertEqual(report["record_counts"]["observations_loaded"], 1)
         self.assertEqual(report["record_counts"]["forecasts_joined_to_observations"], 1)
+        self.assertEqual(report["record_counts"]["pending_collection_sessions"], 2)
         source_paths = [item["path"] for item in report["source_files"]]
         self.assertFalse(any("collection-partial" in path for path in source_paths))
+        self.assertFalse(any("collection-running/observations" in path for path in source_paths))
 
     def test_only_manifest_declared_records_with_matching_run_identity_are_loaded(self):
         first = self.observation()
@@ -177,7 +189,8 @@ class CandleOutcomeAnalysisTests(unittest.TestCase):
         report = self.report(self.run_analysis())
 
         self.assertEqual(report["record_counts"]["observation_records"], 3)
-        self.assertEqual(report["record_counts"]["observations_loaded"], 1)
+        self.assertEqual(report["record_counts"]["observations_loaded"], 0)
+        self.assertEqual(report["record_counts"]["forecasts_joined_to_observations"], 0)
         self.assertEqual(report["coverage_summary"]["observation_collection_run_id_mismatch"], 1)
         self.assertEqual(report["coverage_summary"]["observation_records_beyond_manifest_count"], 1)
 
@@ -185,7 +198,7 @@ class CandleOutcomeAnalysisTests(unittest.TestCase):
         run_dir = self.observations / "collection-missing"
         run_dir.mkdir(parents=True)
         (run_dir / "manifest.json").write_text(json.dumps({
-            "status": "INTERRUPTED",
+            "status": "ONE_CYCLE_COMPLETED",
             "collection_run_id": "collection-missing",
             "record_count": 2,
             "output_file": "observations.jsonl",
@@ -363,6 +376,20 @@ class CandleOutcomeAnalysisTests(unittest.TestCase):
         self.assertEqual(report["record_counts"]["observations_loaded"], 0)
         self.assertEqual(report["record_counts"]["forecasts_joined_to_observations"], 0)
         self.assertEqual(report["coverage_summary"]["observation_status:PROVIDER_RATE_LIMITED"], 1)
+
+    def test_terminal_failed_collection_records_are_not_joined_to_forecasts(self):
+        self.write_observations([self.observation()])
+        manifest_path = self.observations / "collection-test" / "manifest.json"
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        manifest["status"] = "FAILED"
+        manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+        report = self.report(self.run_analysis())
+
+        self.assertEqual(report["record_counts"]["failed_collection_sessions"], 1)
+        self.assertEqual(report["record_counts"]["observations_loaded"], 0)
+        self.assertEqual(report["record_counts"]["forecasts_joined_to_observations"], 0)
+        self.assertEqual(report["record_counts"]["pending_collection_sessions"], 0)
 
 
 def bars_start(snapshot):

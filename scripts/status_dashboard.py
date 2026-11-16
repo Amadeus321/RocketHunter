@@ -14,6 +14,11 @@ from pathlib import Path
 from typing import Any
 
 try:
+    from scripts import research_run_contract as run_contract
+except ImportError:
+    import research_run_contract as run_contract
+
+try:
     from scripts import local_diagnostics
 except ImportError:
     import local_diagnostics
@@ -60,17 +65,7 @@ def _format_israel_time(dt_val: Any) -> str:
         return israel_dt.strftime("%Y-%m-%d %H:%M:%S IST")
     except Exception:
         return s
-FINAL_COLLECTION_STATUSES = {
-    "COMPLETED",
-    "DURATION_ELAPSED",
-    "FAILED",
-    "INTERRUPTED",
-    "ONE_CYCLE_COMPLETED",
-    "PROVIDER_ACCESS_DENIED",
-    "PROVIDER_COOLDOWN_ACTIVE",
-    "PROVIDER_RATE_LIMITED",
-    "REQUEST_LIMIT_REACHED",
-}
+FINAL_COLLECTION_STATUSES = run_contract.FINAL_COLLECTION_STATUSES
 
 
 class DashboardError(RuntimeError):
@@ -214,6 +209,7 @@ def _collection_summaries(
             summaries.append({
                 "directory": run_dir.name,
                 "status": "PENDING_FINALIZATION",
+                "evidence_status": "PENDING",
                 "lifecycle": "Not finalized; manifest unavailable; observations not read",
                 "started_utc": None,
                 "finished_utc": None,
@@ -225,20 +221,59 @@ def _collection_summaries(
                 "excluded_rows": {},
             })
             continue
-        manifest = _read_object(manifest_path)
+        try:
+            contract = run_contract.read_collection_manifest(manifest_path)
+        except run_contract.CollectionManifestError as exc:
+            raise DashboardError(str(exc)) from exc
+        manifest = contract["manifest"]
+        lifecycle_status = contract["status"]
+        declared_count = contract["record_count"]
+        if not contract["finalized"]:
+            pending_observation_sessions += 1
+            summaries.append({
+                "directory": run_dir.name,
+                "status": lifecycle_status,
+                "evidence_status": "PENDING",
+                "lifecycle": "Not finalized; observations not read",
+                "started_utc": manifest.get("started_utc"),
+                "finished_utc": manifest.get("finished_utc"),
+                "record_count": declared_count,
+                "requests_started": manifest.get("requests_started"),
+                "statuses": {},
+                "usable_bars": None,
+                "observations_available": False,
+                "excluded_rows": {},
+            })
+            continue
+        collection_run_id = contract["run_id"]
         observation_path = _safe_observation_path(run_dir, manifest)
-        declared_count = manifest.get("record_count")
-        if isinstance(declared_count, bool) or not isinstance(declared_count, int) or declared_count < 0:
-            raise DashboardError(f"invalid record_count in collection manifest: {run_dir.name}")
-        collection_run_id = manifest.get("collection_run_id")
-        if declared_count and (not isinstance(collection_run_id, str) or not collection_run_id):
-            raise DashboardError(f"missing collection_run_id in non-empty manifest: {run_dir.name}")
+        if lifecycle_status == "FAILED":
+            failed_observations_available = observation_path.exists()
+            summaries.append({
+                "directory": run_dir.name,
+                "status": lifecycle_status,
+                "evidence_status": "FAILED",
+                "lifecycle": "Finalized; failed observations not loaded",
+                "started_utc": manifest.get("started_utc"),
+                "finished_utc": manifest.get("finished_utc"),
+                "record_count": declared_count,
+                "requests_started": manifest.get("requests_started"),
+                "statuses": {},
+                "usable_bars": 0,
+                "observations_available": failed_observations_available,
+                "excluded_rows": {
+                    "failed_collection_observations_not_loaded": declared_count,
+                },
+            })
+            continue
         statuses: dict[str, int] = {}
         usable_bars = 0
         excluded_rows: dict[str, int] = {}
         source_record_count = 0
-        lifecycle_status = manifest.get("status")
-        finalized = lifecycle_status in FINAL_COLLECTION_STATUSES
+        conflicting_records = 0
+        stale_records = 0
+        failed_records = 0
+        finalized = True
         observation_file_available = finalized and observation_path.exists()
         if not finalized:
             pending_observation_sessions += 1
@@ -274,10 +309,16 @@ def _collection_summaries(
                             excluded_rows["collection_run_id_mismatch"] = (
                                 excluded_rows.get("collection_run_id_mismatch", 0) + 1
                             )
+                            conflicting_records += 1
                             continue
                         status = record.get("source_status")
                         if isinstance(status, str):
                             statuses[status] = statuses.get(status, 0) + 1
+                            stale_records += status.startswith("STALE")
+                            failed_records += status in {
+                                "FETCH_FAILED", "PROVIDER_ACCESS_DENIED",
+                                "PROVIDER_RATE_LIMITED", "SKIPPED_PROVIDER_COOLDOWN",
+                            }
                         evidence = record.get("source_evidence")
                         bars = evidence.get("bars") if isinstance(evidence, dict) else None
                         if status == "OBSERVED" and isinstance(bars, list):
@@ -289,10 +330,20 @@ def _collection_summaries(
                 raise DashboardError(f"cannot read observations for collection {run_dir.name}: {exc}") from exc
             if source_record_count < declared_count:
                 excluded_rows["missing_manifest_declared_records"] = declared_count - source_record_count
-        total_usable_bars += usable_bars
+        evidence_status = run_contract.collection_evidence_status(
+            lifecycle_status, declared_count, source_record_count,
+            finalized=True, file_present=observation_file_available,
+            conflicting_records=conflicting_records,
+            stale_records=stale_records, failed_records=failed_records,
+        )
+        if evidence_status == "COMPLETE":
+            total_usable_bars += usable_bars
+        else:
+            usable_bars = 0
         summaries.append({
             "directory": run_dir.name,
             "status": lifecycle_status,
+            "evidence_status": evidence_status,
             "lifecycle": "Finalized" if finalized else "Not finalized; observations not read",
             "started_utc": next((
                 manifest.get(key) for key in ("started_utc", "collection_started_utc", "created_utc")

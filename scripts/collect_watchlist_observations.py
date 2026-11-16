@@ -39,10 +39,12 @@ IDENTITY_FIELDS = (
 
 try:
     from scripts import v425_early_breakout as monitor
+    from scripts import research_run_contract as run_contract
     from scripts import venues
     from scripts.file_lock import shared_rate_limit
 except ImportError:
     import v425_early_breakout as monitor
+    import research_run_contract as run_contract
     import venues
     from file_lock import shared_rate_limit
 
@@ -482,7 +484,9 @@ def _make_observation(
     }
 
 
-def _write_observation(stream, observation: dict[str, Any]) -> None:
+def _write_observation(stream, observation: dict[str, Any], health_check=None) -> None:
+    if health_check is not None:
+        health_check()
     stream.write(_json_text(observation) + "\n")
     stream.flush()
     os.fsync(stream.fileno())
@@ -495,14 +499,28 @@ def _read_scanner_version() -> str:
         return "unknown"
 
 
-def collect(
+def _collect(
     args,
     *,
     now_fn=_utc_now,
     sleep_fn=time.sleep,
     fetch_fn=None,
     rate_limit_fn=shared_rate_limit,
+    run_id: str | None = None,
+    lease_health_check=None,
 ) -> Path | None:
+    lease_health_failed = False
+
+    def check_lease_health() -> None:
+        nonlocal lease_health_failed
+        if lease_health_check is None:
+            return
+        try:
+            lease_health_check()
+        except run_contract.ResearchRunError:
+            lease_health_failed = True
+            raise
+
     watchlist_path = Path(args.watchlist).absolute()
     output_root = Path(args.output_root)
     _ensure_disjoint_paths(Path(args.memory_dir), output_root)
@@ -524,7 +542,7 @@ def collect(
     output_root.mkdir(parents=True, exist_ok=True)
     if output_root.is_symlink():
         raise CollectorError(f"research output root must not be a symlink: {output_root}")
-    run_id = f"{now_fn().strftime('%Y%m%dT%H%M%SZ')}-{uuid.uuid4().hex[:12]}"
+    run_id = run_id or f"{now_fn().strftime('%Y%m%dT%H%M%SZ')}-{uuid.uuid4().hex[:12]}"
     run_dir = output_root / f"collection-{run_id}"
     run_dir.mkdir(exist_ok=False)
     config_fingerprint = _configuration_fingerprint(args, watchlist_path)
@@ -548,6 +566,7 @@ def collect(
     try:
         # One global lock serializes writers and provider polling across collector sessions.
         with _locked_writer(output_root / ".collector.lock", deadline_monotonic):
+            check_lease_health()
             provider_response_metadata = _read_provider_cooldown(cooldown_path, now_fn())
             if provider_response_metadata is not None:
                 if provider_response_metadata.get("http_status") in (418, 429):
@@ -556,6 +575,7 @@ def collect(
             with (run_dir / "observations.jsonl").open("a", encoding="utf-8", newline="\n") as stream:
                 first_cycle = True
                 while True:
+                    check_lease_health()
                     if now_fn().timestamp() >= deadline:
                         stop_status = "DURATION_ELAPSED"
                         break
@@ -574,6 +594,7 @@ def collect(
                     first_cycle = False
                     cycle_requested = 0
                     for position in positions:
+                        check_lease_health()
                         missing = _missing_fetch_fields(position)
                         if missing:
                             sequence += 1
@@ -586,7 +607,7 @@ def collect(
                                 source_status="SKIPPED_INCOMPLETE_IDENTITY",
                                 error="missing fields: " + ", ".join(missing),
                             )
-                            _write_observation(stream, observation)
+                            _write_observation(stream, observation, check_lease_health)
                             counts["skipped_incomplete_identity"] += 1
                             continue
                         if stop_status == "PROVIDER_COOLDOWN_ACTIVE":
@@ -602,7 +623,7 @@ def collect(
                                 provider_rate_limit=provider_rate_metadata,
                                 provider_response=provider_response_metadata,
                             )
-                            _write_observation(stream, observation)
+                            _write_observation(stream, observation, check_lease_health)
                             counts["skipped_provider_cooldown"] += 1
                             continue
                         if stop_status == "PROVIDER_RATE_LIMITED":
@@ -618,7 +639,7 @@ def collect(
                                 provider_rate_limit=provider_rate_metadata,
                                 provider_response=provider_response_metadata,
                             )
-                            _write_observation(stream, observation)
+                            _write_observation(stream, observation, check_lease_health)
                             counts["skipped_provider_rate_limit"] += 1
                             continue
                         if stop_status == "PROVIDER_ACCESS_DENIED":
@@ -633,7 +654,7 @@ def collect(
                                 error="GeckoTerminal returned HTTP 403 earlier in this session",
                                 provider_response=provider_response_metadata,
                             )
-                            _write_observation(stream, observation)
+                            _write_observation(stream, observation, check_lease_health)
                             counts["skipped_provider_access_denied"] += 1
                             continue
                         if request_count >= args.max_requests:
@@ -656,6 +677,7 @@ def collect(
                             break
                         market_type = _market_type(position)
                         if market_type == "dex_pool":
+                            check_lease_health()
                             rate_limit_fn(
                                 rate_path, max(PACING_SECONDS, monitor.GECKO_POSITION_INTERVAL_SECONDS)
                             )
@@ -682,6 +704,7 @@ def collect(
                             bars, url, error, source, provider_metadata = (
                                 [], None, f"{type(exc).__name__}: {exc}", None, None
                             )
+                        check_lease_health()
                         if market_type == "cex_spot" and cex_fetcher.last_request_started_utc:
                             request_started = cex_fetcher.last_request_started_utc
                         actual_requests = cex_fetcher.requests_started - previous_requests
@@ -703,6 +726,7 @@ def collect(
                         ):
                             stop_status = "PROVIDER_ACCESS_DENIED"
                         if provider_metadata is not None:
+                            check_lease_health()
                             provider_response_metadata = provider_metadata
                             if provider_metadata.get("http_status") in (418, 429):
                                 provider_rate_metadata = provider_metadata
@@ -750,7 +774,7 @@ def collect(
                             provider_response=provider_metadata,
                             simulated_execution=sim_exec,
                         )
-                        _write_observation(stream, observation)
+                        _write_observation(stream, observation, check_lease_health)
                     if stop_status in ("REQUEST_LIMIT_REACHED", "PROVIDER_RATE_LIMITED",
                                        "PROVIDER_ACCESS_DENIED",
                                        "DURATION_ELAPSED"):
@@ -771,47 +795,120 @@ def collect(
         raise
     finally:
         finished = now_fn()
-        manifest = {
-            "schema": "crypto-prebreakout.watchlist-observation-manifest.v1",
-            "collector_version": COLLECTOR_VERSION,
-            "status": stop_status,
-            "collection_run_id": run_id,
-            "started_utc": _utc_iso(started),
-            "finished_utc": _utc_iso(finished),
-            "duration_seconds": round((finished - started).total_seconds(), 3),
-            "scanner_version": scanner_version,
-            "configuration_fingerprint": config_fingerprint,
-            "request_pacing_seconds": max(PACING_SECONDS, monitor.GECKO_POSITION_INTERVAL_SECONDS),
-            "watchlist_source": str(watchlist_path),
-            "watchlist_sha256": watchlist_sha256,
-            "selected_candidate_count": len(positions),
-            "requests_started": request_count,
-            "record_count": sequence,
-            "record_status_counts": dict(sorted(counts.items())),
-            "source_access": "read-only",
-            "provider_rate_limit": provider_rate_metadata,
-            "provider_response": provider_response_metadata,
-            "output_file": "observations.jsonl",
-            "metrics_supported_by_complete_hourly_bars": [
-                "candle-level observed target presence from high values, if forecast baseline and complete hourly coverage are available",
-                "hourly-bar-resolution adverse excursion from low values, if complete coverage is available",
-                "endpoint mark paths from close values and event-time timestamps",
-            ],
-            "metrics_still_unsupported": [
-                "exact intrahour target-crossing time or ordering when multiple levels occur in one hourly candle",
-                "target-touch claims across missing or incomplete candle coverage",
-                "executable fills, fees, slippage, and quote-adjusted returns",
-                "instantaneous price/liquidity at the collector's received timestamp; adapters return completed hourly bars",
-            ],
-        }
-        temp_manifest = run_dir / "manifest.json.tmp"
-        temp_manifest.write_text(
-            json.dumps(manifest, indent=2, ensure_ascii=False, sort_keys=True) + "\n",
-            encoding="utf-8",
-        )
-        temp_manifest.replace(run_dir / "manifest.json")
+        if lease_health_failed:
+            stop_status = "FAILED"
+        if stop_status not in ("INTERRUPTED", "FAILED"):
+            check_lease_health()
+            try:
+                actual_record_count, conflicting_record_count = run_contract.count_jsonl_records(
+                    run_dir / "observations.jsonl", run_id
+                )
+            except run_contract.ResearchRunError:
+                actual_record_count, conflicting_record_count = None, None
+                stop_status = "FAILED"
+            if conflicting_record_count or actual_record_count != sequence:
+                stop_status = "FAILED"
+            manifest = {
+                "schema": "crypto-prebreakout.watchlist-observation-manifest.v1",
+                "run_lifecycle_schema": "rocket-hunter.research-run.v1",
+                "activity_run_id": run_id,
+                "collector_version": COLLECTOR_VERSION,
+                "status": stop_status,
+                "collection_run_id": run_id,
+                "started_utc": _utc_iso(started),
+                "finished_utc": _utc_iso(finished),
+                "duration_seconds": round((finished - started).total_seconds(), 3),
+                "scanner_version": scanner_version,
+                "configuration_fingerprint": config_fingerprint,
+                "request_pacing_seconds": max(PACING_SECONDS, monitor.GECKO_POSITION_INTERVAL_SECONDS),
+                "watchlist_source": str(watchlist_path),
+                "watchlist_sha256": watchlist_sha256,
+                "selected_candidate_count": len(positions),
+                "requests_started": request_count,
+                "record_count": actual_record_count if actual_record_count is not None else sequence,
+                "attempted_record_count": sequence,
+                "actual_record_count": actual_record_count,
+                "record_count_validation": (
+                    "MATCH" if actual_record_count is not None and not conflicting_record_count
+                    else "FAILED"
+                ),
+                "conflicting_run_id_record_count": conflicting_record_count,
+                "record_status_counts": dict(sorted(counts.items())),
+                "source_access": "read-only",
+                "provider_rate_limit": provider_rate_metadata,
+                "provider_response": provider_response_metadata,
+                "output_file": "observations.jsonl",
+                "metrics_supported_by_complete_hourly_bars": [
+                    "candle-level observed target presence from high values, if forecast baseline and complete hourly coverage are available",
+                    "hourly-bar-resolution adverse excursion from low values, if complete coverage is available",
+                    "endpoint mark paths from close values and event-time timestamps",
+                ],
+                "metrics_still_unsupported": [
+                    "exact intrahour target-crossing time or ordering when multiple levels occur in one hourly candle",
+                    "target-touch claims across missing or incomplete candle coverage",
+                    "executable fills, fees, slippage, and quote-adjusted returns",
+                    "instantaneous price/liquidity at the collector's received timestamp; adapters return completed hourly bars",
+                ],
+            }
+            if stop_status != "FAILED":
+                check_lease_health()
+                temp_manifest = run_dir / "manifest.json.tmp"
+                temp_manifest.write_text(
+                    json.dumps(manifest, indent=2, ensure_ascii=False, sort_keys=True) + "\n",
+                    encoding="utf-8",
+                )
+                temp_manifest.replace(run_dir / "manifest.json")
     print(f"Collection {stop_status}: {request_count} requests, {sequence} observation records; {run_dir}")
     return run_dir
+
+
+def collect(
+    args,
+    *,
+    now_fn=_utc_now,
+    sleep_fn=time.sleep,
+    fetch_fn=None,
+    rate_limit_fn=shared_rate_limit,
+) -> Path | None:
+    if args.dry_run:
+        return _collect(
+            args, now_fn=now_fn, sleep_fn=sleep_fn, fetch_fn=fetch_fn,
+            rate_limit_fn=rate_limit_fn,
+        )
+    output_root = Path(args.output_root)
+    memory_dir = Path(args.memory_dir)
+    _ensure_disjoint_paths(memory_dir, output_root)
+    activity_db = Path(args.activity_db)
+    run_contract.ensure_activity_db_disjoint(activity_db, [
+        memory_dir, output_root, DEFAULT_EXPORTS, DEFAULT_ANALYSIS, DEFAULT_RUNS,
+    ])
+    run_id = f"{now_fn().strftime('%Y%m%dT%H%M%SZ')}-{uuid.uuid4().hex[:12]}"
+    lease = run_contract.ResearchRunLease(
+        activity_db, run_id, "watchlist-collector",
+        int(args.duration_minutes * 60),
+    ).acquire()
+    try:
+        run_dir = _collect(
+            args, now_fn=now_fn, sleep_fn=sleep_fn, fetch_fn=fetch_fn,
+            rate_limit_fn=rate_limit_fn, run_id=run_id,
+            lease_health_check=lease.check_health,
+        )
+        manifest_path = run_dir / "manifest.json" if run_dir is not None else None
+        if manifest_path is None or not manifest_path.is_file():
+            lease.finish(
+                "INTERRUPTED",
+                "collector output is incomplete; session remains manifestless and pending",
+            )
+        else:
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            lease.finish(str(manifest.get("status") or "FAILED"))
+        return run_dir
+    except BaseException as exc:
+        lease.finish(
+            "INTERRUPTED" if isinstance(exc, KeyboardInterrupt) else "FAILED",
+            f"{type(exc).__name__}: {exc}",
+        )
+        raise
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
@@ -821,6 +918,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--watchlist", type=Path, default=None,
                         help="read-only watchlist JSON; defaults to active-24h-watchlist.json")
     parser.add_argument("--output-root", type=Path, default=DEFAULT_OUTPUT_ROOT)
+    parser.add_argument("--activity-db", type=Path, default=run_contract.DEFAULT_ACTIVITY_DB,
+                        help="shared SQLite scanner/collector lifecycle database")
     parser.add_argument("--duration-minutes", type=int, default=60,
                         help=f"foreground session duration, {MIN_DURATION_MINUTES}-{MAX_DURATION_MINUTES} minutes")
     parser.add_argument("--interval-seconds", type=int, default=300,
@@ -851,6 +950,9 @@ def main(argv: list[str] | None = None) -> int:
         parser.error(f"--max-requests must be 1-{MAX_REQUESTS}")
     try:
         collect(args)
+    except run_contract.ResearchRunError as exc:
+        print(f"Watchlist collection blocked: {exc}", file=sys.stderr)
+        return 2
     except CollectorError as exc:
         print(f"Watchlist collection failed: {exc}", file=sys.stderr)
         return 2

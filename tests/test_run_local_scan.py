@@ -12,6 +12,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from scripts import run_local_scan
+from scripts import research_run_contract as run_contract
 
 
 def write_rows(path, rows):
@@ -22,6 +23,12 @@ def write_rows(path, rows):
 
 
 class LocalRunMemoryTests(unittest.TestCase):
+    def test_isolated_output_mode_is_available_for_controlled_runs(self):
+        args = run_local_scan.build_arg_parser().parse_args([
+            "--outdir", "run-test", "--isolated-output",
+        ])
+        self.assertTrue(args.isolated_output)
+
     def test_local_scan_defaults_keep_gecko_discovery_bounded(self):
         args = run_local_scan.build_arg_parser().parse_args(["--outdir", "run-test"])
         self.assertEqual(args.gecko_pages, 1)
@@ -43,6 +50,28 @@ class LocalRunMemoryTests(unittest.TestCase):
             with self.assertRaises(SystemExit) as raised:
                 run_local_scan.main(["--outdir", "run-test", "--workers", "13"])
         self.assertEqual(raised.exception.code, 2)
+
+    def test_duplicate_shared_run_blocks_scan_before_creating_output(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            activity_db = root / "activity.sqlite3"
+            outdir = root / "scan-output"
+            memory = root / "scanner-memory"
+            memory.mkdir()
+            active = run_contract.ResearchRunLease(
+                activity_db, "collector-run", "watchlist-collector", 120,
+                heartbeat_seconds=100, stale_after_seconds=110,
+            ).acquire()
+            try:
+                result = run_local_scan.main([
+                    "--outdir", str(outdir),
+                    "--memory-dir", str(memory),
+                    "--activity-db", str(activity_db),
+                ])
+                self.assertEqual(result, 2)
+                self.assertFalse(outdir.exists())
+            finally:
+                active.finish("COMPLETED")
 
     def test_concurrent_snapshot_merge_unions_ledgers_and_rebuilds_calibration(self):
         with tempfile.TemporaryDirectory() as tmp:

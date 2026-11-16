@@ -14,6 +14,11 @@ import zlib
 from pathlib import Path
 from typing import Any
 
+try:
+    from scripts import research_run_contract as run_contract
+except ImportError:
+    import research_run_contract as run_contract
+
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_MEMORY = ROOT / "rocket-hunter-data" / "scanner-memory"
 DEFAULT_OBSERVATIONS = ROOT / "rocket-hunter-data" / "research-data" / "watchlist-observations"
@@ -83,37 +88,34 @@ def _forecast_files(memory_dir: Path) -> list[Path]:
 
 def _observation_sources(
     observation_root: Path,
-) -> tuple[list[Path], list[Path], dict[Path, dict[str, Any]]]:
+) -> tuple[list[Path], list[Path], dict[Path, dict[str, Any]], list[str]]:
     if not observation_root.exists():
-        return [], [], {}
+        return [], [], {}, []
     if observation_root.is_symlink() or not observation_root.is_dir():
         raise AnalysisError(f"observation source must be a regular directory: {observation_root}")
 
     manifests = []
     observations = []
     manifest_by_observation = {}
+    pending_sessions = []
     for run_dir in sorted(observation_root.glob("collection-*"), key=lambda item: str(item)):
         if run_dir.is_symlink() or not run_dir.is_dir():
             continue
         manifest_path = run_dir / "manifest.json"
         if not manifest_path.exists():
+            pending_sessions.append(f"{run_dir.name} (manifest unavailable)")
             continue
-        if manifest_path.is_symlink() or not manifest_path.is_file():
-            raise AnalysisError(f"collection manifest must be a regular file: {manifest_path}")
         try:
-            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
-            raise AnalysisError(f"cannot read collection manifest: {manifest_path}") from exc
-        if not isinstance(manifest, dict):
-            raise AnalysisError(f"collection manifest must contain an object: {manifest_path}")
+            contract = run_contract.read_collection_manifest(manifest_path)
+        except run_contract.CollectionManifestError as exc:
+            raise AnalysisError(str(exc)) from exc
+        manifest = contract["manifest"]
         manifests.append(manifest_path)
-
-        collection_run_id = manifest.get("collection_run_id")
-        record_count = manifest.get("record_count")
-        if not isinstance(collection_run_id, str) or not collection_run_id:
-            raise AnalysisError(f"collection manifest has no collection_run_id: {manifest_path}")
-        if isinstance(record_count, bool) or not isinstance(record_count, int) or record_count < 0:
-            raise AnalysisError(f"collection manifest has invalid record_count: {manifest_path}")
+        if not contract["finalized"]:
+            pending_sessions.append(f"{run_dir.name} ({contract['status']})")
+            continue
+        collection_run_id = contract["run_id"]
+        record_count = contract["record_count"]
         output_file = manifest.get("output_file", "observations.jsonl")
         if not isinstance(output_file, str) or not output_file:
             raise AnalysisError(f"invalid collection output_file in {run_dir.name}")
@@ -135,18 +137,24 @@ def _observation_sources(
             "collection_run_id": collection_run_id,
             "record_count": record_count,
             "present": present,
+            "status": contract["status"],
+            "evidence_status": contract["evidence_status"],
         }
+        if contract["status"] == "FAILED":
+            continue
         if not present:
             continue
         if not observation_path.is_file():
             raise AnalysisError(f"collection observation source must be a regular file: {observation_path}")
         observations.append(observation_path)
-    return manifests, observations, manifest_by_observation
+    return manifests, observations, manifest_by_observation, pending_sessions
 
 
 def _source_snapshot(memory_dir: Path, observation_root: Path):
     forecast_files = _forecast_files(memory_dir)
-    manifest_files, observation_files, manifest_by_observation = _observation_sources(observation_root)
+    manifest_files, observation_files, manifest_by_observation, pending_sessions = (
+        _observation_sources(observation_root)
+    )
     files = []
     stats = {}
     digest = hashlib.sha256()
@@ -168,7 +176,7 @@ def _source_snapshot(memory_dir: Path, observation_root: Path):
             digest.update(_json_text(item).encode("utf-8"))
     return (
         forecast_files, manifest_files, observation_files, manifest_by_observation,
-        stats, files, digest.hexdigest(),
+        pending_sessions, stats, files, digest.hexdigest(),
     )
 
 
@@ -176,7 +184,7 @@ def _verify_source_snapshot(memory_dir, observation_root, forecast_files, manife
                             observation_files, stats):
     if _forecast_files(memory_dir) != forecast_files:
         raise AnalysisError("forecast partition list changed during analysis")
-    current_manifests, current_observations, _ = _observation_sources(observation_root)
+    current_manifests, current_observations, _, _ = _observation_sources(observation_root)
     if current_manifests != manifest_files:
         raise AnalysisError("collection manifest list changed during analysis")
     if current_observations != observation_files:
@@ -279,14 +287,23 @@ def _read_observations(
         manifest["record_count"] for manifest in manifest_by_observation.values()
     )
     for manifest in manifest_by_observation.values():
+        if manifest.get("status") == "FAILED":
+            counters["collection_evidence_state:FAILED"] += 1
+            continue
         if not manifest["present"]:
             counters["observation_files_missing"] += 1
             counters["observation_records_missing_from_manifest_count"] += manifest["record_count"]
+            counters["collection_evidence_state:MISSING"] += 1
     for path in paths:
         manifest = manifest_by_observation[path]
         declared_count = manifest["record_count"]
         collection_run_id = manifest["collection_run_id"]
         source_record_count = 0
+        conflicting_records = 0
+        stale_records = 0
+        failed_records = 0
+        session_records = []
+        session_as_of_candidates = []
         try:
             with path.open("r", encoding="utf-8") as stream:
                 for line in stream:
@@ -296,17 +313,21 @@ def _read_observations(
                     counters["observation_source_records"] += 1
                     if source_record_count > declared_count:
                         counters["observation_records_beyond_manifest_count"] += 1
+                        conflicting_records += 1
                         continue
                     try:
                         record = json.loads(line)
                     except json.JSONDecodeError:
                         counters["observation_malformed_json"] += 1
+                        failed_records += 1
                         continue
                     if not isinstance(record, dict):
                         counters["observation_non_object_records"] += 1
+                        failed_records += 1
                         continue
                     if record.get("collection_run_id") != collection_run_id:
                         counters["observation_collection_run_id_mismatch"] += 1
+                        conflicting_records += 1
                         continue
                     if record.get("schema") != OBSERVATION_SCHEMA or record.get("record_type") != OBSERVATION_TYPE:
                         counters["observation_unsupported_schema"] += 1
@@ -317,17 +338,36 @@ def _read_observations(
                     for field in ("source_received_utc", "collected_utc"):
                         stamp = _parse_utc(record.get(field))
                         if stamp is not None:
-                            as_of_candidates.append(stamp)
+                            session_as_of_candidates.append(stamp)
                     if record.get("source_status") != OBSERVED_STATUS:
-                        counters[f"observation_status:{record.get('source_status') or 'MISSING'}"] += 1
+                        record_status = record.get("source_status") or "MISSING"
+                        counters[f"observation_status:{record_status}"] += 1
+                        stale_records += isinstance(record_status, str) and record_status.startswith("STALE")
+                        failed_records += record_status in {
+                            "FETCH_FAILED", "PROVIDER_ACCESS_DENIED",
+                            "PROVIDER_RATE_LIMITED", "SKIPPED_PROVIDER_COOLDOWN",
+                        }
                         continue
-                    records.append((record, str(path)))
-                    counters["observations_loaded"] += 1
+                    session_records.append((record, str(path)))
         except (OSError, UnicodeDecodeError):
             counters["observation_unreadable_files"] += 1
         if source_record_count < declared_count:
             counters["observation_records_missing_from_manifest_count"] += (
                 declared_count - source_record_count
+            )
+        evidence_status = run_contract.collection_evidence_status(
+            manifest["status"], declared_count, source_record_count,
+            finalized=True, file_present=True, conflicting_records=conflicting_records,
+            stale_records=stale_records, failed_records=failed_records,
+        )
+        counters[f"collection_evidence_state:{evidence_status}"] += 1
+        as_of_candidates.extend(session_as_of_candidates)
+        if evidence_status == "COMPLETE":
+            records.extend(session_records)
+            counters["observations_loaded"] += len(session_records)
+        else:
+            counters["observation_records_excluded_noncomplete_collection"] += (
+                len(session_records)
             )
     as_of = max(as_of_candidates) if as_of_candidates else None
     return records, as_of
@@ -778,6 +818,11 @@ def _make_report(forecasts, observation_records, as_of, bars_by_forecast,
             "observation_records_declared": counters["observation_records_declared"],
             "observations_loaded": len(observation_records),
             "observation_files_missing": counters["observation_files_missing"],
+            "pending_collection_sessions": counters["pending_collection_sessions"],
+            "failed_collection_sessions": counters["collection_evidence_state:FAILED"],
+            "stale_collection_sessions": counters["collection_evidence_state:STALE"],
+            "missing_collection_sessions": counters["collection_evidence_state:MISSING"],
+            "conflicting_collection_sessions": counters["collection_evidence_state:CONFLICTING"],
             "forecasts_with_reliable_core_identity": len(forecast_info),
             "forecasts_joined_to_observations": len(joinable_forecasts),
             "forecast_path_labels_reported": len(labels),
@@ -797,6 +842,11 @@ def _make_report(forecasts, observation_records, as_of, bars_by_forecast,
                                "bar_excluded:", "bars_outside_", "detection_overlapping_",
                                "forecasts_with_", "forecasts_without_", "total_", "eligible_",
                                "complete_window_", "target_"))
+        },
+        "collection_evidence_states": {
+            key.split(":", 1)[1]: value
+            for key, value in sorted(counters.items())
+            if key.startswith("collection_evidence_state:")
         },
         "candle_level_metrics": {
             "time_window_hours": WINDOW_HOURS,
@@ -947,7 +997,7 @@ def analyze_candles(
     memory_dir, observation_root, output_root = map(Path, (memory_dir, observation_root, output_root))
     _ensure_disjoint_paths(memory_dir, observation_root, output_root)
     (forecast_files, manifest_files, observation_files, manifest_by_observation,
-     stats, source_files, snapshot_id) = _source_snapshot(
+     pending_sessions, stats, source_files, snapshot_id) = _source_snapshot(
         memory_dir, observation_root
     )
     output_dir = output_root / f"candle-outcomes-v4-{snapshot_id[:24]}"
@@ -955,6 +1005,7 @@ def analyze_candles(
     if existing is not None:
         return existing
     counters: collections.Counter[str] = collections.Counter()
+    counters["pending_collection_sessions"] = len(pending_sessions)
     forecasts = _read_forecasts(forecast_files, counters)
     observation_records, as_of = _read_observations(
         observation_files, counters, manifest_by_observation

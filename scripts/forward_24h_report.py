@@ -673,15 +673,16 @@ def build_market_context(report, candidates, btc_macro=None):
 
 class GeckoThrottle:
     def __init__(self, interval=12.0):
-        self.interval = interval
+        self.interval = max(12.0, interval)
         self.last = 0.0
-        self.rate_limited = False
-        self.rate_limit_reason = None
+        self.stopped_status = None
+        self.stop_reason = None
 
     def get(self, url, timeout=10):
-        if self.rate_limited:
+        if self.stopped_status is not None:
             raise urllib.error.HTTPError(
-                url, 429, f"Too Many Requests (cached rate limit: {self.rate_limit_reason})", {}, None
+                url, self.stopped_status,
+                f"GeckoTerminal halted after HTTP {self.stopped_status}: {self.stop_reason}", {}, None
             )
         if self.last:
             wait = self.interval - (time.monotonic() - self.last)
@@ -691,9 +692,9 @@ class GeckoThrottle:
         try:
             return get_json(url, timeout)
         except urllib.error.HTTPError as exc:
-            if exc.code in (418, 429):
-                self.rate_limited = True
-                self.rate_limit_reason = f"HTTP {exc.code} rate limit from provider: {exc}"
+            if exc.code in (403, 418, 429):
+                self.stopped_status = exc.code
+                self.stop_reason = f"HTTP {exc.code} from provider"
             raise
 
 
@@ -1325,8 +1326,8 @@ def main(argv=None):
     parser.add_argument("--timeout", type=int, default=10)
     parser.add_argument("--gecko-interval", type=float, default=12.0)
     args = parser.parse_args(argv)
-    if args.dex_limit < 0 or args.cex_limit < 0 or args.timeout <= 0 or args.gecko_interval < 0:
-        parser.error("limits must be non-negative and timeout positive")
+    if args.dex_limit < 0 or args.cex_limit < 0 or args.timeout <= 0 or args.gecko_interval < 12:
+        parser.error("limits must be non-negative, timeout positive, and GeckoTerminal interval at least 12 seconds")
     try:
         report_path = Path(args.report)
         report = json.loads(report_path.read_text(encoding="utf-8"))

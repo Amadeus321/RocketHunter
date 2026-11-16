@@ -111,7 +111,7 @@ class ResearchReadinessTests(unittest.TestCase):
 
         self.assertEqual(result["usable_bars"], 1)
 
-    def test_counts_only_manifest_declared_records_with_matching_run_id(self):
+    def test_manifest_count_conflict_excludes_all_collection_records(self):
         manifest_path = self.run_dir / "manifest.json"
         manifest_path.write_text(json.dumps({
             "status": "COMPLETED",
@@ -138,7 +138,7 @@ class ResearchReadinessTests(unittest.TestCase):
 
         result = summarize(self.collections, self.analyses)
 
-        self.assertEqual(result["usable_bars"], 1)
+        self.assertEqual(result["usable_bars"], 0)
         self.assertEqual(result["status_counts"], {"OBSERVED": 1})
         self.assertEqual(result["excluded_observation_records"], {
             "beyond_manifest_record_count": 1,
@@ -148,10 +148,11 @@ class ResearchReadinessTests(unittest.TestCase):
             "beyond_manifest_record_count": 1,
             "collection_run_id_mismatch": 1,
         })
+        self.assertEqual(result["collections"][0]["evidence_status"], "CONFLICTING")
 
     def test_missing_observation_artifact_is_reported_without_inventing_zero_bars(self):
         (self.run_dir / "manifest.json").write_text(json.dumps({
-            "status": "FAILED",
+            "status": "ONE_CYCLE_COMPLETED",
             "record_count": 1,
             "collection_run_id": "fixture",
             "output_file": "observations.jsonl",
@@ -164,6 +165,7 @@ class ResearchReadinessTests(unittest.TestCase):
         self.assertEqual(result["usable_bars"], 0)
         self.assertEqual(result["missing_observation_files"], 1)
         self.assertEqual(result["missing_observation_records"], 1)
+        self.assertEqual(result["collections"][0]["evidence_status"], "MISSING")
         self.assertTrue(any("declare records" in item for item in result["blockers"]))
         self.assertIn("Missing observation files: 1 (1 with manifest-declared records)", text)
 
@@ -193,11 +195,50 @@ class ResearchReadinessTests(unittest.TestCase):
         self.assertEqual(result["usable_bars"], 0)
         self.assertEqual(
             {item["directory"] for item in result["collections"]},
-            {"collection-fixture"},
+            {
+                "collection-fixture", "collection-in-progress",
+                "collection-without-manifest",
+            },
+        )
+        self.assertEqual(
+            {item["evidence_status"] for item in result["collections"]
+             if item["directory"] != "collection-fixture"},
+            {"PENDING"},
         )
         self.assertTrue(any("in-progress" in item.lower() for item in result["blockers"]))
         self.assertTrue(any("manifest" in item.lower() for item in result["blockers"]))
         self.assertIn("not target misses", text)
+
+    def test_terminal_failed_collection_is_reported_but_never_supplies_bars(self):
+        failed = self.collections / "collection-failed"
+        failed.mkdir()
+        (failed / "manifest.json").write_text(json.dumps({
+            "status": "FAILED",
+            "record_count": 1,
+            "collection_run_id": "failed-run",
+            "output_file": "observations.jsonl",
+        }), encoding="utf-8")
+        observed = {
+            "collection_run_id": "failed-run",
+            "source_status": "OBSERVED",
+            "source_received_utc": "2026-11-09T15:00:00Z",
+            "source_evidence": {"bars": [{
+                "time_open": "2026-11-09T13:00:00Z",
+                "time_close": "2026-11-09T14:00:00Z",
+                "high": 12, "low": 8, "close": 10,
+            }]},
+        }
+        (failed / "observations.jsonl").write_text(
+            json.dumps(observed) + "\n", encoding="utf-8"
+        )
+
+        result = summarize(self.collections, self.analyses)
+
+        summary = next(item for item in result["collections"]
+                       if item["directory"] == "collection-failed")
+        self.assertEqual(summary["evidence_status"], "FAILED")
+        self.assertEqual(summary["usable_bars"], 0)
+        self.assertEqual(result["usable_bars"], 0)
 
     def test_displays_cooldown_only_when_persisted(self):
         cooldown = {

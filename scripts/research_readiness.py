@@ -10,20 +10,15 @@ from collections import Counter
 from pathlib import Path
 from typing import Any
 
+try:
+    from scripts import research_run_contract as run_contract
+except ImportError:
+    import research_run_contract as run_contract
+
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_COLLECTION_ROOT = ROOT / "rocket-hunter-data" / "research-data" / "watchlist-observations"
 DEFAULT_ANALYSIS_ROOT = ROOT / "rocket-hunter-data" / "research-analysis"
-FINAL_COLLECTION_STATUSES = {
-    "COMPLETED",
-    "DURATION_ELAPSED",
-    "FAILED",
-    "INTERRUPTED",
-    "ONE_CYCLE_COMPLETED",
-    "PROVIDER_ACCESS_DENIED",
-    "PROVIDER_COOLDOWN_ACTIVE",
-    "PROVIDER_RATE_LIMITED",
-    "REQUEST_LIMIT_REACHED",
-}
+FINAL_COLLECTION_STATUSES = run_contract.FINAL_COLLECTION_STATUSES
 
 
 class ReadinessError(RuntimeError):
@@ -115,23 +110,64 @@ def _collection_summaries(
         manifest_path = run_dir / "manifest.json"
         if not manifest_path.is_file():
             pending_sessions.append(f"{run_dir.name} (manifest unavailable)")
+            summaries.append({
+                "directory": run_dir.name,
+                "status": "PENDING_FINALIZATION",
+                "evidence_status": "PENDING",
+                "finished_utc": None,
+                "record_count": None,
+                "requests_started": None,
+                "usable_bars": None,
+                "statuses": {},
+                "observations_available": False,
+            })
             continue
-        manifest = _read_object(manifest_path)
-        lifecycle_status = manifest.get("status")
-        if lifecycle_status not in FINAL_COLLECTION_STATUSES:
+        try:
+            contract = run_contract.read_collection_manifest(manifest_path)
+        except run_contract.CollectionManifestError as exc:
+            raise ReadinessError(str(exc)) from exc
+        manifest = contract["manifest"]
+        lifecycle_status = contract["status"]
+        if not contract["finalized"]:
             pending_sessions.append(f"{run_dir.name} ({lifecycle_status or 'unknown status'})")
+            summaries.append({
+                "directory": run_dir.name,
+                "status": lifecycle_status,
+                "evidence_status": "PENDING",
+                "finished_utc": manifest.get("finished_utc"),
+                "record_count": contract["record_count"],
+                "requests_started": manifest.get("requests_started"),
+                "usable_bars": None,
+                "statuses": {},
+                "observations_available": False,
+            })
             continue
-        declared_count = manifest.get("record_count")
-        if isinstance(declared_count, bool) or not isinstance(declared_count, int) or declared_count < 0:
-            raise ReadinessError(f"invalid record_count in collection manifest: {manifest_path}")
-        collection_run_id = manifest.get("collection_run_id")
-        if declared_count and (not isinstance(collection_run_id, str) or not collection_run_id):
-            raise ReadinessError(f"missing collection_run_id in non-empty manifest: {manifest_path}")
+        declared_count = contract["record_count"]
+        collection_run_id = contract["run_id"]
         observation_path = _safe_observation_path(run_dir, manifest)
+        if lifecycle_status == "FAILED":
+            summaries.append({
+                "directory": run_dir.name,
+                "status": lifecycle_status,
+                "evidence_status": "FAILED",
+                "finished_utc": manifest.get("finished_utc"),
+                "record_count": declared_count,
+                "requests_started": manifest.get("requests_started"),
+                "usable_bars": 0,
+                "statuses": {},
+                "observations_available": observation_path.exists(),
+                "excluded_records": {
+                    "failed_collection_observations_not_loaded": declared_count,
+                },
+            })
+            continue
         run_statuses: Counter[str] = Counter()
         run_excluded_records: Counter[str] = Counter()
         run_bars = 0
         source_record_count = 0
+        conflicting_records = 0
+        stale_records = 0
+        failed_records = 0
         observations_available = observation_path.exists()
         if not observations_available:
             missing_observation_files += 1
@@ -161,11 +197,17 @@ def _collection_summaries(
                         if record.get("collection_run_id") != collection_run_id:
                             excluded_records["collection_run_id_mismatch"] += 1
                             run_excluded_records["collection_run_id_mismatch"] += 1
+                            conflicting_records += 1
                             continue
                         status = record.get("source_status")
                         if isinstance(status, str):
                             statuses[status] += 1
                             run_statuses[status] += 1
+                            stale_records += status.startswith("STALE")
+                            failed_records += status in {
+                                "FETCH_FAILED", "PROVIDER_ACCESS_DENIED",
+                                "PROVIDER_RATE_LIMITED", "SKIPPED_PROVIDER_COOLDOWN",
+                            }
                         evidence = record.get("source_evidence")
                         bars = evidence.get("bars") if isinstance(evidence, dict) else None
                         if status == "OBSERVED" and isinstance(bars, list):
@@ -173,16 +215,26 @@ def _collection_summaries(
                                 _usable_hourly_bar(bar, record.get("source_received_utc"))
                                 for bar in bars
                             )
-                            usable_bars += count
                             run_bars += count
             except (OSError, UnicodeDecodeError) as exc:
                 raise ReadinessError(f"cannot read observations {observation_path}: {exc}") from exc
             if source_record_count < declared_count:
                 excluded_records["missing_manifest_declared_records"] += declared_count - source_record_count
                 run_excluded_records["missing_manifest_declared_records"] += declared_count - source_record_count
+        evidence_status = run_contract.collection_evidence_status(
+            lifecycle_status, declared_count, source_record_count,
+            finalized=True, file_present=observations_available,
+            conflicting_records=conflicting_records,
+            stale_records=stale_records, failed_records=failed_records,
+        )
+        if evidence_status == "COMPLETE":
+            usable_bars += run_bars
+        else:
+            run_bars = 0
         summaries.append({
             "directory": run_dir.name,
             "status": manifest.get("status", "UNKNOWN"),
+            "evidence_status": evidence_status,
             "finished_utc": manifest.get("finished_utc"),
             "record_count": declared_count,
             "requests_started": manifest.get("requests_started"),

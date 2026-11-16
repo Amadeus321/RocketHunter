@@ -1292,6 +1292,8 @@ def main() -> int:
     parser.add_argument("--input", required=True, type=Path, help="Final forward-watchlist JSON")
     parser.add_argument("--output", required=True, type=Path, help="Markdown output path")
     parser.add_argument("--html", type=Path, default=None, help="HTML output path")
+    parser.add_argument("--isolated-output", action="store_true",
+                        help="Do not update repository-root convenience reports")
     args = parser.parse_args()
 
     try:
@@ -1319,17 +1321,18 @@ def main() -> int:
     html_out.write_text(html_report, encoding="utf-8")
     print(f"Wrote finalized forward HTML watchlist: {html_out}")
 
-    root_html = ROOT / "forward-24h-rocket.html"
-    root_md = ROOT / "forward-24h-rocket.md"
-    try:
-        root_html.write_text(html_report, encoding="utf-8")
-        print(f"Updated root forward HTML watchlist: {root_html}")
-    except Exception as exc:
-        print(f"Warning: could not write root HTML: {exc}")
-    try:
-        root_md.write_text(report, encoding="utf-8")
-    except Exception:
-        pass
+    if not args.isolated_output:
+        root_html = ROOT / "forward-24h-rocket.html"
+        root_md = ROOT / "forward-24h-rocket.md"
+        try:
+            root_html.write_text(html_report, encoding="utf-8")
+            print(f"Updated root forward HTML watchlist: {root_html}")
+        except Exception as exc:
+            print(f"Warning: could not write root HTML: {exc}")
+        try:
+            root_md.write_text(report, encoding="utf-8")
+        except Exception:
+            pass
 
     return 0
 

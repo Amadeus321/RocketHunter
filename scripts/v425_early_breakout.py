@@ -49,7 +49,7 @@ LEGACY_EXTRA_TARGET_FIELDS = (
 )
 REQUEST_INTERVAL_SECONDS = 4.2
 GECKO_POSITION_ROOT = "https://api.geckoterminal.com/api/v2"
-GECKO_POSITION_INTERVAL_SECONDS = 6.2
+GECKO_POSITION_INTERVAL_SECONDS = 12.0
 GECKO_MAX_RETRY_AFTER_SECONDS = 7 * 24 * 60 * 60
 GECKO_POSITION_ALIASES = {
     "avalanche": "avax", "sui": "sui-network", "fantom": "ftm",
@@ -2233,10 +2233,47 @@ def classify_final_candidates(candidates: list[dict[str, Any]]) -> tuple[list[di
     return research_watchlist, []
 
 
+PHASE4_SCORE_SNAPSHOT_SCHEMA = "rocket-hunter.phase4-score-snapshot.v1"
+PHASE4_SCORE_SNAPSHOT_FIELDS = (
+    "early_breakout_score", "early_breakout_signal_version", "early_breakout_model_id",
+    "breakout_confluence_score", "breakout_engine_scores", "breakout_acceleration_signals",
+    "engine_evidence_status", "evidence_coverage_pct", "breakout_evidence_eligible",
+    "signal_engine_executed", "expected_return_engine_executed", "engine_result_status",
+    "expected_return_status", "engine_failure_module", "engine_exception_category",
+    "engine_failure_diagnostic", "probability_tp_hit_24h_pct",
+    "expected_net_24h_return_pct", "potential_mfe_24h_pct", "potential_mae_24h_pct",
+    "estimated_hours_to_target", "reversal_risk_score", "realistic_opportunity_rank",
+    "entry_decision", "qualification_blockers", "safety_verified",
+    "dex_loss_guard_status", "quote_status", "source", "source_url",
+    "data_timestamp_utc", "retrieved_utc",
+)
+
+
+def _phase4_score_snapshot(candidate: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "schema": PHASE4_SCORE_SNAPSHOT_SCHEMA,
+        **{field: candidate.get(field) for field in PHASE4_SCORE_SNAPSHOT_FIELDS},
+    }
+
+
+def _phase4_source_provenance(candidate: dict[str, Any],
+                              scan_status: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "scanner_version": scan_status.get("scanner_version"),
+        "configuration_fingerprint": scan_status.get("configuration_fingerprint"),
+        "source_run_id": scan_status.get("run_id"),
+        "source_event_utc": candidate.get("data_timestamp_utc"),
+        "source_received_utc": candidate.get("retrieved_utc"),
+    }
+
+
 def update_position_monitor(outdir: Path, memory_dir: Path, run_id: str) -> dict[str, Any]:
     forward_path = outdir / "forward-24h-rocket.json"
     forward = _load_json(forward_path, {})
     report = _load_json(outdir / "rocket-hunt.json", {})
+    scan_status = _load_json(outdir / "scan-status.json", {})
+    if not isinstance(scan_status, dict):
+        scan_status = {}
     if not isinstance(forward, dict):
         return {"status": "FORWARD_REPORT_MISSING"}
     forward = apply_forward_opportunity_ranking(forward, report)
@@ -2265,6 +2302,7 @@ def update_position_monitor(outdir: Path, memory_dir: Path, run_id: str) -> dict
     # spot OHLCV. No quote-symbol whitelist can hide a good altcoin opportunity.
     updated = []
     gecko_last_request = 0.0
+    gecko_stopped_status = None
     request_count = 0
     monitor_rows = sorted(
         existing_by_key.values(),
@@ -2282,12 +2320,23 @@ def update_position_monitor(outdir: Path, memory_dir: Path, run_id: str) -> dict
             continue
         market_type = str(position.get("market_type") or ("dex_pool" if position.get("pool_address") else "cex_spot")).lower()
         if market_type == "dex_pool":
-            wait = GECKO_POSITION_INTERVAL_SECONDS - (time.monotonic() - gecko_last_request) if gecko_last_request else 0
-            if wait > 0:
-                time.sleep(wait)
-            bars, candle_url, error = _fetch_gecko_position_bars(position, timeout=8)
-            gecko_last_request = time.monotonic()
-            request_count += 1
+            if gecko_stopped_status is not None:
+                bars, candle_url = [], None
+                error = "GeckoTerminal polling stopped after HTTP %s" % gecko_stopped_status
+            else:
+                wait = GECKO_POSITION_INTERVAL_SECONDS - (time.monotonic() - gecko_last_request) if gecko_last_request else 0
+                if wait > 0:
+                    time.sleep(wait)
+                bars, candle_url, error, provider_metadata = _fetch_gecko_position_bars_with_metadata(
+                    position, timeout=8
+                )
+                gecko_last_request = time.monotonic()
+                request_count += 1
+                if (
+                    isinstance(provider_metadata, dict)
+                    and provider_metadata.get("http_status") in (403, 418, 429)
+                ):
+                    gecko_stopped_status = provider_metadata["http_status"]
             position["ohlcv_source"] = "GeckoTerminal exact tracked-token USD OHLCV"
         else:
             bars, candle_url, error = _fetch_cex_position_bars(position, venue_adapters, cex_fx, now)
@@ -2325,6 +2374,8 @@ def update_position_monitor(outdir: Path, memory_dir: Path, run_id: str) -> dict
             existing["latest_early_breakout_score"] = candidate.get("early_breakout_score")
             existing["latest_forecast_rank"] = candidate.get("forecast_rank")
             existing["latest_forward_opportunity_rank"] = candidate.get("forward_opportunity_rank")
+            existing["latest_phase4_score_snapshot"] = _phase4_score_snapshot(candidate)
+            existing["latest_source_provenance"] = _phase4_source_provenance(candidate, scan_status)
             continue
         if len(by_key) >= MAX_MONITORED_POSITIONS or new_positions >= MAX_NEW_POSITIONS_PER_SCAN:
             break
@@ -2408,6 +2459,8 @@ def update_position_monitor(outdir: Path, memory_dir: Path, run_id: str) -> dict
             "research_only": True,
             "execution_status": "NO WALLET OR TRADE EXECUTION",
             "created_run_id": str(run_id),
+            "phase4_score_snapshot": _phase4_score_snapshot(candidate),
+            "source_provenance": _phase4_source_provenance(candidate, scan_status),
         }
         by_key[key] = record
         new_positions += 1
@@ -2421,6 +2474,15 @@ def update_position_monitor(outdir: Path, memory_dir: Path, run_id: str) -> dict
     state_out = {
         "schema": "crypto-prebreakout.active-24h-watchlist.v2",
         "provider_version": VERSION,
+        "scanner_version": scan_status.get("scanner_version"),
+        "configuration_fingerprint": scan_status.get("configuration_fingerprint"),
+        "source_scan_run_id": scan_status.get("run_id"),
+        "source_provenance_status": (
+            "PRESENT" if scan_status.get("scanner_version")
+            and scan_status.get("configuration_fingerprint")
+            and scan_status.get("run_id") == str(run_id)
+            else "MISSING_OR_MISMATCHED"
+        ),
         "updated_utc": utc_now(),
         "run_id": str(run_id),
         "max_positions": MAX_MONITORED_POSITIONS,

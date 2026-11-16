@@ -70,7 +70,7 @@ def _num(value):
         return None
 
 
-def _json_get(url, headers=None, timeout=10, retries=2):
+def _json_get(url, headers=None, timeout=10, retries=2, stop_statuses=()):
     VERSION = (Path(__file__).resolve().parents[1] / "VERSION").read_text(encoding="utf-8").strip()
     req_headers = {"User-Agent": "crypto-prebreakout-research-post-audit/%s" % VERSION,
                    "Accept": "application/json"}
@@ -85,6 +85,10 @@ def _json_get(url, headers=None, timeout=10, retries=2):
                 return json.loads(body), {"ok": True, "status": response.status, "error": None,
                                           "url": url, "attempts": attempts, "retrieved_utc": utc_now()}
         except urllib.error.HTTPError as exc:
+            if exc.code in stop_statuses:
+                return None, {"ok": False, "status": exc.code,
+                              "error": "HTTP %s (stopped by provider policy)" % exc.code,
+                              "url": url, "attempts": attempts, "retrieved_utc": utc_now()}
             retryable = exc.code in (418, 429) or 500 <= exc.code <= 599
             if retryable and attempts <= retries:
                 delay = None
@@ -263,6 +267,8 @@ def audit_gecko_spot_cvd(report, limit=8, timeout=10, interval_seconds=12.0):
                        "cronos": "cro", "sei": "sei-network"}
     audited, logs = [], []
     last_completed = None
+    stopped_status = None
+    interval_seconds = max(12.0, float(interval_seconds))
     for row in candidates:
         network = str(row.get("chain") or "").lower()
         network = network_aliases.get(network, network)
@@ -271,6 +277,15 @@ def audit_gecko_spot_cvd(report, limit=8, timeout=10, interval_seconds=12.0):
                 "contract_address": row.get("contract_address"), "pool_address": pool,
                 "quality_gate": (row.get("quality_gate") or {}).get("status"),
                 "retrieved_utc": utc_now()}
+        if stopped_status is not None:
+            item.update({
+                "status": "UNVERIFIED",
+                "reason": "GeckoTerminal polling stopped after HTTP %s" % stopped_status,
+                "http_status": stopped_status,
+                "sampled_trade_count": 0,
+            })
+            audited.append(item)
+            continue
         if not network or not pool:
             item.update({"status": "UNVERIFIED", "reason": "Exact network slug or pool address is missing."})
             audited.append(item)
@@ -283,9 +298,14 @@ def audit_gecko_spot_cvd(report, limit=8, timeout=10, interval_seconds=12.0):
         url = "%s/networks/%s/pools/%s/trades?%s" % (
             "https://api.geckoterminal.com/api/v2", urllib.parse.quote(network, safe=""),
             urllib.parse.quote(pool, safe=""), params)
-        payload, log = _json_get(url, timeout=timeout, retries=2)
+        payload, log = _json_get(
+            url, headers={"Accept": "application/json;version=20230203"},
+            timeout=timeout, retries=0, stop_statuses=(403, 418, 429),
+        )
         last_completed = time.monotonic()
         logs.append(log)
+        if log.get("status") in (403, 418, 429):
+            stopped_status = log["status"]
         trades = payload.get("data", []) if isinstance(payload, dict) else []
         if not isinstance(trades, list) or not trades:
             item.update({"status": "UNVERIFIED", "reason": log.get("error") or "No recent trade data returned.",

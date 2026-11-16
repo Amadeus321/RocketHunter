@@ -1,9 +1,11 @@
 import unittest
 from unittest.mock import patch
+import urllib.error
 
 from scripts.forward_24h_report import (
     build_market_context,
     derive_risk_metrics,
+    GeckoThrottle,
     fetch_dex_market,
     resolve_gecko_token_orientation,
     fetch_btc_macro_context,
@@ -46,6 +48,22 @@ class _FakeThrottle:
 
 
 class Forward24hOrientationTests(unittest.TestCase):
+    def test_gecko_throttle_enforces_minimum_and_stops_on_access_or_rate_limit(self):
+        for status in (403, 418, 429):
+            with self.subTest(status=status):
+                throttle = GeckoThrottle(interval=1)
+                self.assertEqual(throttle.interval, 12.0)
+                error = urllib.error.HTTPError(
+                    "https://api.geckoterminal.com/test", status, "blocked", {}, None
+                )
+                with patch("scripts.forward_24h_report.get_json", side_effect=error) as get_json:
+                    with self.assertRaises(urllib.error.HTTPError):
+                        throttle.get("https://api.geckoterminal.com/test")
+                    with self.assertRaises(urllib.error.HTTPError) as repeated:
+                        throttle.get("https://api.geckoterminal.com/second")
+                self.assertEqual(repeated.exception.code, status)
+                get_json.assert_called_once()
+
 
     def test_pool_token_matching_respects_case_sensitive_solana_mints(self):
         payload = {

@@ -47,7 +47,7 @@ class StatusDashboardTests(unittest.TestCase):
             "scan_finished_utc": "2026-11-08T12:01:00Z",
         })
         self._write_json(self.collections / "manifest.json", {
-            "status": "PROVIDER_RATE_LIMITED",
+            "status": "COMPLETED",
             "started_utc": "2026-11-09T12:59:00Z",
             "finished_utc": "2026-11-09T13:00:00Z",
             "record_count": 1,
@@ -135,13 +135,14 @@ class StatusDashboardTests(unittest.TestCase):
         self.assertNotIn("<img src=x", report)
         self.assertNotIn("https://", report)
 
-    def test_available_bar_total_survives_empty_failed_collection_artifact(self):
+    def test_empty_finalized_collection_does_not_invent_missing_records(self):
         self._write_inputs()
         empty_run = self.collections.parent / "collection-empty"
         empty_run.mkdir()
         self._write_json(empty_run / "manifest.json", {
-            "status": "FAILED",
+            "status": "ONE_CYCLE_COMPLETED",
             "record_count": 0,
+            "collection_run_id": "empty",
             "requests_started": 0,
             "output_file": "observations.jsonl",
         })
@@ -152,6 +153,7 @@ class StatusDashboardTests(unittest.TestCase):
         self.assertEqual(summary["usable_bars"], 1)
         self.assertEqual(summary["missing_observation_files"], 1)
         self.assertEqual(summary["missing_observation_records"], 0)
+        self.assertEqual(summary["collections"][0]["evidence_status"], "COMPLETE")
         self.assertNotIn("<h2>Collection sessions</h2>", report)
 
     def test_unfinalized_collection_observations_are_not_read(self):
@@ -174,6 +176,7 @@ class StatusDashboardTests(unittest.TestCase):
 
         active = next(item for item in summary["collections"] if item["directory"] == "collection-active")
         self.assertEqual(active["lifecycle"], "Not finalized; observations not read")
+        self.assertEqual(active["evidence_status"], "PENDING")
         self.assertIsNone(active["usable_bars"])
         self.assertEqual(summary["pending_observation_sessions"], 1)
 
@@ -193,6 +196,7 @@ class StatusDashboardTests(unittest.TestCase):
             if item["directory"] == "collection-interrupted"
         )
         self.assertEqual(pending["status"], "PENDING_FINALIZATION")
+        self.assertEqual(pending["evidence_status"], "PENDING")
         self.assertEqual(
             pending["lifecycle"],
             "Not finalized; manifest unavailable; observations not read",
@@ -201,6 +205,40 @@ class StatusDashboardTests(unittest.TestCase):
         self.assertIsNone(pending["usable_bars"])
         self.assertFalse(pending["observations_available"])
         self.assertEqual(summary["pending_observation_sessions"], 1)
+
+    def test_terminal_failed_collection_bars_are_excluded_from_usable_coverage(self):
+        self._write_inputs()
+        failed = self.collections.parent / "collection-failed"
+        failed.mkdir()
+        self._write_json(failed / "manifest.json", {
+            "status": "FAILED",
+            "started_utc": "2026-11-09T12:59:00Z",
+            "finished_utc": "2026-11-09T13:00:00Z",
+            "record_count": 1,
+            "collection_run_id": "failed-run",
+            "output_file": "observations.jsonl",
+        })
+        failed_observation = {
+            "collection_run_id": "failed-run",
+            "source_status": "OBSERVED",
+            "source_received_utc": "2026-11-09T15:00:00Z",
+            "source_evidence": {"bars": [{
+                "time_open": "2026-11-09T13:00:00Z",
+                "time_close": "2026-11-09T14:00:00Z",
+                "high": 12, "low": 8, "close": 10,
+            }]},
+        }
+        (failed / "observations.jsonl").write_text(
+            json.dumps(failed_observation) + "\n", encoding="utf-8"
+        )
+
+        summary = summarize(self.root)
+
+        failed_summary = next(item for item in summary["collections"]
+                              if item["directory"] == "collection-failed")
+        self.assertEqual(failed_summary["evidence_status"], "FAILED")
+        self.assertEqual(failed_summary["usable_bars"], 0)
+        self.assertEqual(summary["usable_bars"], 1)
 
     def test_missing_values_are_unknown_or_unavailable_not_zero_misses(self):
         summary = summarize(self.root)
@@ -234,13 +272,16 @@ class StatusDashboardTests(unittest.TestCase):
 
     def test_refuses_collection_output_path_escape(self):
         self._write_json(self.collections / "manifest.json", {
+            "status": "ONE_CYCLE_COMPLETED",
+            "collection_run_id": "escape",
+            "record_count": 1,
             "output_file": "..\\..\\..\\outside.jsonl",
         })
 
         with self.assertRaises(DashboardError):
             summarize(self.root)
 
-    def test_counts_only_manifest_declared_records_with_matching_run_id(self):
+    def test_manifest_count_conflict_excludes_all_collection_records(self):
         self._write_inputs()
         self._write_json(self.collections / "manifest.json", {
             "status": "COMPLETED",
@@ -262,12 +303,13 @@ class StatusDashboardTests(unittest.TestCase):
 
         summary = summarize(self.root)
 
-        self.assertEqual(summary["usable_bars"], 1)
+        self.assertEqual(summary["usable_bars"], 0)
         self.assertEqual(summary["collections"][0]["statuses"], {"OBSERVED": 1})
         self.assertEqual(summary["collections"][0]["excluded_rows"], {
             "beyond_manifest_record_count": 1,
             "collection_run_id_mismatch": 1,
         })
+        self.assertEqual(summary["collections"][0]["evidence_status"], "CONFLICTING")
 
     def test_cli_writes_static_html_without_overwriting_source_artifacts(self):
         self._write_inputs()

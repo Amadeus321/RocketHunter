@@ -2,10 +2,33 @@ import pytest
 from unittest.mock import patch, MagicMock
 
 from scripts.dex_onchain_evidence import _solana_security, _evm_lp_lock_share
-from scripts import v425_early_breakout as v425
+from scripts import post_scan_audit, v425_early_breakout as v425
 
 
 class TestPhase5SecurityAndDiscovery:
+    def test_gecko_cvd_stops_after_provider_denial_and_marks_remaining_unverified(self):
+        report = {"execution_candidate_shortlist": [
+            {"market_type": "dex_pool", "chain": "ethereum",
+             "contract_address": "0x" + "1" * 40, "pool_address": "0x" + "a" * 40},
+            {"market_type": "dex_pool", "chain": "base",
+             "contract_address": "0x" + "2" * 40, "pool_address": "0x" + "b" * 40},
+        ]}
+
+        with patch.object(
+            post_scan_audit, "_json_get",
+            return_value=(None, {"ok": False, "status": 429, "error": "HTTP 429"}),
+        ) as request:
+            result = post_scan_audit.audit_gecko_spot_cvd(
+                report, limit=2, interval_seconds=1,
+            )
+
+        request.assert_called_once()
+        assert request.call_args.kwargs["headers"]["Accept"] == "application/json;version=20230203"
+        assert request.call_args.kwargs["stop_statuses"] == (403, 418, 429)
+        assert request.call_args.kwargs["retries"] == 0
+        assert result["request_interval_seconds"] == 12.0
+        assert [item["http_status"] for item in result["audited"]] == [429, 429]
+
     def test_solana_token_2022_permanent_delegate_flagged_critical(self):
         report = {
             "token": {"mintAuthority": None, "freezeAuthority": None},

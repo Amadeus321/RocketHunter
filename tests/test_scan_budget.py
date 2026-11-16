@@ -11,6 +11,7 @@ from pathlib import Path
 from unittest.mock import Mock, patch
 
 from scripts.process_runner import run_bounded
+from scripts.research_run_contract import ResearchRunError
 from scripts.run_full_scan import (
     _mark_scan_state, _run_bounded, gecko_pacing_budget_minutes,
 )
@@ -35,6 +36,32 @@ class ScanBudgetTests(unittest.TestCase):
         result = _run_bounded([sys.executable, "-c", "import time; time.sleep(5)"],
                              Path.cwd(), time.monotonic() + 0.1)
         self.assertEqual(result.returncode, 124)
+
+    def test_subprocess_is_stopped_when_lease_health_fails(self):
+        with tempfile.TemporaryDirectory() as temp:
+            marker = Path(temp) / "child-continued-after-lease-loss"
+            child_code = (
+                "import time; from pathlib import Path; time.sleep(0.3); "
+                f"Path({str(marker)!r}).write_text('unexpected', encoding='utf-8')"
+            )
+            health_checks = 0
+
+            def check_health():
+                nonlocal health_checks
+                health_checks += 1
+                if health_checks >= 3:
+                    raise ResearchRunError("simulated heartbeat loss")
+
+            with self.assertRaisesRegex(ResearchRunError, "heartbeat loss"):
+                run_bounded(
+                    [sys.executable, "-c", child_code],
+                    Path(temp),
+                    5,
+                    health_check=check_health,
+                    health_check_interval_seconds=0.03,
+                )
+            time.sleep(0.4)
+            self.assertFalse(marker.exists())
 
     def test_windows_interrupt_requests_graceful_child_shutdown(self):
         cwd = Path.cwd()

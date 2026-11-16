@@ -109,11 +109,15 @@ def run_bounded(
     env: dict[str, str] | None = None,
     stdout: Any = None,
     stderr: Any = None,
+    health_check=None,
+    health_check_interval_seconds: float = 1.0,
 ) -> subprocess.CompletedProcess:
     """Run a command until timeout, terminating its complete process tree."""
     remaining = float(timeout)
     if remaining <= 0:
         return subprocess.CompletedProcess(command, 124)
+    if health_check is not None and health_check_interval_seconds <= 0:
+        raise ValueError("health check interval must be positive")
 
     if os.name == "nt":
         kernel32, job = _windows_job()
@@ -130,14 +134,28 @@ def run_bounded(
                 process.wait()
                 raise ctypes.WinError(error)
             try:
-                returncode = process.wait(timeout=remaining)
-                return subprocess.CompletedProcess(command, returncode)
-            except subprocess.TimeoutExpired:
-                if not kernel32.TerminateJobObject(job, 124):
-                    error = __import__("ctypes").get_last_error()
-                    raise __import__("ctypes").WinError(error)
-                process.wait()
-                return subprocess.CompletedProcess(command, 124)
+                deadline = time.monotonic() + remaining
+                while True:
+                    if health_check is not None:
+                        health_check()
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        if not kernel32.TerminateJobObject(job, 124):
+                            error = __import__("ctypes").get_last_error()
+                            raise __import__("ctypes").WinError(error)
+                        process.wait()
+                        return subprocess.CompletedProcess(command, 124)
+                    wait_for = (
+                        min(remaining, health_check_interval_seconds)
+                        if health_check is not None else remaining
+                    )
+                    try:
+                        returncode = process.wait(timeout=wait_for)
+                    except subprocess.TimeoutExpired:
+                        continue
+                    if health_check is not None:
+                        health_check()
+                    return subprocess.CompletedProcess(command, returncode)
             except KeyboardInterrupt:
                 try:
                     sent = bool(kernel32.GenerateConsoleCtrlEvent(1, process.pid))
@@ -156,6 +174,15 @@ def run_bounded(
                             pass
                     process.wait()
                 raise
+            except BaseException:
+                if process.poll() is None:
+                    if not kernel32.TerminateJobObject(job, 1):
+                        try:
+                            process.kill()
+                        except ProcessLookupError:
+                            pass
+                    process.wait()
+                raise
         finally:
             kernel32.CloseHandle(job)
 
@@ -164,15 +191,37 @@ def run_bounded(
         start_new_session=True,
     )
     try:
-        returncode = process.wait(timeout=remaining)
-        return subprocess.CompletedProcess(command, returncode)
-    except subprocess.TimeoutExpired:
-        try:
-            os.killpg(process.pid, signal.SIGKILL)
-        except ProcessLookupError:
-            pass
-        process.wait()
-        return subprocess.CompletedProcess(command, 124)
+        deadline = time.monotonic() + remaining
+        while True:
+            if health_check is not None:
+                health_check()
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                try:
+                    os.killpg(process.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                process.wait()
+                return subprocess.CompletedProcess(command, 124)
+            wait_for = (
+                min(remaining, health_check_interval_seconds)
+                if health_check is not None else remaining
+            )
+            try:
+                returncode = process.wait(timeout=wait_for)
+            except subprocess.TimeoutExpired:
+                continue
+            if health_check is not None:
+                health_check()
+            return subprocess.CompletedProcess(command, returncode)
     except KeyboardInterrupt:
         _stop_posix_process_group(process)
+        raise
+    except BaseException:
+        if process.poll() is None:
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            process.wait()
         raise

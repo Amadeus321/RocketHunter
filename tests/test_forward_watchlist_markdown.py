@@ -1,9 +1,36 @@
+import json
+import sys
+import tempfile
 import unittest
+from pathlib import Path
+from unittest.mock import patch
 
+from scripts import render_forward_watchlist_markdown as renderer
 from scripts.render_forward_watchlist_markdown import render_report, render_html
 
 
 class ForwardWatchlistMarkdownTests(unittest.TestCase):
+    def test_isolated_output_does_not_update_root_convenience_reports(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            input_path = root / "forward.json"
+            output_path = root / "runs" / "forward.md"
+            input_path.write_text(json.dumps({"status": "NO_VERIFIED_TARGET", "candidates": []}),
+                                  encoding="utf-8")
+            argv = [
+                "render_forward_watchlist_markdown.py",
+                "--input", str(input_path),
+                "--output", str(output_path),
+                "--isolated-output",
+            ]
+            with patch.object(renderer, "ROOT", root), patch.object(sys, "argv", argv):
+                self.assertEqual(renderer.main(), 0)
+
+            self.assertTrue(output_path.is_file())
+            self.assertTrue(output_path.with_suffix(".html").is_file())
+            self.assertFalse((root / "forward-24h-rocket.html").exists())
+            self.assertFalse((root / "forward-24h-rocket.md").exists())
+
     def test_renders_source_backed_pair_tp_and_final_quality_gate(self):
         document = {
             "age_guard_summary": {"run_id": "test-1", "eligible_forward_candidates": 1, "raw_candidate_count": 3},

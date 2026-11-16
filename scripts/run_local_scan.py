@@ -8,6 +8,7 @@ Provider request ledgers with hard local ceilings use the shared memory root.
 from __future__ import annotations
 
 import argparse
+import atexit
 import hashlib
 import gzip
 import json
@@ -27,6 +28,7 @@ repo_root = ROOT
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 DEFAULT_MEMORY = ROOT / "rocket-hunter-data" / "scanner-memory"
+from scripts import research_run_contract as run_contract
 
 
 def utc_now() -> str:
@@ -54,7 +56,15 @@ def _prevent_system_sleep(enable: bool = True) -> None:
         pass
 
 
-def _run(cmd: list[str], deadline: float, env: dict[str, str], log_path: Path, cwd: Path) -> int:
+def _run(
+    cmd: list[str],
+    deadline: float,
+    env: dict[str, str],
+    log_path: Path,
+    cwd: Path,
+    *,
+    health_check=None,
+) -> int:
     remaining = deadline - time.monotonic()
     if remaining <= 0:
         return 124
@@ -63,17 +73,26 @@ def _run(cmd: list[str], deadline: float, env: dict[str, str], log_path: Path, c
     with log_path.open("a", encoding="utf-8") as log:
         log.write("\n$ " + subprocess.list2cmdline(cmd) + "\n")
         log.flush()
-        result = run_bounded(cmd, cwd, remaining, env=env, stdout=log, stderr=subprocess.STDOUT)
+        result = run_bounded(
+            cmd, cwd, remaining, env=env, stdout=log, stderr=subprocess.STDOUT,
+            health_check=health_check,
+        )
         return result.returncode
 
 
 def _run_required(cmd: list[str], deadline: float, env: dict[str, str],
-                  log_path: Path, cwd: Path, failure: str) -> None:
-    returncode = _run(cmd, deadline, env, log_path, cwd)
+                  log_path: Path, cwd: Path, failure: str, *, health_check=None) -> None:
+    if health_check is not None:
+        health_check()
+    returncode = _run(
+        cmd, deadline, env, log_path, cwd, health_check=health_check,
+    )
     if returncode == 124:
         raise TimeoutError(f"{failure}; its deadline expired and child processes were stopped")
     if returncode:
         raise RuntimeError(failure)
+    if health_check is not None:
+        health_check()
 
 
 def _safe_extract_memory_archive(archive: bytes, destination: Path) -> None:
@@ -165,10 +184,18 @@ def _inject_runtime_hook(path: Path, tag: str, hook: str) -> None:
     path.write_text(text[:index] + "\n" + hook + text[index:] + "\n", encoding="utf-8")
 
 
-def prepare_runtime(runtime_store: Path, deadline: float, log_path: Path) -> Path:
+def prepare_runtime(
+    runtime_store: Path,
+    deadline: float,
+    log_path: Path,
+    *,
+    health_check=None,
+) -> Path:
     """Build an isolated, versioned runtime with the archived overlays installed."""
     from scripts.file_lock import locked_file
 
+    if health_check is not None:
+        health_check()
     runtime_store = Path(runtime_store).resolve()
     fingerprint = _project_fingerprint()
     runtime = runtime_store / fingerprint
@@ -179,6 +206,8 @@ def prepare_runtime(runtime_store: Path, deadline: float, log_path: Path) -> Pat
         if manifest_path.exists():
             saved = json.loads(manifest_path.read_text(encoding="utf-8"))
             if saved.get("fingerprint") == fingerprint:
+                if health_check is not None:
+                    health_check()
                 return runtime
             raise RuntimeError("runtime cache manifest does not match its folder")
         if runtime.exists():
@@ -205,13 +234,18 @@ def prepare_runtime(runtime_store: Path, deadline: float, log_path: Path) -> Pat
             for cmd in installers:
                 if time.monotonic() >= deadline:
                     raise TimeoutError("time budget expired while preparing the local runtime")
+                if health_check is not None:
+                    health_check()
                 from scripts.process_runner import run_bounded
                 with log_path.open("a", encoding="utf-8") as log:
                     log.write("\n$ " + subprocess.list2cmdline(cmd) + "\n")
                     result = run_bounded(
                         cmd, staging, max(0.1, deadline - time.monotonic()),
                         env=env, stdout=log, stderr=subprocess.STDOUT,
+                        health_check=health_check,
                     )
+                if health_check is not None:
+                    health_check()
                 if result.returncode:
                     if result.returncode == 124:
                         raise TimeoutError("time budget expired while preparing the local runtime")
@@ -260,6 +294,8 @@ _v420_install_memory(_v420_sys.modules[__name__])\n'''),
             if staging.exists():
                 shutil.rmtree(staging)
             raise
+    if health_check is not None:
+        health_check()
     return runtime
 
 
@@ -455,6 +491,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--outdir", type=Path, required=True, help="unique output directory for this run")
     p.add_argument("--memory-dir", type=Path, default=DEFAULT_MEMORY, help="persistent local learning memory")
+    p.add_argument("--activity-db", type=Path, default=run_contract.DEFAULT_ACTIVITY_DB,
+                   help="shared SQLite scanner/collector lifecycle database")
     p.add_argument("--max-runtime-minutes", type=float, default=170,
                    help="whole local run deadline; maximum 180 minutes")
     p.add_argument("--gecko-pages", type=int, default=1,
@@ -466,6 +504,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--preflight-workers", type=int, default=4,
                    help="maximum parallel preflight probes (1-12; local default 4)")
     p.add_argument("--birdeye", action="store_true")
+    p.add_argument(
+        "--isolated-output", action="store_true",
+        help="keep reports, dashboards, and notifications inside this run's output only",
+    )
     p.add_argument("--gecko-cvd-limit", type=int, default=4,
                    help="number of top priority DEX candidates to sample for on-chain CVD (default 4)")
     p.add_argument("--book-limit", type=int, default=4,
@@ -492,8 +534,26 @@ def main(argv: list[str] | None = None) -> int:
         existing_files = {f.name for f in outdir.iterdir()}
         if not existing_files.issubset(allowed):
             p.error(f"output directory must be new or empty: {outdir}")
-    outdir.mkdir(parents=True, exist_ok=True)
+    try:
+        run_contract.ensure_activity_db_disjoint(
+            args.activity_db,
+            [memory_dir, outdir, ROOT / "rocket-hunter-data" / "research-exports",
+             ROOT / "rocket-hunter-data" / "research-analysis"],
+        )
+    except run_contract.ResearchRunError as exc:
+        p.error(str(exc))
     run_id = "local-" + uuid.uuid4().hex
+    try:
+        lease = run_contract.ResearchRunLease(
+            args.activity_db, run_id, "local-scanner",
+            int(args.max_runtime_minutes * 60),
+        ).acquire()
+    except run_contract.ResearchRunError as exc:
+        print(f"Local scan blocked: {exc}", file=sys.stderr)
+        return 2
+    atexit.register(lease.finish, "FAILED", "process exited before scan finalization")
+    lease.check_health()
+    outdir.mkdir(parents=True, exist_ok=True)
     started, started_utc = time.monotonic(), utc_now()
     deadline = started + args.max_runtime_minutes * 60
     log_path = outdir / "local-run.log"
@@ -509,11 +569,14 @@ def main(argv: list[str] | None = None) -> int:
     budget_mgr.start_phase("preflight_and_registries")
 
     state = {
-        "status": "IN_PROGRESS", "run_id": run_id, "scan_started_utc": started_utc,
+        "status": "IN_PROGRESS", "run_id": run_id, "activity_run_id": run_id,
+        "run_lifecycle_schema": "rocket-hunter.research-run.v1",
+        "scan_started_utc": started_utc,
         "process_id": os.getpid(),
         "unified_budget": budget_mgr.get_summary(),
         **metadata,
     }
+    lease.check_health()
     status_path.write_text(json.dumps(state, indent=2) + "\n", encoding="utf-8")
     _prevent_system_sleep(True)
     try:
@@ -521,13 +584,19 @@ def main(argv: list[str] | None = None) -> int:
     except Exception:
         pass
     # Immediately render status-dashboard.html so Scan History shows this scan as IN_PROGRESS
-    try:
-        from scripts import status_dashboard
-        status_dashboard.main(["--root", str(repo_root), "--output", str(repo_root / "status-dashboard.html")])
-    except Exception:
-        pass
+    if not args.isolated_output:
+        try:
+            from scripts import status_dashboard
+            lease.check_health()
+            status_dashboard.main(["--root", str(repo_root), "--output", str(repo_root / "status-dashboard.html")])
+            lease.check_health()
+        except run_contract.ResearchRunError:
+            raise
+        except Exception:
+            pass
     try:
         from scripts.file_lock import locked_file
+        lease.check_health()
         with locked_file(lock_path):
             ensure_memory(memory_dir)
             shutil.copytree(memory_dir, snapshot)
@@ -536,7 +605,11 @@ def main(argv: list[str] | None = None) -> int:
                 source = memory_dir / name
                 if source.exists():
                     shutil.copy2(source, baseline / name)
-        runtime_root = prepare_runtime(memory_dir.parent / "runtime", deadline, log_path)
+        lease.check_health()
+        runtime_root = prepare_runtime(
+            memory_dir.parent / "runtime", deadline, log_path,
+            health_check=lease.check_health,
+        )
         env = os.environ.copy()
         env["PYTHONUTF8"] = "1"
         env["PYTHONIOENCODING"] = "utf-8"
@@ -554,7 +627,8 @@ def main(argv: list[str] | None = None) -> int:
         status_path.write_text(json.dumps(state, indent=2) + "\n", encoding="utf-8")
 
         _run_required(cmds[0], disc_deadline, env, log_path, runtime_root,
-                      "bounded discovery/preflight/report stage failed")
+                      "bounded discovery/preflight/report stage failed",
+                      health_check=lease.check_health)
         budget_mgr.end_phase("global_multichain_discovery")
 
         enrich_allowance = budget_mgr.start_phase("candidate_enrichment")
@@ -574,7 +648,8 @@ def main(argv: list[str] | None = None) -> int:
         ]
         for cmd in stages:
             _run_required(cmd, enrich_deadline, env, log_path, runtime_root,
-                          "quality, memory, or safety-audit stage failed")
+                          "quality, memory, or safety-audit stage failed",
+                          health_check=lease.check_health)
         budget_mgr.end_phase("candidate_enrichment")
 
         deep_allowance = budget_mgr.start_phase("deep_verification_safety")
@@ -587,7 +662,8 @@ def main(argv: list[str] | None = None) -> int:
                    "--dex-limit", "140", "--cex-limit", "25", "--timeout", "8", "--gecko-interval", "12.0"]
         (outdir / "forward-24h-rocket.md").write_text("", encoding="utf-8")
         _run_required(forward, deep_deadline, env, log_path, runtime_root,
-                      "forward report generation failed")
+                      "forward report generation failed",
+                      health_check=lease.check_health)
         budget_mgr.end_phase("deep_verification_safety")
 
         budget_mgr.start_phase("finalization_and_reports")
@@ -599,24 +675,36 @@ def main(argv: list[str] | None = None) -> int:
             [sys.executable, "-m", "scripts.v423_provider_expansion", "--post-scan", "--outdir", str(outdir), "--memory-dir", str(snapshot), "--run-id", run_id],
             [sys.executable, "-m", "scripts.v424_birdeye_free", "--post-scan", "--outdir", str(outdir), "--memory-dir", str(snapshot), "--run-id", run_id],
             [sys.executable, "-m", "scripts.v425_early_breakout", "--post-scan", "--outdir", str(outdir), "--memory-dir", str(snapshot), "--run-id", run_id],
-            [sys.executable, "scripts/render_forward_watchlist_markdown.py", "--input", str(outdir / "forward-24h-rocket.json"), "--output", str(outdir / "forward-24h-rocket.md")],
         ]
+        render_forward = [
+            sys.executable, "scripts/render_forward_watchlist_markdown.py",
+            "--input", str(outdir / "forward-24h-rocket.json"),
+            "--output", str(outdir / "forward-24h-rocket.md"),
+        ]
+        if args.isolated_output:
+            render_forward.append("--isolated-output")
+        post.append(render_forward)
         for cmd in post:
             _run_required(cmd, deadline, env, log_path, runtime_root,
-                          "final qualification, memory, or rendering stage failed")
+                          "final qualification, memory, or rendering stage failed",
+                          health_check=lease.check_health)
         if not (outdir / "forward-24h-rocket.json").is_file() or not (outdir / "forward-24h-rocket.md").is_file():
             raise RuntimeError("final forward report is incomplete")
+        lease.check_health()
         merge_memory(snapshot, memory_dir, lock_path, baseline, deadline)
+        lease.check_health()
         final = [sys.executable, "scripts/run_full_scan.py", "--mark-complete", "--outdir", str(outdir)]
         _run_required(final, deadline, env, log_path, runtime_root,
-                      "could not finalize scan state")
+                      "could not finalize scan state", health_check=lease.check_health)
         budget_mgr.end_phase("finalization_and_reports")
+        lease.check_health()
         state.update(json.loads(status_path.read_text(encoding="utf-8")))
         state.update({"status": "COMPLETED", "scan_finished_utc": utc_now(),
                       "scan_duration_seconds": round(time.monotonic() - started, 3),
                       "unified_budget": budget_mgr.get_summary()})
         status_path.write_text(json.dumps(state, indent=2) + "\n", encoding="utf-8")
         for name in ("rocket-hunt.json", "forward-24h-rocket.json"):
+            lease.check_health()
             path = outdir / name
             if path.exists():
                 doc = json.loads(path.read_text(encoding="utf-8"))
@@ -630,58 +718,67 @@ def main(argv: list[str] | None = None) -> int:
                 "--input", str(outdir / "forward-24h-rocket.json"),
                 "--output", str(outdir / "forward-24h-rocket.md"),
             ]
-            _run(render_final, deadline, env, log_path, runtime_root)
-        try:
-            if (outdir / "forward-24h-rocket.html").exists():
-                shutil.copy2(outdir / "forward-24h-rocket.html", repo_root / "forward-24h-rocket.html")
-            if (outdir / "forward-24h-rocket.md").exists():
-                shutil.copy2(outdir / "forward-24h-rocket.md", repo_root / "forward-24h-rocket.md")
-        except Exception:
-            pass
+            if args.isolated_output:
+                render_final.append("--isolated-output")
+            _run(render_final, deadline, env, log_path, runtime_root,
+                 health_check=lease.check_health)
+        if not args.isolated_output:
+            try:
+                if (outdir / "forward-24h-rocket.html").exists():
+                    shutil.copy2(outdir / "forward-24h-rocket.html", repo_root / "forward-24h-rocket.html")
+                if (outdir / "forward-24h-rocket.md").exists():
+                    shutil.copy2(outdir / "forward-24h-rocket.md", repo_root / "forward-24h-rocket.md")
+            except Exception:
+                pass
 
         # Automatically update status-dashboard.html so scan history always shows all completed scans
-        try:
-            render_dash = [
-                sys.executable, "scripts/status_dashboard.py",
-                "--output", str(repo_root / "status-dashboard.html"),
-            ]
-            _run(render_dash, deadline, env, log_path, runtime_root)
-        except Exception:
-            pass
+        if not args.isolated_output:
+            try:
+                render_dash = [
+                    sys.executable, "scripts/status_dashboard.py",
+                    "--output", str(repo_root / "status-dashboard.html"),
+                ]
+                _run(render_dash, deadline, env, log_path, runtime_root,
+                     health_check=lease.check_health)
+            except run_contract.ResearchRunError:
+                raise
+            except Exception:
+                pass
 
-        try:
-            from scripts import notification_manager
-            fw_path = outdir / "forward-24h-rocket.json"
-            act_cnt = 0
-            rnk_cnt = 0
-            top_name = "—"
-            if fw_path.exists():
-                fw_data = json.loads(fw_path.read_text(encoding="utf-8"))
-                act_cnt = len(fw_data.get("verified_actionable_opportunities") or [])
-                rnk_cnt = len(fw_data.get("unverified_research_watchlist") or []) + act_cnt
-                if act_cnt > 0:
-                    first = fw_data["verified_actionable_opportunities"][0]
-                    top_name = f"{first.get('pair')} (+{first.get('tp_upside_pct')}%)"
-            f_utc = state.get("scan_finished_utc") or utc_now()
-            s_utc = state.get("scan_started_utc") or utc_now()
-            ist_tz = timezone(timedelta(hours=2))
-            f_ist = datetime.fromisoformat(f_utc.replace("Z", "+00:00")).astimezone(ist_tz).strftime("%Y-%m-%d %H:%M:%S IST")
-            s_ist = datetime.fromisoformat(s_utc.replace("Z", "+00:00")).astimezone(ist_tz).strftime("%Y-%m-%d %H:%M:%S IST")
-            dur = f"{int(state.get('scan_duration_seconds', 0) // 60)}m {int(state.get('scan_duration_seconds', 0) % 60)}s"
+        if not args.isolated_output:
+            try:
+                from scripts import notification_manager
+                fw_path = outdir / "forward-24h-rocket.json"
+                act_cnt = 0
+                rnk_cnt = 0
+                top_name = "—"
+                if fw_path.exists():
+                    fw_data = json.loads(fw_path.read_text(encoding="utf-8"))
+                    act_cnt = len(fw_data.get("verified_actionable_opportunities") or [])
+                    rnk_cnt = len(fw_data.get("unverified_research_watchlist") or []) + act_cnt
+                    if act_cnt > 0:
+                        first = fw_data["verified_actionable_opportunities"][0]
+                        top_name = f"{first.get('pair')} (+{first.get('tp_upside_pct')}%)"
+                f_utc = state.get("scan_finished_utc") or utc_now()
+                s_utc = state.get("scan_started_utc") or utc_now()
+                ist_tz = timezone(timedelta(hours=2))
+                f_ist = datetime.fromisoformat(f_utc.replace("Z", "+00:00")).astimezone(ist_tz).strftime("%Y-%m-%d %H:%M:%S IST")
+                s_ist = datetime.fromisoformat(s_utc.replace("Z", "+00:00")).astimezone(ist_tz).strftime("%Y-%m-%d %H:%M:%S IST")
+                dur = f"{int(state.get('scan_duration_seconds', 0) // 60)}m {int(state.get('scan_duration_seconds', 0) % 60)}s"
 
-            notif_res = notification_manager.send_scan_completed_notification(
-                run_id=outdir.name,
-                status="COMPLETED",
-                started_ist=s_ist,
-                finished_ist=f_ist,
-                duration_str=dur,
-                ranked_count=rnk_cnt,
-                actionable_count=act_cnt,
-                top_candidate=top_name
-            )
-            print(f"Scan completion notification dispatched: {notif_res}")
-        except Exception as e:
-            print(f"Notification check: {e}")
+                notif_res = notification_manager.send_scan_completed_notification(
+                    run_id=outdir.name,
+                    status="COMPLETED",
+                    started_ist=s_ist,
+                    finished_ist=f_ist,
+                    duration_str=dur,
+                    ranked_count=rnk_cnt,
+                    actionable_count=act_cnt,
+                    top_candidate=top_name
+                )
+                print(f"Scan completion notification dispatched: {notif_res}")
+            except Exception as e:
+                print(f"Notification check: {e}")
 
         print(f"Completed local scan: {outdir}")
         return 0
@@ -723,37 +820,43 @@ def main(argv: list[str] | None = None) -> int:
                         pass
 
             # Notify user on scan failure or interrupt if configured
-            try:
-                from scripts import notification_manager
-                f_utc = state.get("scan_finished_utc") or utc_now()
-                s_utc = state.get("scan_started_utc") or utc_now()
-                ist_tz = timezone(timedelta(hours=2))
-                f_ist = datetime.fromisoformat(f_utc.replace("Z", "+00:00")).astimezone(ist_tz).strftime("%Y-%m-%d %H:%M:%S IST")
-                s_ist = datetime.fromisoformat(s_utc.replace("Z", "+00:00")).astimezone(ist_tz).strftime("%Y-%m-%d %H:%M:%S IST")
-                dur = f"{int(state.get('scan_duration_seconds', 0) // 60)}m {int(state.get('scan_duration_seconds', 0) % 60)}s"
-                notification_manager.send_scan_completed_notification(
-                    run_id=outdir.name,
-                    status=state["status"],
-                    started_ist=s_ist,
-                    finished_ist=f_ist,
-                    duration_str=dur,
-                    ranked_count=0,
-                    actionable_count=0,
-                    top_candidate=state.get("failure_reason", state["status"])
-                )
-            except Exception:
-                pass
+            if not args.isolated_output:
+                try:
+                    from scripts import notification_manager
+                    f_utc = state.get("scan_finished_utc") or utc_now()
+                    s_utc = state.get("scan_started_utc") or utc_now()
+                    ist_tz = timezone(timedelta(hours=2))
+                    f_ist = datetime.fromisoformat(f_utc.replace("Z", "+00:00")).astimezone(ist_tz).strftime("%Y-%m-%d %H:%M:%S IST")
+                    s_ist = datetime.fromisoformat(s_utc.replace("Z", "+00:00")).astimezone(ist_tz).strftime("%Y-%m-%d %H:%M:%S IST")
+                    dur = f"{int(state.get('scan_duration_seconds', 0) // 60)}m {int(state.get('scan_duration_seconds', 0) % 60)}s"
+                    notification_manager.send_scan_completed_notification(
+                        run_id=outdir.name,
+                        status=state["status"],
+                        started_ist=s_ist,
+                        finished_ist=f_ist,
+                        duration_str=dur,
+                        ranked_count=0,
+                        actionable_count=0,
+                        top_candidate=state.get("failure_reason", state["status"])
+                    )
+                except Exception:
+                    pass
 
         # Always re-render status-dashboard.html to ensure scan history is never stale
-        try:
-            from scripts import status_dashboard
-            status_dashboard.main(["--root", str(repo_root), "--output", str(repo_root / "status-dashboard.html")])
-        except Exception:
-            pass
+        if not args.isolated_output:
+            try:
+                from scripts import status_dashboard
+                status_dashboard.main(["--root", str(repo_root), "--output", str(repo_root / "status-dashboard.html")])
+            except Exception:
+                pass
 
         if snapshot.exists():
             shutil.rmtree(snapshot)
         _prevent_system_sleep(False)
+        lease.finish(
+            str(state.get("status") or "FAILED"),
+            str(state.get("failure_reason") or "") or None,
+        )
     return returncode
 
 

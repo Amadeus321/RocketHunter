@@ -16,6 +16,9 @@ from tests.test_execution_simulator import make_mock_chainlink_rpc_transport
 
 
 class EarlyBreakoutTests(unittest.TestCase):
+    def test_gecko_terminal_monitor_respects_minimum_request_pacing(self):
+        self.assertGreaterEqual(v425.GECKO_POSITION_INTERVAL_SECONDS, 12.0)
+
     def test_post_scan_persists_prospective_score_and_source_provenance(self):
         snapshot_utc = "2026-11-09T12:00:00Z"
         with tempfile.TemporaryDirectory() as tmp:
@@ -471,6 +474,100 @@ class EarlyBreakoutTests(unittest.TestCase):
             self.assertEqual(state["positions"][0]["quote_symbol"], "SOL")
             self.assertNotIn("initial_stop_price", state["positions"][0])
             self.assertNotIn("stop_loss_pct", state["positions"][0])
+
+    def test_position_monitor_preserves_phase4_scores_and_scan_provenance(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            outdir = root / "out"
+            memory = root / "memory"
+            outdir.mkdir()
+            memory.mkdir()
+            stamp = v425.utc_now()
+            source_run_id = "phase4-source-run"
+            configuration_fingerprint = "c" * 64
+            v425._write_json(outdir / "scan-status.json", {
+                "status": "IN_PROGRESS",
+                "run_id": source_run_id,
+                "scanner_version": v425.VERSION,
+                "configuration_fingerprint": configuration_fingerprint,
+            })
+            candidate = {
+                "identity": "dex:solana:phase4-pool",
+                "asset": "Phase4",
+                "symbol": "P4",
+                "pair": "P4/SOL",
+                "market_type": "dex_pool",
+                "chain": "solana",
+                "pool_address": "phase4-pool",
+                "contract_address": "phase4-token",
+                "price": 1.0,
+                "data_timestamp_utc": stamp,
+                "retrieved_utc": stamp,
+                "early_breakout_score": 77.0,
+                "breakout_confluence_score": 81.5,
+                "breakout_engine_scores": {"engine_1_momentum_acceleration": 80.0},
+                "breakout_acceleration_signals": {"engine_1_momentum_acceleration": {"evidence_status": "MEASURED"}},
+                "engine_evidence_status": {"engine_1_momentum_acceleration": "MEASURED"},
+                "evidence_coverage_pct": 75.0,
+                "breakout_evidence_eligible": False,
+                "signal_engine_executed": True,
+                "expected_return_engine_executed": False,
+                "engine_result_status": "SUCCESS",
+                "expected_return_status": "DATA_UNAVAILABLE",
+                "engine_failure_module": None,
+                "engine_exception_category": None,
+                "engine_failure_diagnostic": None,
+                "probability_tp_hit_24h_pct": None,
+                "expected_net_24h_return_pct": None,
+                "potential_mfe_24h_pct": None,
+                "potential_mae_24h_pct": None,
+                "estimated_hours_to_target": None,
+                "reversal_risk_score": None,
+                "realistic_opportunity_rank": None,
+                "entry_decision": "NOT QUALIFIED",
+                "qualification_blockers": ["MISSING_EXECUTABLE_QUOTE"],
+                "safety_verified": False,
+                "dex_loss_guard_status": "MISSING",
+                "quote_status": "UNAVAILABLE",
+                "source": "fixture",
+                "source_url": "https://example.invalid/pool",
+                "target_price": 1.4,
+                "trade_plan": {"single_take_profit": 1.4},
+            }
+            v425._write_json(outdir / "forward-24h-rocket.json", {
+                "as_of_utc": stamp,
+                "candidates": [candidate],
+            })
+            v425._write_json(outdir / "rocket-hunt.json", {})
+
+            class FakeDexClient:
+                request_count = 0
+                def __init__(self, *args, **kwargs):
+                    pass
+
+            with patch.object(v425, "DexPaprikaClient", FakeDexClient), \
+                 patch.object(v425, "_load_registry", return_value=([], {"registry_cached": True})), \
+                 patch.object(v425, "_fetch_gecko_position_bars", return_value=([], "https://example.invalid/candles", None)):
+                v425.update_position_monitor(outdir, memory, source_run_id)
+
+            state = v425._load_json(memory / "active-24h-watchlist.json", {})
+            position = state["positions"][0]
+            self.assertEqual(state["scanner_version"], v425.VERSION)
+            self.assertEqual(state["configuration_fingerprint"], configuration_fingerprint)
+            self.assertEqual(state["source_scan_run_id"], source_run_id)
+            self.assertEqual(state["source_provenance_status"], "PRESENT")
+            self.assertEqual(position["phase4_score_snapshot"]["breakout_engine_scores"],
+                             candidate["breakout_engine_scores"])
+            self.assertEqual(position["phase4_score_snapshot"]["breakout_confluence_score"], 81.5)
+            self.assertFalse(position["phase4_score_snapshot"]["breakout_evidence_eligible"])
+            self.assertEqual(position["phase4_score_snapshot"]["entry_decision"], "NOT QUALIFIED")
+            self.assertEqual(position["source_provenance"], {
+                "scanner_version": v425.VERSION,
+                "configuration_fingerprint": configuration_fingerprint,
+                "source_run_id": source_run_id,
+                "source_event_utc": stamp,
+                "source_received_utc": stamp,
+            })
 
     def test_position_monitor_skips_targets_below_single_tp40_threshold(self):
         with tempfile.TemporaryDirectory() as tmp:

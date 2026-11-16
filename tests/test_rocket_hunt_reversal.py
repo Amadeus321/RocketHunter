@@ -1,9 +1,57 @@
+import io
 import math
+import urllib.error
+from unittest.mock import patch
 import pytest
-from scripts.rocket_hunt import score_candidate
+from scripts.rocket_hunt import RocketHunter, score_candidate
+from scripts.venues import Fetcher
 
 
 class TestRocketHuntReversal:
+    @pytest.mark.parametrize("status", [403, 418, 429])
+    def test_gecko_terminal_http_stop_status_is_not_retried(self, status):
+        requests = []
+
+        def fail_request(request, timeout):
+            requests.append(request)
+            raise urllib.error.HTTPError(
+                request.full_url, status, "provider stopped", {}, io.BytesIO()
+            )
+
+        fetcher = Fetcher(retries=2, pause=0)
+        with patch("scripts.venues.urllib.request.urlopen", side_effect=fail_request):
+            result = fetcher.get(
+                "https://api.geckoterminal.com/test",
+                headers={"Accept": "application/json;version=20230203"},
+                stop_statuses=(403, 418, 429),
+            )
+
+        assert result is None
+        assert len(requests) == 1
+        assert requests[0].get_header("Accept") == "application/json;version=20230203"
+        assert fetcher.log[-1]["attempts"] == 1
+
+    def test_gecko_terminal_policy_uses_versioned_header_and_halts_after_rate_limit(self):
+        hunter = RocketHunter(progress=False)
+        calls = []
+
+        def rate_limited(url, *, headers, stop_statuses):
+            calls.append((url, headers, stop_statuses))
+            hunter.fx.log.append({
+                "url": url, "status": 429, "ok": False,
+                "retrieved_utc": "2026-11-16T12:00:00Z",
+                "error": "HTTP 429 (stopped by provider policy)",
+            })
+            return None
+
+        hunter.fx.get = rate_limited
+        assert hunter._fetch_gecko_json("first", "https://api.geckoterminal.com/first") is None
+        assert hunter._fetch_gecko_json("second", "https://api.geckoterminal.com/second") is None
+
+        assert len(calls) == 1
+        assert calls[0][1]["Accept"] == "application/json;version=20230203"
+        assert calls[0][2] == (403, 418, 429)
+
     def test_strong_24h_move_with_negative_1h_applies_reversal_penalty(self):
         # 500% 24h gain with -5% 1h pullback
         row_with_pullback = {

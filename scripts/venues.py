@@ -68,7 +68,7 @@ class Fetcher:
             except Exception:
                 return None
 
-    def _request(self, method, url, payload=None):
+    def _request(self, method, url, payload=None, headers_override=None, stop_statuses=()):
         from urllib.parse import urlparse
         host = (urlparse(url).hostname or "").lower()
         last_err, status = None, None
@@ -77,6 +77,8 @@ class Fetcher:
             if wait:
                 time.sleep(wait)
             headers = {"User-Agent": USER_AGENT, "Accept": "application/json"}
+            if headers_override:
+                headers.update(headers_override)
             body = None
             if payload is not None:
                 headers["Content-Type"] = "application/json"
@@ -95,6 +97,9 @@ class Fetcher:
                 status = exc.code
                 retry_after = self._retry_after_seconds(exc.headers.get("Retry-After") if exc.headers else None)
                 last_err = "HTTP %s" % exc.code
+                if exc.code in stop_statuses:
+                    last_err += " (stopped by provider policy)"
+                    break
                 if exc.code in (400, 401, 403, 404, 405, 410, 451):
                     break
                 if exc.code == 429 or exc.code == 418:
@@ -119,8 +124,8 @@ class Fetcher:
                          "error": last_err, "retrieved_utc": iso(utc_now()), "attempts": attempt + 1})
         return None
 
-    def get(self, url):
-        return self._request("GET", url)
+    def get(self, url, *, headers=None, stop_statuses=()):
+        return self._request("GET", url, headers_override=headers, stop_statuses=stop_statuses)
 
     def post(self, url, payload):
         return self._request("POST", url, payload)

@@ -356,6 +356,7 @@ class RocketHunter:
         # around 5 requests/minute, leaving headroom for dynamic registry reads.
         self.gecko_request_interval = 12.0
         self._gecko_last_request = 0.0
+        self._gecko_stopped_status = None
         self._gecko_lock = threading.Lock()
         self._checkpoint_lock = threading.RLock()
         self.checkpoint_dir = Path(checkpoint_dir) if checkpoint_dir else None
@@ -450,7 +451,7 @@ class RocketHunter:
         return payload
 
     def _fetch_gecko_json(self, source, url):
-        """Serialize live GeckoTerminal requests to stay below its current ~30/min public-tier limit.
+        """Serialize GeckoTerminal requests under the shared public-tier policy.
 
         Successful cached responses on --resume bypass pacing; only live calls
         consume the public API request budget.
@@ -459,11 +460,37 @@ class RocketHunter:
         if hit:
             return cached_payload
         with self._gecko_lock:
-            wait = self.gecko_request_interval - (time.monotonic() - self._gecko_last_request)
+            if self._gecko_stopped_status is not None:
+                self._record_source({
+                    "source": source, "url": url, "status": "HALTED",
+                    "row_count": 0, "retrieved_utc": utc_iso(),
+                    "error": "GeckoTerminal halted after HTTP %s" % self._gecko_stopped_status,
+                })
+                return None
+            interval = max(12.0, self.gecko_request_interval)
+            wait = interval - (time.monotonic() - self._gecko_last_request)
             if self._gecko_last_request and wait > 0:
                 time.sleep(wait)
             self._gecko_last_request = time.monotonic()
-            return self._fetch_json(source, url)
+            payload = self.fx.get(
+                url,
+                headers={"Accept": "application/json;version=20230203"},
+                stop_statuses=(403, 418, 429),
+            )
+            log_row = next((x for x in reversed(self.fx.log) if x.get("url") == url), {})
+            status = log_row.get("status")
+            if status in (403, 418, 429):
+                self._gecko_stopped_status = status
+            retrieved = log_row.get("retrieved_utc", utc_iso())
+            self._record_source({
+                "source": source, "url": url,
+                "status": "OK" if payload is not None else "FAILED",
+                "row_count": len(_items(payload)) if payload is not None else 0,
+                "retrieved_utc": retrieved, "error": log_row.get("error"),
+            })
+            if payload is not None:
+                self._save_cached(source, url, payload, retrieved)
+            return payload
 
     def cex_boards(self, venue_names):
         def one(name):
@@ -1184,7 +1211,7 @@ def main(argv=None):
     hunter = RocketHunter(timeout=a.timeout, retries=a.retries, workers=max(1, a.workers),
                           checkpoint_dir=a.checkpoint_dir, resume=a.resume,
                           resume_max_age_seconds=a.resume_max_age_seconds)
-    hunter.gecko_request_interval = max(0.0, a.gecko_request_interval)
+    hunter.gecko_request_interval = max(12.0, a.gecko_request_interval)
     if not 1 <= a.dex_search_limit <= len(DEFAULT_DEX_SEARCH_QUERIES):
         p.error("--dex-search-limit must be between 1 and %d" % len(DEFAULT_DEX_SEARCH_QUERIES))
     total_q = len(DEFAULT_DEX_SEARCH_QUERIES)

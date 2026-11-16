@@ -112,6 +112,7 @@ def _unwrap(value):
 
 
 def _http_json(url, timeout=8, headers=None):
+    safe_url = _redact_sensitive_url(url)
     req_headers = {
         "Accept": "application/json",
         "User-Agent": "crypto-prebreakout-onchain-evidence/1.0",
@@ -122,20 +123,42 @@ def _http_json(url, timeout=8, headers=None):
         with urllib.request.urlopen(req, timeout=timeout) as response:
             payload = json.loads(response.read().decode("utf-8"))
             return payload, {
-                "ok": True, "status": response.status, "url": url,
+                "ok": True, "status": response.status, "url": safe_url,
                 "retrieved_utc": utc_now(), "error": None,
             }
     except urllib.error.HTTPError as exc:
         return None, {
-            "ok": False, "status": exc.code, "url": url,
+            "ok": False, "status": exc.code, "url": safe_url,
             "retrieved_utc": utc_now(), "error": "HTTP %s" % exc.code,
         }
     except Exception as exc:
         return None, {
-            "ok": False, "status": None, "url": url,
+            "ok": False, "status": None, "url": safe_url,
             "retrieved_utc": utc_now(),
-            "error": "%s: %s" % (type(exc).__name__, exc),
+            "error": _redact_sensitive_text("%s: %s" % (type(exc).__name__, exc)),
         }
+
+
+def _redact_sensitive_url(url):
+    parts = urllib.parse.urlsplit(url)
+    sensitive_names = {"key", "api_key", "apikey", "access_token", "token", "secret"}
+    query = [
+        (name, "[REDACTED]" if name.lower() in sensitive_names else value)
+        for name, value in urllib.parse.parse_qsl(parts.query, keep_blank_values=True)
+    ]
+    return urllib.parse.urlunsplit((
+        parts.scheme, parts.netloc, parts.path,
+        urllib.parse.urlencode(query), parts.fragment,
+    ))
+
+
+def _redact_sensitive_text(value):
+    secret = os.environ.get("RUGCHECK_API_KEY", "").strip()
+    if not secret:
+        return value
+    return value.replace(secret, "[REDACTED]").replace(
+        urllib.parse.quote(secret, safe=""), "[REDACTED]"
+    )
 
 
 def _rpc_post(url, method, params, timeout=8):

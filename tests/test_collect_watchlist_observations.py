@@ -7,9 +7,10 @@ import time
 import urllib.error
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from scripts import collect_watchlist_observations as collector
+from scripts import research_run_contract as run_contract
 
 
 class WatchlistObservationCollectorTests(unittest.TestCase):
@@ -61,6 +62,7 @@ class WatchlistObservationCollectorTests(unittest.TestCase):
             "--memory-dir", str(self.memory),
             "--watchlist", str(self.watchlist),
             "--output-root", str(self.output_root),
+            "--activity-db", str(self.root / "shared-activity.sqlite3"),
             "--duration-minutes", "2",
             "--interval-seconds", "60",
             "--max-requests", "10",
@@ -143,6 +145,8 @@ class WatchlistObservationCollectorTests(unittest.TestCase):
         self.assertEqual(manifest["requests_started"], 1)
         self.assertTrue(manifest["configuration_fingerprint"])
         self.assertEqual(manifest["request_pacing_seconds"], 12.0)
+        self.assertEqual(manifest["record_count_validation"], "MATCH")
+        self.assertEqual(manifest["actual_record_count"], manifest["record_count"])
         self.assertIn("executable fills", " ".join(manifest["metrics_still_unsupported"]))
         self.assertEqual(before, {
             path.name: hashlib.sha256(path.read_bytes()).hexdigest()
@@ -159,6 +163,19 @@ class WatchlistObservationCollectorTests(unittest.TestCase):
             run_dir = collector.collect(self.args("--dry-run", "--once"))
         self.assertIsNone(run_dir)
         self.assertFalse(self.output_root.exists())
+
+    def test_duplicate_shared_run_is_rejected_before_collection_io(self):
+        args = self.args("--once")
+        active = run_contract.ResearchRunLease(
+            args.activity_db, "active-scan", "local-scanner", 120,
+            heartbeat_seconds=100, stale_after_seconds=110,
+        ).acquire()
+        try:
+            with self.assertRaises(run_contract.DuplicateResearchRun):
+                collector.collect(args, fetch_fn=lambda *_args: self.fail("must not fetch"))
+            self.assertFalse(self.output_root.exists())
+        finally:
+            active.finish("COMPLETED")
 
     def test_candidate_limit_and_duplicate_identity_are_enforced(self):
         self.write_watchlist([self.positions[0], self.positions[0], self.positions[1]])
@@ -216,6 +233,7 @@ class WatchlistObservationCollectorTests(unittest.TestCase):
         self.assertEqual(manifest["record_status_counts"]["skipped_provider_rate_limit"], 1)
         self.assertEqual(manifest["record_status_counts"]["skipped_incomplete_identity"], 1)
         self.assertEqual(manifest["provider_rate_limit"]["http_status"], 429)
+        self.assertEqual(manifest["record_count_validation"], "MATCH")
         self.assertEqual(
             manifest["provider_rate_limit"]["cooldown_until_utc"],
             "2026-11-09T15:02:00Z",
@@ -506,18 +524,61 @@ class WatchlistObservationCollectorTests(unittest.TestCase):
         self.assertTrue(metadata["retry_after_clamped"])
         self.assertEqual(metadata["cooldown_until_utc"], "2026-11-16T15:00:00Z")
 
-    def test_ctrl_c_writes_interrupted_manifest_without_touching_source(self):
+    def test_ctrl_c_leaves_collection_manifestless_without_reading_partial_output(self):
         with patch.object(collector.monitor, "_fetch_gecko_position_bars_with_metadata",
-                          side_effect=KeyboardInterrupt):
+                          side_effect=KeyboardInterrupt), \
+             patch.object(run_contract, "count_jsonl_records") as count_records:
             run_dir = collector.collect(
                 self.args("--once"),
                 now_fn=lambda: dt.datetime(2026, 11, 9, 15, 0, tzinfo=dt.timezone.utc),
                 rate_limit_fn=lambda *_args: None,
             )
-        manifest = json.loads((run_dir / "manifest.json").read_text(encoding="utf-8"))
-        self.assertEqual(manifest["status"], "INTERRUPTED")
-        self.assertEqual(manifest["requests_started"], 1)
-        self.assertEqual((run_dir / "observations.jsonl").read_text(encoding="utf-8"), "")
+        self.assertFalse((run_dir / "manifest.json").exists())
+        count_records.assert_not_called()
+
+    def test_record_count_mismatch_leaves_collection_manifestless(self):
+        with patch.object(
+            collector.monitor, "_fetch_gecko_position_bars_with_metadata",
+            return_value=self.fake_gecko_bars(),
+        ), patch.object(
+            collector.monitor, "_fetch_cex_position_bars", return_value=self.fake_bars(),
+        ), patch.object(
+            run_contract, "count_jsonl_records", return_value=(2, 0),
+        ) as count_records:
+            run_dir = collector.collect(
+                self.args("--once"),
+                now_fn=lambda: dt.datetime(2026, 11, 9, 15, 0, tzinfo=dt.timezone.utc),
+                rate_limit_fn=lambda *_args: None,
+            )
+
+        count_records.assert_called_once()
+        self.assertFalse((run_dir / "manifest.json").exists())
+
+    def test_heartbeat_loss_after_fetch_stops_writes_and_leaves_manifestless(self):
+        args = self.args("--once")
+        error = run_contract.ResearchRunError("simulated heartbeat loss")
+        fetch = Mock(return_value=self.fake_gecko_bars())
+
+        def check_health():
+            if fetch.called:
+                raise error
+
+        with patch.object(
+            run_contract.ResearchRunLease, "check_health", side_effect=check_health,
+        ), patch.object(run_contract, "count_jsonl_records") as count_records:
+            with self.assertRaisesRegex(run_contract.ResearchRunError, "heartbeat loss"):
+                collector.collect(
+                    args,
+                    now_fn=lambda: dt.datetime(2026, 11, 9, 15, 0, tzinfo=dt.timezone.utc),
+                    fetch_fn=fetch,
+                    rate_limit_fn=lambda *_args: None,
+                )
+
+        run_dir = next(self.output_root.glob("collection-*"))
+        self.assertEqual(fetch.call_count, 1)
+        self.assertFalse((run_dir / "manifest.json").exists())
+        count_records.assert_not_called()
+        self.assertEqual((run_dir / "observations.jsonl").stat().st_size, 0)
 
     def test_output_must_remain_separate_from_scanner_memory(self):
         args = self.args("--dry-run")
