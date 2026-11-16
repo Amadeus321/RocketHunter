@@ -113,7 +113,7 @@ jobs:
           PY
       - name: Run all deterministic tests and CLI smoke checks
         run: |
-          pip install pytest pytest-subtests
+          pip install pytest pytest-subtests requests
           python -m pytest tests/ -v
           python -m compileall -q scripts tests
           python scripts/rocket_hunt.py --help >/dev/null

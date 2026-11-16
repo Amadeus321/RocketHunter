@@ -11,9 +11,11 @@ Comprehensive unit and adversarial test suite for Rocket Hunter v4.30 Stage 3.2:
 - Protected data ledger SHA-256 equivalence preservation
 """
 
+from contextlib import contextmanager
 import dataclasses
 import datetime as dt
 import hashlib
+import json
 import math
 import os
 import tempfile
@@ -1853,6 +1855,17 @@ class TestMultiSizeAndIdentityConstraints(unittest.TestCase):
     """Test suite covering AC-10, AC-13, AC-14, AC-15."""
 
     def setUp(self):
+        super().setUp()
+        self.notif_cfg = Path("rocket-hunter-data/notification_config.json")
+        self._created_notif = False
+        self._created_notif_dir = False
+        if not self.notif_cfg.exists():
+            if not self.notif_cfg.parent.exists():
+                self.notif_cfg.parent.mkdir(parents=True, exist_ok=True)
+                self._created_notif_dir = True
+            self.notif_cfg.write_text('{"notifications_enabled": false}\n', encoding="utf-8")
+            self._created_notif = True
+
         self.entry_v2 = UniswapV2Evidence(
             chain_id=1,
             pool_address="0x1111111111111111111111111111111111111111",
@@ -1881,6 +1894,19 @@ class TestMultiSizeAndIdentityConstraints(unittest.TestCase):
             block_hash="0x" + "bb" * 32,
             parent_hash="0x" + "aa" * 32,
         )
+
+    def tearDown(self):
+        if getattr(self, "_created_notif", False) and self.notif_cfg.exists():
+            try:
+                self.notif_cfg.unlink()
+            except Exception:
+                pass
+        if getattr(self, "_created_notif_dir", False) and self.notif_cfg.parent.exists():
+            try:
+                self.notif_cfg.parent.rmdir()
+            except Exception:
+                pass
+        super().tearDown()
 
     def test_multi_size_simulation_depth_divergence(self):
         """AC-10: Standard simulation scenarios ($100-$5,000) depth divergence labeled strictly as scenarios."""
