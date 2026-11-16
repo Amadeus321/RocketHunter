@@ -34,6 +34,7 @@ from scripts.research_evidence import (
     TargetTouchClassification,
     CompleteReplayManifest,
     ReplayManifestBuilder,
+    get_actual_git_state,
     UniswapV2Evidence,
     UniswapV3Evidence,
     UniswapV3TickMath,
@@ -2833,10 +2834,14 @@ class TestMultiSizeAndIdentityConstraints(unittest.TestCase):
             notif_cfg = Path("rocket-hunter-data/notification_config.json")
             notif_sha = hashlib.sha256(notif_cfg.read_bytes()).hexdigest()
 
+            actual_head, actual_clean = get_actual_git_state()
+            current_head_sha = actual_head or "3a879cc38f6e60b51e9e8116fcdb43bdcbd1fbac"
+            current_tree_clean = bool(actual_clean) if actual_clean is not None else False
+
             # 1. Valid manifest build succeeds and generates deterministic 64-char digest
             manifest = ReplayManifestBuilder.build(
-                git_commit_sha="3a879cc38f6e60b51e9e8116fcdb43bdcbd1fbac",
-                is_working_tree_clean=False,
+                git_commit_sha=current_head_sha,
+                is_working_tree_clean=current_tree_clean,
                 input_datasets={"dataset_a": {"path": str(dataset_file), "sha256": actual_sha, "count": 2}},
                 configuration_hashes={"config": cfg_sha, "rocket-hunter-data/notification_config.json": notif_sha},
                 identity_bindings={"chain_id": 1},
@@ -2878,8 +2883,8 @@ class TestMultiSizeAndIdentityConstraints(unittest.TestCase):
             # 3. Adversarial: Malformed dataset SHA-256 format fails closed
             with self.assertRaises(ValueError) as ctx:
                 ReplayManifestBuilder.build(
-                    git_commit_sha="3a879cc38f6e60b51e9e8116fcdb43bdcbd1fbac",
-                    is_working_tree_clean=False,
+                    git_commit_sha=current_head_sha,
+                    is_working_tree_clean=current_tree_clean,
                     input_datasets={"dataset_a": {"path": str(dataset_file), "sha256": "ABCD", "count": 2}},
                     configuration_hashes={"config": cfg_sha},
                     identity_bindings={"chain_id": 1},
@@ -2894,8 +2899,8 @@ class TestMultiSizeAndIdentityConstraints(unittest.TestCase):
             # 4. Adversarial: Missing dataset file fails closed
             with self.assertRaises(ValueError) as ctx:
                 ReplayManifestBuilder.build(
-                    git_commit_sha="3a879cc38f6e60b51e9e8116fcdb43bdcbd1fbac",
-                    is_working_tree_clean=False,
+                    git_commit_sha=current_head_sha,
+                    is_working_tree_clean=current_tree_clean,
                     input_datasets={"dataset_a": {"path": str(tmp_path / "nonexistent.jsonl"), "sha256": actual_sha, "count": 2}},
                     configuration_hashes={"config": cfg_sha},
                     identity_bindings={"chain_id": 1},
@@ -2911,8 +2916,8 @@ class TestMultiSizeAndIdentityConstraints(unittest.TestCase):
             bogus_sha = hashlib.sha256(b"completely_different_content").hexdigest()
             with self.assertRaises(ValueError) as ctx:
                 ReplayManifestBuilder.build(
-                    git_commit_sha="3a879cc38f6e60b51e9e8116fcdb43bdcbd1fbac",
-                    is_working_tree_clean=False,
+                    git_commit_sha=current_head_sha,
+                    is_working_tree_clean=current_tree_clean,
                     input_datasets={"dataset_a": {"path": str(dataset_file), "sha256": bogus_sha, "count": 2}},
                     configuration_hashes={"config": cfg_sha},
                     identity_bindings={"chain_id": 1},
@@ -2927,8 +2932,8 @@ class TestMultiSizeAndIdentityConstraints(unittest.TestCase):
             # 6. Adversarial: Record count mismatch fails closed
             with self.assertRaises(ValueError) as ctx:
                 ReplayManifestBuilder.build(
-                    git_commit_sha="3a879cc38f6e60b51e9e8116fcdb43bdcbd1fbac",
-                    is_working_tree_clean=False,
+                    git_commit_sha=current_head_sha,
+                    is_working_tree_clean=current_tree_clean,
                     input_datasets={"dataset_a": {"path": str(dataset_file), "sha256": actual_sha, "count": 999}},
                     configuration_hashes={"config": cfg_sha},
                     identity_bindings={"chain_id": 1},
@@ -2943,8 +2948,8 @@ class TestMultiSizeAndIdentityConstraints(unittest.TestCase):
             # 7. Adversarial: Malformed configuration hash format fails closed
             with self.assertRaises(ValueError) as ctx:
                 ReplayManifestBuilder.build(
-                    git_commit_sha="3a879cc38f6e60b51e9e8116fcdb43bdcbd1fbac",
-                    is_working_tree_clean=False,
+                    git_commit_sha=current_head_sha,
+                    is_working_tree_clean=current_tree_clean,
                     input_datasets={"dataset_a": {"path": str(dataset_file), "sha256": actual_sha, "count": 2}},
                     configuration_hashes={"config": "1234"},
                     identity_bindings={"chain_id": 1},
@@ -2959,8 +2964,8 @@ class TestMultiSizeAndIdentityConstraints(unittest.TestCase):
             # 8. Adversarial: Timezone-naive valuation source timestamp fails closed
             with self.assertRaises(ValueError) as ctx:
                 ReplayManifestBuilder.build(
-                    git_commit_sha="3a879cc38f6e60b51e9e8116fcdb43bdcbd1fbac",
-                    is_working_tree_clean=False,
+                    git_commit_sha=current_head_sha,
+                    is_working_tree_clean=current_tree_clean,
                     input_datasets={"dataset_a": {"path": str(dataset_file), "sha256": actual_sha, "count": 2}},
                     configuration_hashes={"config": cfg_sha},
                     identity_bindings={"chain_id": 1},
@@ -2975,8 +2980,8 @@ class TestMultiSizeAndIdentityConstraints(unittest.TestCase):
             # 9. Adversarial: Untrusted valuation source fails closed
             with self.assertRaises(ValueError) as ctx:
                 ReplayManifestBuilder.build(
-                    git_commit_sha="3a879cc38f6e60b51e9e8116fcdb43bdcbd1fbac",
-                    is_working_tree_clean=False,
+                    git_commit_sha=current_head_sha,
+                    is_working_tree_clean=current_tree_clean,
                     input_datasets={"dataset_a": {"path": str(dataset_file), "sha256": actual_sha, "count": 2}},
                     configuration_hashes={"config": cfg_sha},
                     identity_bindings={"chain_id": 1},
@@ -2991,8 +2996,8 @@ class TestMultiSizeAndIdentityConstraints(unittest.TestCase):
             # 10. Adversarial: Missing required dataset_a fails closed
             with self.assertRaises(ValueError) as ctx:
                 ReplayManifestBuilder.build(
-                    git_commit_sha="3a879cc38f6e60b51e9e8116fcdb43bdcbd1fbac",
-                    is_working_tree_clean=False,
+                    git_commit_sha=current_head_sha,
+                    is_working_tree_clean=current_tree_clean,
                     input_datasets={"dataset_b": {"path": str(dataset_file), "sha256": actual_sha, "count": 2}},
                     configuration_hashes={"config": cfg_sha},
                     identity_bindings={"chain_id": 1},
@@ -3007,8 +3012,8 @@ class TestMultiSizeAndIdentityConstraints(unittest.TestCase):
             # 11. Adversarial: Incorrect repository root (missing .git) fails closed
             with self.assertRaises(ValueError) as ctx:
                 ReplayManifestBuilder.build(
-                    git_commit_sha="3a879cc38f6e60b51e9e8116fcdb43bdcbd1fbac",
-                    is_working_tree_clean=False,
+                    git_commit_sha=current_head_sha,
+                    is_working_tree_clean=current_tree_clean,
                     input_datasets={"dataset_a": {"path": str(dataset_file), "sha256": actual_sha, "count": 2}},
                     configuration_hashes={"config": cfg_sha, "rocket-hunter-data/notification_config.json": notif_sha},
                     identity_bindings={"chain_id": 1},
@@ -3024,8 +3029,8 @@ class TestMultiSizeAndIdentityConstraints(unittest.TestCase):
             # 12. Adversarial: Incomplete dependency inventory containing only python fails closed
             with self.assertRaises(ValueError) as ctx:
                 ReplayManifestBuilder.build(
-                    git_commit_sha="3a879cc38f6e60b51e9e8116fcdb43bdcbd1fbac",
-                    is_working_tree_clean=False,
+                    git_commit_sha=current_head_sha,
+                    is_working_tree_clean=current_tree_clean,
                     input_datasets={"dataset_a": {"path": str(dataset_file), "sha256": actual_sha, "count": 2}},
                     configuration_hashes={"config": cfg_sha, "rocket-hunter-data/notification_config.json": notif_sha},
                     identity_bindings={"chain_id": 1},
@@ -3044,8 +3049,8 @@ class TestMultiSizeAndIdentityConstraints(unittest.TestCase):
             incomplete_deps["inventory_status"] = "INCOMPLETE"
             with self.assertRaises(ValueError) as ctx:
                 ReplayManifestBuilder.build(
-                    git_commit_sha="3a879cc38f6e60b51e9e8116fcdb43bdcbd1fbac",
-                    is_working_tree_clean=False,
+                    git_commit_sha=current_head_sha,
+                    is_working_tree_clean=current_tree_clean,
                     input_datasets={"dataset_a": {"path": str(dataset_file), "sha256": actual_sha, "count": 2}},
                     configuration_hashes={"config": cfg_sha, "rocket-hunter-data/notification_config.json": notif_sha},
                     identity_bindings={"chain_id": 1},
@@ -3061,8 +3066,8 @@ class TestMultiSizeAndIdentityConstraints(unittest.TestCase):
             # 14. Adversarial: Unlisted configuration file omitted from manifest fails closed
             with self.assertRaises(ValueError) as ctx:
                 ReplayManifestBuilder.build(
-                    git_commit_sha="3a879cc38f6e60b51e9e8116fcdb43bdcbd1fbac",
-                    is_working_tree_clean=False,
+                    git_commit_sha=current_head_sha,
+                    is_working_tree_clean=current_tree_clean,
                     input_datasets={"dataset_a": {"path": str(dataset_file), "sha256": actual_sha, "count": 2}},
                     configuration_hashes={"config": cfg_sha},  # omitted notification_config.json
                     identity_bindings={"chain_id": 1},
@@ -3078,8 +3083,8 @@ class TestMultiSizeAndIdentityConstraints(unittest.TestCase):
             tampered_hashes = {"config": cfg_sha, "rocket-hunter-data/notification_config.json": "00" * 32}
             with self.assertRaises(ValueError) as ctx:
                 ReplayManifestBuilder.build(
-                    git_commit_sha="3a879cc38f6e60b51e9e8116fcdb43bdcbd1fbac",
-                    is_working_tree_clean=False,
+                    git_commit_sha=current_head_sha,
+                    is_working_tree_clean=current_tree_clean,
                     input_datasets={"dataset_a": {"path": str(dataset_file), "sha256": actual_sha, "count": 2}},
                     configuration_hashes=tampered_hashes,
                     identity_bindings={"chain_id": 1},
