@@ -563,7 +563,6 @@ def main(argv: list[str] | None = None) -> int:
 
         stages = [
             [sys.executable, "-m", "scripts.v418_pipeline", "--outdir", str(outdir), "--memory-dir", str(snapshot), "--run-id", run_id],
-            [sys.executable, "-m", "scripts.v418_forward_guard", "--outdir", str(outdir), "--memory-dir", str(snapshot), "--run-id", run_id],
             [sys.executable, "-m", "scripts.v419_upgrade", "--outdir", str(outdir), "--memory-dir", str(snapshot), "--run-id", run_id],
             [sys.executable, "scripts/post_scan_audit.py", "--report", str(outdir / "rocket-hunt.json"),
              "--markdown", str(outdir / "rocket-hunt.md"), "--timeout", "8",

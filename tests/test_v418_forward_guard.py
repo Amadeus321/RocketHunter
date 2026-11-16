@@ -124,5 +124,12 @@ class ForwardAgeGuardTests(unittest.TestCase):
         self.assertEqual(out["status"], "NO_AGE_QUALIFIED_FORWARD_CANDIDATE")
 
 
+    def test_missing_forward_report_defers_gracefully(self):
+        (self.root / "forward-24h-rocket.json").unlink()
+        summary = apply_forward_guard(self.root, self.memory, self.run_id)
+        self.assertEqual(summary["status"], "DEFERRED")
+        self.assertEqual(summary["eligible_forward_candidates"], 0)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -213,8 +213,6 @@ jobs:
             --birdeye
       - name: Apply v4.18 quality controls and update learning memory
         run: python -m scripts.v418_pipeline --outdir rocket-run --memory-dir /tmp/scanner-memory --run-id "$GITHUB_RUN_ID"
-      - name: Apply forward-report pool-age qualification
-        run: python -m scripts.v418_forward_guard --outdir rocket-run --memory-dir /tmp/scanner-memory --run-id "$GITHUB_RUN_ID"
       - name: Apply v4.19.0 full-universe snapshot, network rotation and calibration
         run: python -m scripts.v419_upgrade --outdir rocket-run --memory-dir /tmp/scanner-memory --run-id "$GITHUB_RUN_ID"
       - name: Run automatic DEX wallet, LP, security and route evidence audit

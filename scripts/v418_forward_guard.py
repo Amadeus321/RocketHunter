@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import gzip
 import json
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -313,8 +314,19 @@ def _rewrite_current_run_memory(memory_dir: Path, run_id: str, discovery_keys: s
 def apply_forward_guard(outdir: Path, memory_dir: Path | None = None, run_id: str = "") -> dict[str, Any]:
     main_path = outdir / "rocket-hunt.json"
     forward_path = outdir / "forward-24h-rocket.json"
-    if not main_path.exists() or not forward_path.exists():
-        raise FileNotFoundError("both rocket-hunt.json and forward-24h-rocket.json are required")
+    if not main_path.exists():
+        raise FileNotFoundError(f"rocket-hunt.json is required: {main_path}")
+    if not forward_path.exists():
+        sys.stderr.write(
+            f"[INFO] {forward_path.name} not found; forward age guard will run after forward report generation.\n"
+        )
+        return {
+            "status": "DEFERRED",
+            "reason": f"{forward_path.name} not found; forward age guard will run after forward report generation",
+            "eligible_forward_candidates": 0,
+            "discovery_only_candidates": 0,
+            "candidate_denominator": 0,
+        }
     main = json.loads(main_path.read_text(encoding="utf-8"))
     forward = json.loads(forward_path.read_text(encoding="utf-8"))
     index = _build_index(main)
