@@ -252,7 +252,7 @@ def main(argv=None):
         print("Discovery reached its bounded time slice; final verification/report stages were not started.", file=sys.stderr)
         return 124
     audit_result = None
-    if report_path.exists():
+    if report_path.exists() and not args.defer_completion:
         # Always attempt the read-only post-scan audit, even on a partial scan.
         # It emits explicit SKIPPED/UNVERIFIED rows when optional API keys are absent.
         audit_cmd = [sys.executable, str(SCRIPTS / "post_scan_audit.py"),
@@ -277,16 +277,17 @@ def main(argv=None):
             coverage.get("sources_ok", 0), coverage.get("sources_failed", 0), coverage.get("sources_skipped", 0)),
             flush=True)
         post = report.get("post_scan_audit") or {}
-        print("Post-scan audits: DEX sampled CVD=%s; CEX books=%s; GoPlus=%s; 0x EVM=%s; Jupiter Solana=%s." % (
-            (post.get("gecko_spot_cvd_audit") or {}).get("status", "MISSING"),
-            (post.get("cex_orderbook_audit") or {}).get("status", "MISSING"),
-            (post.get("goplus_security_audit") or {}).get("status", "MISSING"),
-            (post.get("dex_router_quote_audit") or {}).get("status", "MISSING"),
-            (post.get("solana_router_quote_audit") or {}).get("status", "MISSING")), flush=True)
+        if post:
+            print("Post-scan audits: DEX sampled CVD=%s; CEX books=%s; GoPlus=%s; 0x EVM=%s; Jupiter Solana=%s." % (
+                (post.get("gecko_spot_cvd_audit") or {}).get("status", "MISSING"),
+                (post.get("cex_orderbook_audit") or {}).get("status", "MISSING"),
+                (post.get("goplus_security_audit") or {}).get("status", "MISSING"),
+                (post.get("dex_router_quote_audit") or {}).get("status", "MISSING"),
+                (post.get("solana_router_quote_audit") or {}).get("status", "MISSING")), flush=True)
     except (OSError, ValueError):
         print("Coverage summary unavailable; inspect the JSON report.", flush=True)
     forecast_result = None
-    if report_path.exists() and scan_result.returncode == 0 and (audit_result is None or audit_result.returncode == 0):
+    if report_path.exists() and scan_result.returncode == 0 and (audit_result is None or audit_result.returncode == 0) and not args.defer_completion:
         forecast_cmd = build_forecast_command(outdir, args.timeout, args.gecko_request_interval, args.dex_limit)
         print("[forward-24h] Building scan-start-anchored DEX Top Rocket, current price, copyable pool/contract and one candle-derived TP.",
               flush=True)

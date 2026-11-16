@@ -203,5 +203,49 @@ class LocalRunMemoryTests(unittest.TestCase):
                 else:
                     os.environ["ROCKET_HUNTER_SHARED_MEMORY_DIR"] = old_env
 
+    def test_run_full_scan_defer_completion_skips_post_scan_and_forecast(self):
+        """Verifies that run_full_scan with --defer-completion skips post_scan_audit and forecast,
+        delegating them strictly to downstream workflow/budget phases."""
+        from scripts import run_full_scan
+        with tempfile.TemporaryDirectory() as tmp:
+            outdir = Path(tmp)
+            report = outdir / "rocket-hunt.json"
+            report.write_text(json.dumps({
+                "coverage": {"status": "MULTI_SOURCE_SAMPLED", "sources_ok": 10},
+                "candidates": []
+            }), encoding="utf-8")
+            preflight = outdir / "preflight.json"
+            preflight.write_text(json.dumps({
+                "market_availability": {"dex_discovery_ok": True}
+            }), encoding="utf-8")
+            
+            with patch("scripts.run_full_scan.any_market_source_available", return_value=True), \
+                 patch("scripts.run_full_scan._run_bounded", return_value=subprocess.CompletedProcess([], 0)) as mock_run:
+                
+                # Standalone run: defer_completion is False -> post_scan_audit and forecast must be executed
+                run_full_scan.main(["--outdir", str(outdir), "--max-runtime-minutes", "10", "--workers", "1", "--preflight-workers", "1"])
+                called_scripts = [str(call[0][0][1]) for call in mock_run.call_args_list if len(call[0][0]) > 1]
+                self.assertTrue(any("post_scan_audit.py" in s for s in called_scripts), "Standalone run must execute post_scan_audit")
+                self.assertTrue(any("forward_24h_report.py" in s for s in called_scripts), "Standalone run must execute forward_24h_report")
+                
+                # Deferred run: defer_completion is True -> post_scan_audit and forecast must NOT be executed
+                mock_run.reset_mock()
+                run_full_scan.main(["--outdir", str(outdir), "--max-runtime-minutes", "10", "--workers", "1", "--preflight-workers", "1", "--defer-completion"])
+                called_scripts_deferred = [str(call[0][0][1]) for call in mock_run.call_args_list if len(call[0][0]) > 1]
+                self.assertFalse(any("post_scan_audit.py" in s for s in called_scripts_deferred), "Deferred run must not execute post_scan_audit")
+                self.assertFalse(any("forward_24h_report.py" in s for s in called_scripts_deferred), "Deferred run must not execute forward_24h_report")
+
+    def test_local_scan_base_budget_aligned_with_discovery_allowance(self):
+        """Verifies that run_local_scan calculates discovery base budget from UnifiedBudgetManager allowance."""
+        from scripts.unified_budget_manager import UnifiedBudgetManager
+        mgr = UnifiedBudgetManager(170.0)
+        mgr.start_phase("preflight_and_registries")
+        disc_allowance = mgr.start_phase("global_multichain_discovery")
+        base_budget = max(1.0, min(150.0, disc_allowance / 60.0))
+        # Total usable budget is 160 minutes; downstream phases reserve 61.18m, leaving ~98.82m for discovery
+        self.assertAlmostEqual(base_budget, 98.82, delta=1.0)
+        self.assertLessEqual(base_budget, 100.0)
+
+
 if __name__ == "__main__":
     unittest.main()

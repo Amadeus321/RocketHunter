@@ -544,17 +544,16 @@ def main(argv: list[str] | None = None) -> int:
         env["ROCKET_HUNTER_SHARED_MEMORY_DIR"] = str(memory_dir)
         env["ROCKET_HUNTER_RUN_ID"] = run_id
         env["ROCKET_HUNTER_USER_DATA_DIR"] = str((ROOT / "rocket-hunter-data").resolve())
-        base_budget = max(1.0, min(150.0, args.max_runtime_minutes * 0.72))
-        cmds = [build_scan_command(args, outdir, base_budget)]
-
         disc_allowance = budget_mgr.start_phase("global_multichain_discovery")
         # Discovery must leave at least 25 minutes for enrichment, verification, and finalization
         disc_deadline = min(deadline - (25.0 * 60.0), time.monotonic() + disc_allowance)
+        base_budget = max(1.0, min(150.0, disc_allowance / 60.0))
+        cmds = [build_scan_command(args, outdir, base_budget)]
         state["unified_budget"] = budget_mgr.get_summary()
         status_path.write_text(json.dumps(state, indent=2) + "\n", encoding="utf-8")
 
         _run_required(cmds[0], disc_deadline, env, log_path, runtime_root,
-                      "bounded discovery/preflight/report stage failed")
+                      "bounded discovery/preflight stage failed")
         budget_mgr.end_phase("global_multichain_discovery")
 
         enrich_allowance = budget_mgr.start_phase("candidate_enrichment")
