@@ -55,12 +55,13 @@ def build_scan_command(args, outdir):
     return cmd
 
 
-def build_forecast_command(outdir, timeout=8, gecko_interval=12.0):
+def build_forecast_command(outdir, timeout=8, gecko_interval=12.0, dex_limit=200):
     """Build the scan-start-anchored forward-24h DEX Top Rocket/report stage."""
     return [sys.executable, str(SCRIPTS / "forward_24h_report.py"),
             "--report", str(outdir / "rocket-hunt.json"),
             "--markdown", str(outdir / "rocket-hunt.md"),
             "--out", str(outdir / "forward-24h-rocket.json"),
+            "--dex-limit", str(dex_limit),
             "--timeout", str(timeout), "--gecko-interval", str(gecko_interval)]
 
 
@@ -133,7 +134,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--gecko-request-interval", type=float, default=12.0)
     p.add_argument("--retries", type=int, default=2, help="transient HTTP retry attempts (0-5)")
     p.add_argument("--dex-search-limit", type=int, default=12)
-    p.add_argument("--dex-lookup-limit", type=int, default=160)
+    p.add_argument("--dex-lookup-limit", type=int, default=300)
+    p.add_argument("--security-limit", type=int, default=60)
+    p.add_argument("--dex-limit", type=int, default=200)
     p.add_argument("--resume", action="store_true", help="reuse successful checkpoint responses that are still fresh")
     p.add_argument("--resume-max-age-seconds", type=int, default=900)
     p.add_argument("--birdeye", action="store_true", help="enable Birdeye only when BIRDEYE_API_KEY is present")
@@ -254,6 +257,7 @@ def main(argv=None):
         # It emits explicit SKIPPED/UNVERIFIED rows when optional API keys are absent.
         audit_cmd = [sys.executable, str(SCRIPTS / "post_scan_audit.py"),
                      "--report", str(report_path), "--markdown", str(outdir / "rocket-hunt.md"),
+                     "--security-limit", str(args.security_limit),
                      "--timeout", str(args.timeout)]
         print("[post-scan] Auditing top candidates for CEX order-book depth, contract risk and optional router quotes.",
               flush=True)
@@ -283,7 +287,7 @@ def main(argv=None):
         print("Coverage summary unavailable; inspect the JSON report.", flush=True)
     forecast_result = None
     if report_path.exists() and scan_result.returncode == 0 and (audit_result is None or audit_result.returncode == 0):
-        forecast_cmd = build_forecast_command(outdir, args.timeout, args.gecko_request_interval)
+        forecast_cmd = build_forecast_command(outdir, args.timeout, args.gecko_request_interval, args.dex_limit)
         print("[forward-24h] Building scan-start-anchored DEX Top Rocket, current price, copyable pool/contract and one candle-derived TP.",
               flush=True)
         forecast_result = _run_bounded(forecast_cmd, ROOT, deadline)

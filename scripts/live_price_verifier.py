@@ -769,11 +769,16 @@ def refresh_and_filter_candidates(
         # STRICT ACTIONABLE CRITERIA:
         # Candidate MUST be genuinely verified/execution-ready by upstream audit
         # NEVER promote unverified research candidates into Section 1!
+        # Candidates ranked > 60 must possess verified loss-guard PASS to qualify
         is_cex = mkt_type == "cex_spot" or "CEX" in str(pool)
+        cand_rank = int(c.get("forecast_rank") or c.get("rank") or 0)
+        security_tier_passed = is_cex or cand_rank <= 60 or c.get("dex_loss_guard_status") == "PASS"
         upstream_qualified = (
-            bool(c.get("executable_route_verified"))
-            or str(c.get("entry_decision") or "").upper() == "QUALIFIED"
-            or str(c.get("verification_status") or "").upper() == "QUALIFIED"
+            security_tier_passed and (
+                bool(c.get("executable_route_verified"))
+                or str(c.get("entry_decision") or "").upper() == "QUALIFIED"
+                or str(c.get("verification_status") or "").upper() == "QUALIFIED"
+            )
         )
 
         if c.get("breakout_evidence_eligible") is True and upstream_qualified and len(actionable) < 10:

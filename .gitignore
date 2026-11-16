@@ -11,6 +11,12 @@ build/
 dist/
 *.egg-info/
 RocketHunter.exe
+RocketHunter*.zip
+RocketHunter-v4.30-Windows/
+review_package/
+review_package.zip
+*.patch
+scratch/
 
 # Local data & run caches
 rocket-hunter-data/

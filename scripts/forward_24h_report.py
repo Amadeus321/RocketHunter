@@ -66,7 +66,7 @@ def get_json(url, timeout=10):
         return json.loads(response.read().decode("utf-8")), utc_now()
 
 
-def pick_candidates(report, dex_limit=140, cex_limit=25):
+def pick_candidates(report, dex_limit=200, cex_limit=25):
     # Merge exact DEX pools across full-universe, short-window, extreme-gainer
     # and fresh-launch boards; retain CEX spot markets as a parallel research lane.
     selected_by_id = {}
@@ -1320,7 +1320,7 @@ def main(argv=None):
     parser.add_argument("--report", default="rocket-run/rocket-hunt.json")
     parser.add_argument("--markdown", default="rocket-run/rocket-hunt.md")
     parser.add_argument("--out", default="rocket-run/forward-24h-rocket.json")
-    parser.add_argument("--dex-limit", type=int, default=140)
+    parser.add_argument("--dex-limit", type=int, default=200)
     parser.add_argument("--cex-limit", type=int, default=25)
     parser.add_argument("--timeout", type=int, default=10)
     parser.add_argument("--gecko-interval", type=float, default=12.0)
@@ -1512,6 +1512,20 @@ def main(argv=None):
         )
         for rank, ranked in enumerate(doc["candidates"], 1):
             ranked["forecast_rank"] = rank
+            if ranked.get("market_type") == "dex_pool" and rank > 60:
+                # Central fail-closed policy: candidates outside deep security tier (rank > 60)
+                # cannot be actionable unless they possess independently verified PASS evidence.
+                if ranked.get("dex_loss_guard_status") != "PASS":
+                    ranked["dex_loss_guard_status"] = "BLOCKED_UNVERIFIED_OR_RISK"
+                    blockers = list(ranked.get("dex_loss_guard_blockers") or [])
+                    blockers.append("candidate outside deep security audit tier (rank > 60); contract safety unverified")
+                    ranked["dex_loss_guard_blockers"] = list(dict.fromkeys(blockers))
+                    entry_blockers = list(ranked.get("entry_blockers") or [])
+                    entry_blockers.extend(ranked["dex_loss_guard_blockers"])
+                    ranked["entry_blockers"] = list(dict.fromkeys(entry_blockers))
+                    ranked["risk_flags"] = list(dict.fromkeys(list(ranked.get("risk_flags") or []) + ["DEX_LOSS_PATTERN_GUARD_NOT_PASSED", "SECURITY_AUDIT_LIMIT_EXCEEDED"]))
+                    ranked["entry_decision"] = "TOP ROCKET — EXECUTION UNVERIFIED"
+                    ranked["verification_status"] = "DISCOVERY_UNVERIFIED_SAFETY"
         if doc.get("candidates"):
             # Preserve the old model's leader for comparison, but make all
             # headline leader fields follow the new blended breakout ranking.
@@ -1538,8 +1552,18 @@ def main(argv=None):
                 "Ranked for relative 24h upside potential using short-window acceleration plus "
                 "existing research evidence. This score is a heuristic, not a return forecast or probability."
             )
-        for item in doc.get("candidates", []):
+        for rank, item in enumerate(doc.get("candidates", []), 1):
             item_meta = meta.get(str(item.get("identity")), {})
+            loss_status = item_meta.get("dex_loss_guard_status") or "BLOCKED_UNVERIFIED_OR_RISK"
+            loss_blockers = list(item_meta.get("dex_loss_guard_blockers") or ["loss-pattern guard evidence missing"])
+            if item.get("market_type") == "dex_pool" and rank > 60:
+                if loss_status != "PASS":
+                    loss_status = "BLOCKED_UNVERIFIED_OR_RISK"
+                    loss_blockers.append("candidate outside deep security audit tier (rank > 60); contract safety unverified")
+                    item["entry_decision"] = "TOP ROCKET — EXECUTION UNVERIFIED"
+                    item["verification_status"] = "DISCOVERY_UNVERIFIED_SAFETY"
+                    item["risk_flags"] = list(dict.fromkeys(list(item.get("risk_flags") or []) + ["DEX_LOSS_PATTERN_GUARD_NOT_PASSED", "SECURITY_AUDIT_LIMIT_EXCEEDED"]))
+            loss_blockers = list(dict.fromkeys(loss_blockers))
             item.update({"pool_address": item_meta.get("pool_address"), "pair_url": item_meta.get("pair_url"),
                          "final_price_usd": item_meta.get("final_price_usd"),
                          "final_price_timestamp_utc": item_meta.get("final_price_timestamp_utc"),
@@ -1571,8 +1595,8 @@ def main(argv=None):
                          "upside_projection_confidence": item_meta.get("upside_projection_confidence"),
                          "tracked_token_orientation": item_meta.get("tracked_token_orientation"),
                          "tracked_token_orientation_verified": item_meta.get("tracked_token_orientation_verified"),
-                         "dex_loss_guard_status": item_meta.get("dex_loss_guard_status") or "BLOCKED_UNVERIFIED_OR_RISK",
-                         "dex_loss_guard_blockers": item_meta.get("dex_loss_guard_blockers") or ["loss-pattern guard evidence missing"]})
+                         "dex_loss_guard_status": loss_status,
+                         "dex_loss_guard_blockers": loss_blockers})
         top = doc.get("top_rocket_pick") or {}
         top_meta = meta.get(str(top.get("identity")), {})
         top.update({"pool_address": top_meta.get("pool_address"),

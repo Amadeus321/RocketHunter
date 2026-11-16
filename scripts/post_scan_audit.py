@@ -764,7 +764,7 @@ def main(argv=None):
     parser.add_argument("--book-depth", type=int, default=100)
     parser.add_argument("--book-notional-usd", type=float, default=100.0)
     parser.add_argument("--fee-bps", type=float, default=0.0)
-    parser.add_argument("--security-limit", type=int, default=12)
+    parser.add_argument("--security-limit", type=int, default=60)
     parser.add_argument("--router-limit", type=int, default=10)
     parser.add_argument("--router-notional-usd", type=float, default=100.0)
     args = parser.parse_args(argv)

@@ -141,7 +141,7 @@ def build_run_metadata(args: argparse.Namespace) -> dict:
         "gecko_request_interval_seconds": 12,
         "retries": 2,
         "dex_search_limit": 12,
-        "dex_lookup_limit": 160,
+        "dex_lookup_limit": 300,
     }
     fingerprint_input = json.dumps(configuration, sort_keys=True, separators=(",", ":"))
     return {
@@ -443,7 +443,7 @@ def build_scan_command(args: argparse.Namespace, outdir: Path, base_budget: floa
         "--max-runtime-minutes", str(base_budget), "--defer-completion", "--resume",
         "--gecko-pages", str(args.gecko_pages), "--network-sweep-limit", str(args.network_sweep_limit),
         "--gecko-request-interval", "12", "--retries", "2", "--dex-search-limit", "12",
-        "--dex-lookup-limit", "160", "--workers", str(args.workers),
+        "--dex-lookup-limit", "300", "--workers", str(args.workers),
         "--preflight-workers", str(args.preflight_workers),
     ]
     if args.birdeye:
@@ -457,10 +457,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--memory-dir", type=Path, default=DEFAULT_MEMORY, help="persistent local learning memory")
     p.add_argument("--max-runtime-minutes", type=float, default=170,
                    help="whole local run deadline; maximum 180 minutes")
-    p.add_argument("--gecko-pages", type=int, default=1,
-                   help="GeckoTerminal pages per list (1-3; default 1)")
-    p.add_argument("--network-sweep-limit", type=int, default=12,
-                   help="rotating GeckoTerminal networks per scan (0-24; default 12)")
+    p.add_argument("--gecko-pages", type=int, default=3,
+                   help="GeckoTerminal pages per list (1-3; default 3)")
+    p.add_argument("--network-sweep-limit", type=int, default=24,
+                   help="rotating GeckoTerminal networks per scan (0-24; default 24)")
     p.add_argument("--workers", type=int, default=4,
                    help="maximum scanner request threads (1-12; local default 4)")
     p.add_argument("--preflight-workers", type=int, default=4,
@@ -570,7 +570,7 @@ def main(argv: list[str] | None = None) -> int:
              "--markdown", str(outdir / "rocket-hunt.md"), "--timeout", "8",
              "--gecko-cvd-limit", str(max(0, getattr(args, "gecko_cvd_limit", 4))),
              "--book-limit", str(max(0, getattr(args, "book_limit", 4))),
-             "--security-limit", "24", "--router-limit", "24"],
+             "--security-limit", "60", "--router-limit", "24"],
         ]
         for cmd in stages:
             _run_required(cmd, enrich_deadline, env, log_path, runtime_root,
@@ -584,7 +584,7 @@ def main(argv: list[str] | None = None) -> int:
 
         forward = [sys.executable, "scripts/forward_24h_report.py", "--report", str(outdir / "rocket-hunt.json"),
                    "--markdown", str(outdir / "forward-24h-rocket.md"), "--out", str(outdir / "forward-24h-rocket.json"),
-                   "--dex-limit", "140", "--cex-limit", "25", "--timeout", "8", "--gecko-interval", "12.0"]
+                   "--dex-limit", "200", "--cex-limit", "25", "--timeout", "8", "--gecko-interval", "12.0"]
         (outdir / "forward-24h-rocket.md").write_text("", encoding="utf-8")
         _run_required(forward, deep_deadline, env, log_path, runtime_root,
                       "forward report generation failed")

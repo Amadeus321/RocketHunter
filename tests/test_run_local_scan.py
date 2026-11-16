@@ -24,8 +24,8 @@ def write_rows(path, rows):
 class LocalRunMemoryTests(unittest.TestCase):
     def test_local_scan_defaults_keep_gecko_discovery_bounded(self):
         args = run_local_scan.build_arg_parser().parse_args(["--outdir", "run-test"])
-        self.assertEqual(args.gecko_pages, 1)
-        self.assertEqual(args.network_sweep_limit, 12)
+        self.assertEqual(args.gecko_pages, 3)
+        self.assertEqual(args.network_sweep_limit, 24)
         self.assertEqual(args.workers, 4)
         self.assertEqual(args.preflight_workers, 4)
 
@@ -36,7 +36,9 @@ class LocalRunMemoryTests(unittest.TestCase):
         command = run_local_scan.build_scan_command(args, Path("run-test"), 120)
         self.assertEqual(command[command.index("--workers") + 1], "3")
         self.assertEqual(command[command.index("--preflight-workers") + 1], "2")
-        self.assertEqual(command[command.index("--gecko-pages") + 1], "1")
+        self.assertEqual(command[command.index("--gecko-pages") + 1], "3")
+        self.assertEqual(command[command.index("--network-sweep-limit") + 1], "24")
+        self.assertEqual(command[command.index("--dex-lookup-limit") + 1], "300")
 
     def test_local_worker_limits_reject_values_above_twelve(self):
         with contextlib.redirect_stderr(io.StringIO()):
