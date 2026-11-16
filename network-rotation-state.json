@@ -1,6 +1,6 @@
 {
   "collector_overlay_version": "4.19.0",
-  "cumulative_network_coverage_pct": 5.36,
+  "cumulative_network_coverage_pct": 5.38,
   "cumulative_networks_swept": [
     "aptos",
     "arbitrum",
@@ -16,10 +16,10 @@
     "ton"
   ],
   "cumulative_unique_networks_swept_count": 12,
-  "discovered_networks_total": 224,
+  "discovered_networks_total": 223,
   "last_rotation_offset": 0,
   "last_rotation_slot": 0,
-  "last_run_id": "43413126121",
+  "last_run_id": "43836790175",
   "last_selected_network_count": 12,
   "last_selected_networks": [
     "solana",
@@ -35,7 +35,7 @@
     "aptos",
     "blast"
   ],
-  "last_updated_utc": "2026-11-13T12:34:26Z",
+  "last_updated_utc": "2026-11-16T09:24:57Z",
   "pipeline_version": "4.19.0",
   "registry_complete": true,
   "registry_size_known": true,
