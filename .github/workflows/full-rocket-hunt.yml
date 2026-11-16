@@ -96,7 +96,7 @@ jobs:
           python -m scripts.v425_early_breakout --self-test
       - name: Restore current tracked DEX safety integration after legacy archive extraction
         run: |
-          git checkout HEAD -- scripts tests VERSION
+          git checkout HEAD -- scripts tests VERSION requirements.txt
       - name: Verify DEX loss-pattern gate wiring
         run: |
           python - <<'PY'
@@ -113,7 +113,7 @@ jobs:
           PY
       - name: Run all deterministic tests and CLI smoke checks
         run: |
-          pip install pytest pytest-subtests requests
+          pip install -r requirements.txt pytest pytest-subtests
           python -m pytest tests/ -v
           python -m compileall -q scripts tests
           python scripts/rocket_hunt.py --help >/dev/null
@@ -171,7 +171,7 @@ jobs:
           python -m scripts.v425_early_breakout --self-test
       - name: Restore current tracked DEX safety integration after legacy archive extraction
         run: |
-          git checkout HEAD -- scripts tests VERSION
+          git checkout HEAD -- scripts tests VERSION requirements.txt
       - name: Restore recent successful public-source checkpoints
         uses: actions/cache@v5
         with:

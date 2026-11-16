@@ -20,8 +20,8 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.11"
       - name: Restore base runtime and v4.15.3 overlay
@@ -74,7 +74,7 @@ jobs:
         run: |
           # Match the full-scan validation workflow: installers may patch or
           # replace tracked files, so tests must run against the exact PR tree.
-          git checkout HEAD -- scripts tests VERSION
+          git checkout HEAD -- scripts tests VERSION requirements.txt
       - name: Verify DEX loss-pattern gate wiring
         run: |
           python - <<'PY'
@@ -91,7 +91,8 @@ jobs:
           PY
       - name: Run all deterministic tests and CLI smoke checks
         run: |
-          pip install pytest pytest-subtests requests
+          pip install -r requirements.txt
+          pip install pytest pytest-subtests
           python -m pytest tests/ -v
           python -m compileall -q scripts tests
           python scripts/rocket_hunt.py --help >/dev/null
