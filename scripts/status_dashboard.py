@@ -1395,6 +1395,18 @@ function addLocalArchivedId(id) {{
   }} catch (_) {{}}
 }}
 
+function removeLocalArchivedId(id, pool) {{
+  try {{
+    const s = getLocalArchivedIds();
+    let changed = false;
+    if (id && s.has(id)) {{ s.delete(id); changed = true; }}
+    if (pool && s.has(pool)) {{ s.delete(pool); changed = true; }}
+    if (changed) {{
+      localStorage.setItem('rh_archived_positions', JSON.stringify(Array.from(s)));
+    }}
+  }} catch (_) {{}}
+}}
+
 let _cachedApiBase = null;
 async function getApiBase() {{
   if (_cachedApiBase !== null) return _cachedApiBase;
@@ -1423,6 +1435,11 @@ async function loadJournalData() {{
     if (!res.ok) return;
     const data = await res.json();
     const allPositions = data.positions || [];
+    allPositions.forEach(p => {{
+      if (!p.archived && (p.status || '').toUpperCase() === 'OPEN') {{
+        removeLocalArchivedId(p.id, p.pool_address);
+      }}
+    }});
     const localArchived = getLocalArchivedIds();
     const positions = allPositions.filter(p => !p.archived && (p.status || '').toUpperCase() !== 'ARCHIVED' && !localArchived.has(p.id) && !localArchived.has(p.pool_address));
     renderJournalTable(positions);

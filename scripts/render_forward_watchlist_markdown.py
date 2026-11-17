@@ -1188,6 +1188,43 @@ async function getWlApiBase() {{
   return _cachedWlApiBase;
 }}
 
+function getLocalTakenPools() {{
+  try {{
+    const raw = localStorage.getItem('rh_local_taken_positions');
+    return raw ? JSON.parse(raw) : {{}};
+  }} catch (_) {{
+    return {{}};
+  }}
+}}
+
+function saveLocalTakenPool(pool, payload) {{
+  try {{
+    const m = getLocalTakenPools();
+    const key = pool || payload.pair;
+    if (key) {{
+      m[key] = payload;
+      localStorage.setItem('rh_local_taken_positions', JSON.stringify(m));
+    }}
+  }} catch (_) {{}}
+}}
+
+function removeLocalTakenPool(pool, pair) {{
+  try {{
+    const m = getLocalTakenPools();
+    if (pool && m[pool]) delete m[pool];
+    if (pair && m[pair]) delete m[pair];
+    localStorage.setItem('rh_local_taken_positions', JSON.stringify(m));
+  }} catch (_) {{}}
+}}
+
+function findMatchingPosition(pool, pair, run) {{
+  if (pool) {{
+    const exact = journalPositions.find(p => p.pool_address === pool);
+    if (exact) return exact;
+  }}
+  return journalPositions.find(p => !p.pool_address && p.pair === pair && (!run || p.run_id === run));
+}}
+
 async function loadJournal() {{
   try {{
     const base = await getWlApiBase();
@@ -1195,19 +1232,37 @@ async function loadJournal() {{
     if (!res.ok) return;
     const data = await res.json();
     journalPositions = (data.positions || []).filter(p => !p.archived && (p.status || '').toUpperCase() !== 'ARCHIVED');
+    
+    // Sync any local offline selections to backend
+    const localTaken = getLocalTakenPools();
+    for (const [key, payload] of Object.entries(localTaken)) {{
+      const existsOnBackend = journalPositions.some(p => (payload.pool_address && p.pool_address === payload.pool_address) || (!payload.pool_address && p.pair === payload.pair));
+      if (!existsOnBackend && payload && payload.pair) {{
+        fetch(base + '/api/journal/record', {{
+          method: 'POST',
+          headers: {{'Content-Type': 'application/json'}},
+          body: JSON.stringify(payload)
+        }}).then(() => {{
+          removeLocalTakenPool(payload.pool_address, payload.pair);
+        }}).catch(() => {{}});
+      }}
+    }}
+    
     syncCandidateCheckboxes();
   }} catch (e) {{
     console.error('Error loading journal:', e);
+    syncCandidateCheckboxes();
   }}
 }}
 
 function syncCandidateCheckboxes() {{
   const chks = document.querySelectorAll('.pos-checkbox');
+  const localTaken = getLocalTakenPools();
   chks.forEach(chk => {{
     const pool = (chk.getAttribute('data-pool') || '').trim();
     const pair = (chk.getAttribute('data-pair') || '').trim();
     const run = (chk.getAttribute('data-run') || '').trim();
-    const match = journalPositions.find(p => (pool && p.pool_address === pool) || (p.pair === pair && p.run_id === run));
+    const match = findMatchingPosition(pool, pair, run) || (pool && localTaken[pool]) || (!pool && localTaken[pair]);
     chk.checked = !!match;
     if (chk.parentElement) {{
       const span = chk.parentElement.querySelector('span');
@@ -1226,9 +1281,23 @@ function syncCandidateCheckboxes() {{
 
 async function toggleCandidatePosition(el) {{
   const isChecked = el.checked;
-  const pool = el.getAttribute('data-pool') || '';
-  const pair = el.getAttribute('data-pair') || '';
-  const run = el.getAttribute('data-run') || '';
+  const pool = (el.getAttribute('data-pool') || '').trim();
+  const pair = (el.getAttribute('data-pair') || '').trim();
+  const run = (el.getAttribute('data-run') || '').trim();
+
+  // Optimistic UI update
+  if (el.parentElement) {{
+    const span = el.parentElement.querySelector('span');
+    if (isChecked) {{
+      el.parentElement.style.background = 'rgba(16, 185, 129, 0.2)';
+      el.parentElement.style.borderColor = 'rgba(16, 185, 129, 0.5)';
+      if (span) span.textContent = '✓ Taken';
+    }} else {{
+      el.parentElement.style.background = '';
+      el.parentElement.style.borderColor = '';
+      if (span) span.textContent = 'Take Position';
+    }}
+  }}
 
   if (isChecked) {{
     const payload = {{
@@ -1243,6 +1312,7 @@ async function toggleCandidatePosition(el) {{
       run_id: run,
       status: 'OPEN'
     }};
+    saveLocalTakenPool(pool, payload);
     try {{
       const base = await getWlApiBase();
       const res = await fetch(base + '/api/journal/record', {{
@@ -1252,21 +1322,23 @@ async function toggleCandidatePosition(el) {{
       }});
       const data = await res.json();
       if (data.status === 'OK' || data.status === 'EXISTS') {{
+        removeLocalTakenPool(pool, pair);
         showToast(`Position ${{pair}} recorded! Track follow-up in Status Dashboard.`);
         await loadJournal();
       }}
     }} catch (e) {{
-      showToast('Failed to record position (backend offline).', true);
+      showToast(`Position ${{pair}} saved! (Backend offline; will sync when app starts)`);
     }}
   }} else {{
-    const match = journalPositions.find(p => (pool && p.pool_address === pool) || (p.pair === pair && p.run_id === run));
+    removeLocalTakenPool(pool, pair);
+    const match = findMatchingPosition(pool, pair, run);
     if (match) {{
       try {{
         const base = await getWlApiBase();
         const res = await fetch(base + '/api/journal/delete', {{
           method: 'POST',
           headers: {{'Content-Type': 'application/json'}},
-          body: JSON.stringify({{id: match.id}})
+          body: JSON.stringify({{id: match.id, pool_address: pool}})
         }});
         const data = await res.json();
         if (data.status === 'OK') {{
@@ -1274,7 +1346,7 @@ async function toggleCandidatePosition(el) {{
           await loadJournal();
         }}
       }} catch (e) {{
-        showToast('Failed to remove position (backend offline).', true);
+        showToast(`Position ${{pair}} unselected.`);
       }}
     }}
   }}

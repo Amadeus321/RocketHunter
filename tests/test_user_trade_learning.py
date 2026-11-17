@@ -250,6 +250,40 @@ class TestUserTradeLearning(unittest.TestCase):
         self.assertEqual(len(active_p), 1)
         self.assertEqual(active_p[0]["id"], "pos_active_one")
 
+    def test_re_recording_archived_position_reactivates_to_open(self):
+        pos = {
+            "pair": "CLAUDIA / SOL",
+            "chain": "solana",
+            "entry_price": "0.006761",
+            "single_tp": "0.011626",
+            "potential_pct": "+71.97%",
+            "pool_address": "4XtavTkbwQpoTiQWswbyvBF3z4Cj5CjjfGGiDMZFk116",
+            "run_id": "run-reactivate-test",
+        }
+        # First record
+        res1 = utl.record_position(pos)
+        self.assertEqual(res1["status"], "OK")
+
+        # User unselects/archives it
+        del_res = utl.delete_position("4XtavTkbwQpoTiQWswbyvBF3z4Cj5CjjfGGiDMZFk116")
+        self.assertEqual(del_res["status"], "OK")
+
+        journal = utl.get_journal()
+        saved = [p for p in journal["positions"] if p.get("pool_address") == "4XtavTkbwQpoTiQWswbyvBF3z4Cj5CjjfGGiDMZFk116"][0]
+        self.assertTrue(saved.get("archived"))
+        self.assertEqual(saved.get("status"), "ARCHIVED")
+
+        # User clicks "Take Position" again on the same candidate
+        res2 = utl.record_position(pos)
+        self.assertEqual(res2["status"], "OK")
+        self.assertEqual(res2.get("action"), "REACTIVATED")
+
+        journal_after = utl.get_journal()
+        saved_after = [p for p in journal_after["positions"] if p.get("pool_address") == "4XtavTkbwQpoTiQWswbyvBF3z4Cj5CjjfGGiDMZFk116"][0]
+        self.assertFalse(saved_after.get("archived"))
+        self.assertEqual(saved_after.get("status"), "OPEN")
+        self.assertEqual(saved_after.get("entry_price"), "0.006761")
+
 
 if __name__ == "__main__":
     unittest.main()

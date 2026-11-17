@@ -177,10 +177,6 @@ def record_position(pos: dict[str, Any]) -> dict[str, Any]:
 
     pos_id = pos.get("id") or f"pos_{pair}_{pool[:8]}_{int(dt.datetime.now().timestamp())}".replace("/", "_")
 
-    for existing in positions:
-        if existing.get("id") == pos_id or (pool and existing.get("pool_address") == pool and existing.get("run_id") == run_id):
-            return {"status": "EXISTS", "position": existing}
-
     def _to_float(val: Any) -> float | None:
         if val is None or val == "":
             return None
@@ -198,6 +194,30 @@ def record_position(pos: dict[str, Any]) -> dict[str, Any]:
     trade_size = _to_float(pos.get("trade_size_usd"))
     realized_pnl = _to_float(pos.get("realized_pnl_pct", pos.get("final_pnl_pct")))
     theoretical_pnl = _to_float(pos.get("theoretical_pnl_pct"))
+
+    for existing in positions:
+        match_id = bool(pos_id and existing.get("id") == pos_id)
+        match_pool = bool(pool and existing.get("pool_address") == pool and (not run_id or existing.get("run_id") == run_id))
+        if match_id or match_pool:
+            is_inactive = bool(existing.get("archived") or (existing.get("status") or "").upper() in ("ARCHIVED", "CLOSED"))
+            if is_inactive:
+                existing["archived"] = False
+                existing["status"] = "OPEN"
+                existing["entered_at_ist"] = _now_ist_str()
+                existing["taken_at_utc"] = pos.get("taken_at_utc") or dt.datetime.now(dt.timezone.utc).isoformat()
+                existing["last_modified_in_version"] = version
+                existing["user_confirmed_taken"] = True
+                if entry_ref is not None:
+                    existing["entry_reference_price"] = entry_ref
+                if pos.get("entry_price"):
+                    existing["entry_price"] = str(pos.get("entry_price"))
+                if pos.get("single_tp"):
+                    existing["single_tp"] = str(pos.get("single_tp"))
+                if pos.get("potential_pct"):
+                    existing["potential_pct"] = str(pos.get("potential_pct"))
+                save_journal(journal)
+                return {"status": "OK", "position": existing, "action": "REACTIVATED"}
+            return {"status": "EXISTS", "position": existing}
 
     record = {
         "id": pos_id,
