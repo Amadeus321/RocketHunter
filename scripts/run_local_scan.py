@@ -459,8 +459,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
                    help="whole local run deadline; maximum 180 minutes")
     p.add_argument("--gecko-pages", type=int, default=1,
                    help="GeckoTerminal pages per list (1-3; default 1)")
-    p.add_argument("--network-sweep-limit", type=int, default=12,
-                   help="rotating GeckoTerminal networks per scan (0-24; default 12)")
+    p.add_argument("--network-sweep-limit", type=int, default=128,
+                   help="maximum live GeckoTerminal networks to sweep (default: up to 128)")
     p.add_argument("--workers", type=int, default=4,
                    help="maximum scanner request threads (1-12; local default 4)")
     p.add_argument("--preflight-workers", type=int, default=4,
@@ -468,8 +468,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--birdeye", action="store_true")
     p.add_argument("--gecko-cvd-limit", type=int, default=4,
                    help="number of top priority DEX candidates to sample for on-chain CVD (default 4)")
-    p.add_argument("--book-limit", type=int, default=4,
-                   help="number of top priority CEX candidates to sample for order-book depth (default 4)")
+    p.add_argument("--book-limit", type=int, default=0,
+                   help="number of CEX candidates to sample for order-book depth (default 0 for DEX-only scans)")
     return p
 
 
@@ -481,7 +481,7 @@ def main(argv: list[str] | None = None) -> int:
     if not 1 <= args.gecko_pages <= 3:
         p.error("--gecko-pages must be between 1 and 3 for a bounded local scan")
     from scripts.unified_network_registry import CANONICAL_NETWORKS
-    max_network_limit = max(64, len(CANONICAL_NETWORKS))
+    max_network_limit = max(128, len(CANONICAL_NETWORKS))
     if not 0 <= args.network_sweep_limit <= max_network_limit:
         p.error(f"--network-sweep-limit must be between 0 and {max_network_limit}")
     if not 1 <= args.workers <= 12 or not 1 <= args.preflight_workers <= 12:
@@ -584,7 +584,7 @@ def main(argv: list[str] | None = None) -> int:
 
         forward = [sys.executable, "scripts/forward_24h_report.py", "--report", str(outdir / "rocket-hunt.json"),
                    "--markdown", str(outdir / "forward-24h-rocket.md"), "--out", str(outdir / "forward-24h-rocket.json"),
-                   "--dex-limit", "140", "--cex-limit", "25", "--timeout", "8", "--gecko-interval", "12.0"]
+                   "--dex-limit", "140", "--cex-limit", "0", "--timeout", "8", "--gecko-interval", "12.0"]
         (outdir / "forward-24h-rocket.md").write_text("", encoding="utf-8")
         _run_required(forward, deep_deadline, env, log_path, runtime_root,
                       "forward report generation failed")

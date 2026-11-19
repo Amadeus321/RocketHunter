@@ -1845,6 +1845,7 @@ def update_position_monitor(outdir: Path, memory_dir: Path, run_id: str) -> dict
     # spot OHLCV. No quote-symbol whitelist can hide a good altcoin opportunity.
     updated = []
     gecko_last_request = 0.0
+    gecko_halt_reason = None
     request_count = 0
     monitor_rows = sorted(
         existing_by_key.values(),
@@ -1862,12 +1863,21 @@ def update_position_monitor(outdir: Path, memory_dir: Path, run_id: str) -> dict
             continue
         market_type = str(position.get("market_type") or ("dex_pool" if position.get("pool_address") else "cex_spot")).lower()
         if market_type == "dex_pool":
-            wait = GECKO_POSITION_INTERVAL_SECONDS - (time.monotonic() - gecko_last_request) if gecko_last_request else 0
-            if wait > 0:
-                time.sleep(wait)
-            bars, candle_url, error = _fetch_gecko_position_bars(position, timeout=8)
-            gecko_last_request = time.monotonic()
-            request_count += 1
+            if gecko_halt_reason:
+                bars, candle_url, error = [], None, "GeckoTerminal requests skipped after %s" % gecko_halt_reason
+            else:
+                wait = GECKO_POSITION_INTERVAL_SECONDS - (time.monotonic() - gecko_last_request) if gecko_last_request else 0
+                if wait > 0:
+                    time.sleep(wait)
+                bars, candle_url, error = _fetch_gecko_position_bars(position, timeout=8)
+                gecko_last_request = time.monotonic()
+                request_count += 1
+                if error:
+                    gecko_halt_reason = next(
+                        ("HTTP %s" % status for status in (403, 418, 429)
+                         if "HTTP Error %s" % status in error),
+                        None,
+                    )
             position["ohlcv_source"] = "GeckoTerminal exact tracked-token USD OHLCV"
         else:
             bars, candle_url, error = _fetch_cex_position_bars(position, venue_adapters, cex_fx, now)

@@ -60,15 +60,15 @@ def num(value):
 def get_json(url, timeout=10):
     req = urllib.request.Request(url, headers={
         "Accept": "application/json;version=20230203",
-        "User-Agent": "crypto-prebreakout-forward-24h/4.29.0 (read-only research)"
+        "User-Agent": "crypto-prebreakout-forward-24h/%s (read-only research)" % next_day_forecast.VERSION
     })
     with urllib.request.urlopen(req, timeout=timeout) as response:
         return json.loads(response.read().decode("utf-8")), utc_now()
 
 
-def pick_candidates(report, dex_limit=140, cex_limit=25):
+def pick_candidates(report, dex_limit=140, cex_limit=0):
     # Merge exact DEX pools across full-universe, short-window, extreme-gainer
-    # and fresh-launch boards; retain CEX spot markets as a parallel research lane.
+    # and fresh-launch boards; use DEX pools as the default research lane.
     selected_by_id = {}
     boards = (
         "universe_rows_v419", "discovery_rows_v421",
@@ -673,7 +673,7 @@ def build_market_context(report, candidates, btc_macro=None):
 
 class GeckoThrottle:
     def __init__(self, interval=12.0):
-        self.interval = interval
+        self.interval = max(12.0, float(interval))
         self.last = 0.0
         self.rate_limited = False
         self.rate_limit_reason = None
@@ -691,9 +691,9 @@ class GeckoThrottle:
         try:
             return get_json(url, timeout)
         except urllib.error.HTTPError as exc:
-            if exc.code in (418, 429):
+            if exc.code in (403, 418, 429):
                 self.rate_limited = True
-                self.rate_limit_reason = f"HTTP {exc.code} rate limit from provider: {exc}"
+                self.rate_limit_reason = f"HTTP {exc.code} from GeckoTerminal: {exc}"
             raise
 
 
@@ -1237,7 +1237,7 @@ def render_markdown(doc, report):
         return "\n".join([
             "## Forward 24-hour rocket forecast", "",
             "**General version:** %s  |  **Scan finished (UTC):** %s  |  **GitHub Actions run ID:** %s  |  **Run URL:** %s" % (
-                doc.get("general_version") or "v4.26.1", doc.get("scan_finished_utc") or "UNVERIFIED",
+                doc.get("general_version") or "v" + next_day_forecast.VERSION, doc.get("scan_finished_utc") or "UNVERIFIED",
                 doc.get("github_actions_run_id") or "UNAVAILABLE", clickable_run_url),
             "**Status: PICK WITHHELD — required evidence incomplete**", "",
             "**ZERO VERIFIED OPPORTUNITIES** passed every mandatory final gate.",
@@ -1249,7 +1249,7 @@ def render_markdown(doc, report):
         ])
     lines = ["## Forward 24-hour rocket forecast", "",
              "**General version:** %s  |  **Scan finished (UTC):** %s  |  **GitHub Actions run:** %s  |  **Run URL:** %s" % (
-                 doc.get("general_version") or "v4.26.1", doc.get("scan_finished_utc") or "UNVERIFIED",
+                 doc.get("general_version") or "v" + next_day_forecast.VERSION, doc.get("scan_finished_utc") or "UNVERIFIED",
                  doc.get("github_actions_run_id") or "UNAVAILABLE", clickable_run_url),
              "**Verified actionable opportunities:** %d" % len(doc.get("verified_actionable_opportunities") or []),
              "**Forecast window:** %s → %s  |  **Data snapshot:** %s  |  **Coverage:** %s" % (
@@ -1321,12 +1321,13 @@ def main(argv=None):
     parser.add_argument("--markdown", default="rocket-run/rocket-hunt.md")
     parser.add_argument("--out", default="rocket-run/forward-24h-rocket.json")
     parser.add_argument("--dex-limit", type=int, default=140)
-    parser.add_argument("--cex-limit", type=int, default=25)
+    parser.add_argument("--cex-limit", type=int, default=0,
+                        help="optional CEX research candidates (default: DEX-only)")
     parser.add_argument("--timeout", type=int, default=10)
     parser.add_argument("--gecko-interval", type=float, default=12.0)
     args = parser.parse_args(argv)
-    if args.dex_limit < 0 or args.cex_limit < 0 or args.timeout <= 0 or args.gecko_interval < 0:
-        parser.error("limits must be non-negative and timeout positive")
+    if args.dex_limit < 0 or args.cex_limit < 0 or args.timeout <= 0 or args.gecko_interval < 12.0:
+        parser.error("limits must be non-negative, timeout positive, and GeckoTerminal interval at least 12 seconds")
     try:
         report_path = Path(args.report)
         report = json.loads(report_path.read_text(encoding="utf-8"))
@@ -1384,10 +1385,10 @@ def main(argv=None):
             no_pick = {"schema": "crypto-prebreakout.forward-24h-rocket.v1", "status": "NO_QUALIFYING_PICK_REQUIRED_FIELDS_NOT_VERIFIED",
                        "scan_start_utc": scan_start, "forecast_window_start_utc": scan_start,
                        "forecast_window_end_utc": forecast_end, "as_of_utc": now,
-                       "universe": "SAMPLED ACCESSIBLE DEX DISCOVERY; 24 configured networks attempted, seven CEX boards run separately",
+                       "universe": "SAMPLED ACCESSIBLE DEX DISCOVERY: GeckoTerminal (up to 128 live networks), DexScreener and optional DEX-data aggregators; non-exhaustive",
                        "reason": "No DEX candidate had all required fields: exact pair address, fresh spot reference entry price, at least 20 hourly candles and one candle-derived single take-profit above entry. No incomplete Top Pick was published.",
                        "required_fields": ["entry_price", "single_take_profit", "pair_address", "dex_loss_guard_status=PASS"],
-                       "general_version": "v4.26.1", "scan_finished_utc": utc_now(),
+                       "general_version": "v" + next_day_forecast.VERSION, "scan_finished_utc": utc_now(),
                        "github_actions_run_id": os.environ.get("GITHUB_RUN_ID") or None,
                        "github_actions_run_url": (
                            "https://github.com/%s/actions/runs/%s" % (os.environ.get("GITHUB_REPOSITORY"), os.environ.get("GITHUB_RUN_ID"))
@@ -1415,7 +1416,7 @@ def main(argv=None):
             lines += ["", "### Forward 24h Top Pick", "",
                       "**NO QUALIFYING PICK — no complete three-field trade plan was supported by source data.**", "",
                       "Required fields: Entry price, Single take-profit, Pair address. The scanner will not invent any of them.",
-                      "", "CEX discovery remains in the broad mover report. Any published Top Pick must be DEX-only with an exact on-chain pair address."]
+                      "", "The discovery universe is DEX-only by default; any published Top Pick must have an exact on-chain pair address."]
             with Path(args.markdown).open("a", encoding="utf-8") as fh:
                 fh.write("\n\n" + "\n".join(lines) + "\n")
             print("Forward 24h Top Rocket: %s — no source-backed TP was available." % (top_pick.get("asset") if top_pick else "NO DEX PICK"), flush=True)
@@ -1431,7 +1432,7 @@ def main(argv=None):
         btc_macro_context = fetch_btc_macro_context(cex_fx, timeout=args.timeout)
         market_context = build_market_context(report, forecast_candidates, btc_macro=btc_macro_context)
         forecast_input = {"as_of_utc": snapshot, "forecast_window_start_utc": scan_start,
-                          "forecast_horizon_hours": 24, "universe": "SAMPLED ACCESSIBLE WEB3: GeckoTerminal/DexScreener DEX + seven CEX spot adapters + aggregators + Hyperliquid derivatives context",
+                          "forecast_horizon_hours": 24, "universe": "SAMPLED ACCESSIBLE DEX: GeckoTerminal/DexScreener pools and optional DEX-data aggregators; not an exhaustive census",
                           "spot_only": True, "require_field_provenance": True,
                           "require_chase_diagnostics": False, "candidates": forecast_candidates,
                           "market_context": market_context}
@@ -1624,7 +1625,7 @@ def main(argv=None):
         doc["scan_start_utc"] = scan_start
         doc["trailing_raw_24h_champion"] = (report.get("top_24h_gainers") or [None])[0]
         doc["forecast_generation_utc"] = snapshot
-        doc["general_version"] = "v4.26.1"
+        doc["general_version"] = "v" + next_day_forecast.VERSION
         doc["scan_finished_utc"] = utc_now()
         doc["github_actions_run_id"] = os.environ.get("GITHUB_RUN_ID") or None
         repository = os.environ.get("GITHUB_REPOSITORY")
@@ -1633,7 +1634,7 @@ def main(argv=None):
             "https://github.com/%s/actions/runs/%s" % (repository, run_id)
             if repository and run_id else None
         )
-        doc["universe"] = "SAMPLED ACCESSIBLE WEB3/DEFI: multi-chain DEX pool discovery plus configured CEX spot venues; not an exhaustive census"
+        doc["universe"] = "SAMPLED ACCESSIBLE DEX: multi-chain DEX pool discovery and optional DEX-data aggregators; not an exhaustive census"
         doc["data_collection"] = {"selected_dex_candidates": sum(1 for x in candidates if x.get("market_type") == "dex_pool"),
                                   "selected_cex_candidates": sum(1 for x in candidates if x.get("market_type") == "cex_spot"),
                                   "forecast_eligible_candidates": len(forecast_candidates),

@@ -28,7 +28,13 @@ COINPAPRIKA_ENDPOINT = ("coinpaprika_tickers", "https://api.coinpaprika.com/v1/t
 
 
 def fetch_json(url: str, timeout: float = 12.0) -> tuple[Any, int | None, str | None]:
-    request = Request(url, headers={"Accept": "application/json", "User-Agent": f"CryptoPreBreakout/{PIPELINE_VERSION} read-only"})
+    accept = "application/json;version=20230203" if url.startswith(
+        "https://api.geckoterminal.com/"
+    ) else "application/json"
+    request = Request(url, headers={
+        "Accept": accept,
+        "User-Agent": f"CryptoPreBreakout/{PIPELINE_VERSION} read-only",
+    })
     try:
         with urlopen(request, timeout=timeout) as response:
             raw = response.read(12 * 1024 * 1024 + 1)
@@ -170,7 +176,14 @@ def run_fast(outdir: Path, memory_dir: Path, run_id: str, no_network: bool = Fal
             source_status.append({"source": name, "status": "SKIPPED_TEST_MODE", "retrieved_utc": retrieved, "row_count": 0, "error": None})
     else:
         previous_gecko = None
+        gecko_halt_status = None
         for name, url in GECKO_ENDPOINTS:
+            if gecko_halt_status is not None:
+                source_status.append({"source": name, "status": "SKIPPED", "http_status": gecko_halt_status,
+                                     "retrieved_utc": retrieved, "row_count": 0,
+                                     "error": "GeckoTerminal requests halted after HTTP %s" % gecko_halt_status,
+                                     "url": url})
+                continue
             if previous_gecko is not None:
                 elapsed = time.monotonic() - previous_gecko
                 if elapsed < GECKO_INTERVAL_SECONDS:
@@ -182,6 +195,8 @@ def run_fast(outdir: Path, memory_dir: Path, run_id: str, no_network: bool = Fal
             target = "top_1h_movers" if "trending_1h" in name else "top_6h_movers" if "trending_6h" in name else "new_pools_under_24h"
             lanes[target].extend(rows)
             source_status.append({"source": name, "status": "OK" if error is None else "FAILED", "http_status": status, "retrieved_utc": retrieved, "row_count": len(rows), "error": error, "url": url})
+            if status in (403, 418, 429):
+                gecko_halt_status = status
         for name, url in DEXSCREENER_ENDPOINTS:
             payload, status, error = fetch_json(url)
             rows = parse_dexscreener(payload, name, retrieved) if error is None else []

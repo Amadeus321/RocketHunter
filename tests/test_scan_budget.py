@@ -5,18 +5,100 @@ import signal
 import subprocess
 import tempfile
 import time
+import urllib.error
 import unittest
 import sys
 from pathlib import Path
-from unittest.mock import Mock, patch
+from unittest.mock import MagicMock, Mock, patch
 
 from scripts.process_runner import run_bounded
 from scripts.run_full_scan import (
-    _mark_scan_state, _run_bounded, gecko_pacing_budget_minutes,
+    _mark_scan_state, _run_bounded, build_parser, build_scan_command,
+    gecko_pacing_budget_minutes,
 )
+from scripts.rocket_hunt import RocketHunter
+from scripts.post_scan_audit import audit_gecko_spot_cvd
+from scripts.venues import Fetcher
+from scripts import live_price_verifier
 
 
 class ScanBudgetTests(unittest.TestCase):
+    def test_scan_defaults_are_dex_only_and_sweep_the_bounded_network_registry(self):
+        args = build_parser().parse_args(["--outdir", "run-test"])
+
+        self.assertEqual(args.network_sweep_limit, 128)
+        self.assertIsNone(args.venue)
+        self.assertNotIn("--venue", build_scan_command(args, Path("run-test")))
+
+    def test_gecko_access_or_rate_limit_halts_followup_requests_without_retry(self):
+        for status in (403, 418, 429):
+            with self.subTest(status=status):
+                hunter = RocketHunter()
+                limited_fx = Mock()
+                limited_fx.timeout = 8
+                limited_fx.log = [{
+                    "url": "https://api.geckoterminal.com/example",
+                    "status": status,
+                    "error": "HTTP %d" % status,
+                }]
+                limited_fx.get.return_value = None
+
+                with patch("scripts.rocket_hunt.venues.Fetcher", return_value=limited_fx) as factory:
+                    self.assertIsNone(hunter._fetch_gecko_json(
+                        "gecko_test", "https://api.geckoterminal.com/example"
+                    ))
+                    self.assertIsNone(hunter._fetch_gecko_json(
+                        "gecko_test", "https://api.geckoterminal.com/next"
+                    ))
+
+                self.assertEqual(factory.call_args.kwargs["retries"], 0)
+                limited_fx.get.assert_called_once()
+
+    def test_gecko_cvd_uses_versioned_accept_header_and_stops_after_rate_limit(self):
+        candidates = [
+            {"chain": "base", "pool_address": "pool-1"},
+            {"chain": "base", "pool_address": "pool-2"},
+        ]
+        limited_response = (None, {"ok": False, "status": 429, "error": "HTTP 429"})
+        with patch("scripts.post_scan_audit._select_dex_candidates", return_value=candidates), \
+             patch("scripts.post_scan_audit._json_get", return_value=limited_response) as request:
+            result = audit_gecko_spot_cvd({}, limit=2)
+
+        request.assert_called_once()
+        self.assertEqual(request.call_args.kwargs["headers"]["Accept"], "application/json;version=20230203")
+        self.assertEqual(request.call_args.kwargs["retries"], 0)
+        self.assertEqual(result["audited"][1]["status"], "SKIPPED")
+
+    def test_gecko_fetcher_uses_required_versioned_accept_header(self):
+        response = MagicMock()
+        response.status = 200
+        response.read.return_value = b"{}"
+        response.__enter__.return_value = response
+        with patch("scripts.venues.urllib.request.urlopen", return_value=response) as request:
+            self.assertEqual(Fetcher().get("https://api.geckoterminal.com/api/v2/networks/base/pools"), {})
+
+        request_object = request.call_args.args[0]
+        self.assertEqual(request_object.get_header("Accept"), "application/json;version=20230203")
+
+    def test_gecko_security_check_stops_all_requests_after_rate_limit(self):
+        error = urllib.error.HTTPError(
+            "https://api.geckoterminal.com/example", 429, "Too Many Requests", {}, None,
+        )
+        with patch.object(live_price_verifier, "_GECKO_REQUESTS_HALTED", None), \
+             patch("scripts.live_price_verifier.urllib.request.urlopen", side_effect=error) as request:
+            bad, reason = live_price_verifier.check_geckoterminal_security(
+                "eth", "0x" + "a" * 40,
+            )
+            next_bad, next_reason = live_price_verifier.check_geckoterminal_security(
+                "eth", "0x" + "b" * 40,
+            )
+
+        self.assertTrue(bad)
+        self.assertTrue(next_bad)
+        self.assertIn("UNVERIFIED_GECKOTERMINAL_REQUESTS_HALTED", reason)
+        self.assertIn("UNVERIFIED_GECKOTERMINAL_REQUESTS_HALTED", next_reason)
+        request.assert_called_once()
+
     def test_interrupted_scan_cannot_leave_stale_actionable_pick(self):
         with tempfile.TemporaryDirectory() as temp:
             out = Path(temp)
@@ -134,7 +216,7 @@ class ScanBudgetTests(unittest.TestCase):
 
     def test_gecko_pacing_estimate_counts_paginated_network_and_registry_requests(self):
         self.assertAlmostEqual(gecko_pacing_budget_minutes(1, 12, 12), 10.2)
-        self.assertAlmostEqual(gecko_pacing_budget_minutes(3, 32, 12), 62.2)
+        self.assertAlmostEqual(gecko_pacing_budget_minutes(3, 32, 12), 23.8)
 
 
 if __name__ == "__main__":

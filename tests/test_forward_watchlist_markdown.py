@@ -1,9 +1,44 @@
 import unittest
+from unittest.mock import patch
 
 from scripts.render_forward_watchlist_markdown import render_report, render_html
 
 
 class ForwardWatchlistMarkdownTests(unittest.TestCase):
+    def setUp(self):
+        patchers = (
+            patch("scripts.render_forward_watchlist_markdown.run_comprehensive_security_check",
+                  return_value=(False, "PASS")),
+            patch("scripts.render_forward_watchlist_markdown.refresh_and_filter_candidates", None),
+        )
+        for patcher in patchers:
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def test_recomputes_potential_from_displayed_price_and_single_tp(self):
+        document = {
+            "unverified_research_watchlist": [{
+                "pair": "DCTY/WETH",
+                "price": 0.0001352,
+                "target_price": 0.0003465706,
+                "tp_upside_pct": 968.75,
+                "trade_plan": {"entry_price": 0.0001352, "single_take_profit": 0.0003465706},
+            }, {
+                "pair": "DacityCoin/TTWO",
+                "price": 0.0007895,
+                "target_price": 0.0040879811,
+                "tp_upside_pct": 467.67,
+                "trade_plan": {"entry_price": 0.0007895, "single_take_profit": 0.0040879811},
+            }],
+        }
+
+        report = render_report(document)
+
+        self.assertIn("+156.34%", report)
+        self.assertIn("+417.79%", report)
+        self.assertNotIn("+968.75%", report)
+        self.assertNotIn("+467.67%", report)
+
     def test_renders_source_backed_pair_tp_and_final_quality_gate(self):
         document = {
             "age_guard_summary": {"run_id": "test-1", "eligible_forward_candidates": 1, "raw_candidate_count": 3},
@@ -350,7 +385,6 @@ class ForwardWatchlistMarkdownTests(unittest.TestCase):
             ],
         }
 
-        # Check Markdown report
         md = render_report(doc)
         # Unified table header contains complete opportunity columns including Pool Age and Status
         self.assertIn("| Pair | Chain | Current Price | Single TP | Potential (% till TP) | Pool Address | Token Contract | Pool Age | Status |", md)

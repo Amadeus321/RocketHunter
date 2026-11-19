@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Hard-bounded, read-only preflight for DEX discovery and seven CEX spot feeds.
+"""Hard-bounded, read-only preflight for DEX discovery and optional CEX feeds.
 
 Each endpoint probe runs in a child process so a blocked DNS resolver cannot
 hold the whole scan beyond the configured timeout. This checks reachability,
@@ -125,7 +125,7 @@ def _probe_bounded(provider, kind, url, timeout, context):
 
 def run(names=None, timeout=6, workers=16, include_dex=True):
     """Run parallel endpoint probes with a hard per-endpoint wall-clock bound."""
-    names = list(names if names is not None else CEX_PROBES)
+    names = list(names or [])
     providers = list(names) + (list(DEX_PROBES) if include_dex else [])
     if len(set(providers)) != len(providers):
         providers = list(dict.fromkeys(providers))
@@ -188,10 +188,8 @@ def run(names=None, timeout=6, workers=16, include_dex=True):
     aggregator_market_ok = any(summary.get(x, {}).get("market_ok") for x in ("coingecko", "coinpaprika"))
     cex_market_ok = any(summary.get(x, {}).get("market_ok") for x in CEX_PROBES if x in summary)
     cex_venues_market_ok = [x for x in CEX_PROBES if summary.get(x, {}).get("market_ok")]
-    # An explicitly CEX-only preflight is allowed to recommend the reduced
-    # scanner when a CEX market endpoint works. The full path requires both a
-    # DEX discovery feed and a CEX market feed; aggregator-only is PARTIAL.
-    scanner_ready = cex_market_ok and (dex_market_ok or not include_dex)
+    # CEX feeds are optional; the local discovery path requires a DEX source.
+    scanner_ready = dex_market_ok
     any_market_ok = dex_market_ok or aggregator_market_ok or cex_market_ok
     return {"tool": "preflight.py", "results": rows, "summary": summary,
             "market_availability": {"dex_discovery_ok": dex_market_ok,
@@ -208,14 +206,14 @@ def run(names=None, timeout=6, workers=16, include_dex=True):
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--venue", action="append", choices=sorted(CEX_PROBES), help="repeat for CEX venues; defaults to all seven")
+    parser.add_argument("--venue", action="append", choices=sorted(CEX_PROBES), help="optional CEX venue probe; DEX-only by default")
     parser.add_argument("--timeout", type=float, default=6, help="hard timeout per endpoint (seconds)")
     parser.add_argument("--workers", type=int, default=16, help="parallel probe processes (default: 16)")
     parser.add_argument("--no-dex", action="store_true", help="skip DEX/aggregator reachability checks")
     parser.add_argument("--json", action="store_true")
     parser.add_argument("--out", default=None)
     args = parser.parse_args(argv)
-    data = run(args.venue or sorted(CEX_PROBES), args.timeout, args.workers, include_dex=not args.no_dex)
+    data = run(args.venue, args.timeout, args.workers, include_dex=not args.no_dex)
     if args.out:
         import json
         with open(args.out, "w", encoding="utf-8") as fh:

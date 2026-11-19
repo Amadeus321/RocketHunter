@@ -254,6 +254,7 @@ def _trade_cvd_window(trades, now, seconds):
 
 def audit_gecko_spot_cvd(report, limit=8, timeout=10, interval_seconds=12.0):
     """Sample the latest GeckoTerminal pool trades and calculate USD buy/sell delta."""
+    interval_seconds = max(12.0, float(interval_seconds))
     candidates = _select_dex_candidates(report, limit)
     if not candidates:
         return {"provider": "GeckoTerminal public on-chain trades", "status": "NO_CANDIDATES",
@@ -263,6 +264,7 @@ def audit_gecko_spot_cvd(report, limit=8, timeout=10, interval_seconds=12.0):
                        "cronos": "cro", "sei": "sei-network"}
     audited, logs = [], []
     last_completed = None
+    gecko_halt_reason = None
     for row in candidates:
         network = str(row.get("chain") or "").lower()
         network = network_aliases.get(network, network)
@@ -275,6 +277,10 @@ def audit_gecko_spot_cvd(report, limit=8, timeout=10, interval_seconds=12.0):
             item.update({"status": "UNVERIFIED", "reason": "Exact network slug or pool address is missing."})
             audited.append(item)
             continue
+        if gecko_halt_reason:
+            item.update({"status": "SKIPPED", "reason": "GeckoTerminal requests stopped after %s" % gecko_halt_reason})
+            audited.append(item)
+            continue
         if last_completed is not None and interval_seconds > 0:
             wait = interval_seconds - (time.monotonic() - last_completed)
             if wait > 0:
@@ -283,9 +289,14 @@ def audit_gecko_spot_cvd(report, limit=8, timeout=10, interval_seconds=12.0):
         url = "%s/networks/%s/pools/%s/trades?%s" % (
             "https://api.geckoterminal.com/api/v2", urllib.parse.quote(network, safe=""),
             urllib.parse.quote(pool, safe=""), params)
-        payload, log = _json_get(url, timeout=timeout, retries=2)
+        payload, log = _json_get(
+            url, headers={"Accept": "application/json;version=20230203"},
+            timeout=timeout, retries=0,
+        )
         last_completed = time.monotonic()
         logs.append(log)
+        if log.get("status") in (403, 418, 429):
+            gecko_halt_reason = "HTTP %s" % log["status"]
         trades = payload.get("data", []) if isinstance(payload, dict) else []
         if not isinstance(trades, list) or not trades:
             item.update({"status": "UNVERIFIED", "reason": log.get("error") or "No recent trade data returned.",

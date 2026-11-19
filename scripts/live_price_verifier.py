@@ -41,6 +41,7 @@ DEXSCREENER_TOKENS_API = "https://api.dexscreener.com/latest/dex/tokens/{tokens}
 DEFILLAMA_PRICES_API = "https://coins.llama.fi/prices/current/{coins}"
 GOPLUS_SECURITY_API = "https://api.gopluslabs.io/api/v1/token_security/{chain_id}?contract_addresses={tokens}"
 GECKOTERMINAL_TOKEN_API = "https://api.geckoterminal.com/api/v2/networks/{network}/tokens/{address}/info"
+_GECKO_REQUESTS_HALTED = None
 RUGCHECK_API = "https://api.rugcheck.xyz/v1/tokens/{mint}/report/summary"
 HONEYPOT_IS_API = "https://api.honeypot.is/v2/IsHoneypot?address={address}&chainID={chain_id}"
 
@@ -78,6 +79,10 @@ CHAIN_MAP_GECKO = {
 
 
 def _http_get_json(url: str, headers_extra: dict[str, str] | None = None, timeout: float = 6.0, retries: int = 2) -> Any:
+    global _GECKO_REQUESTS_HALTED
+    is_gecko = urllib.parse.urlparse(url).hostname == "api.geckoterminal.com"
+    if is_gecko and _GECKO_REQUESTS_HALTED:
+        return None
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
         "Accept": "application/json",
@@ -90,6 +95,10 @@ def _http_get_json(url: str, headers_extra: dict[str, str] | None = None, timeou
             with urllib.request.urlopen(req, timeout=timeout) as response:
                 return json.loads(response.read().decode("utf-8"))
         except urllib.error.HTTPError as exc:
+            if is_gecko and exc.code in (403, 418, 429):
+                _GECKO_REQUESTS_HALTED = "HTTP %s" % exc.code
+                logger.debug(f"GeckoTerminal requests halted after HTTP {exc.code}")
+                return None
             if exc.code == 429 and attempt < retries:
                 time.sleep(1.2 * (attempt + 1))
                 continue
@@ -375,10 +384,14 @@ def check_geckoterminal_security(chain: str, contract_address: str) -> tuple[boo
     network = CHAIN_MAP_GECKO.get(chain_norm)
     if not network or not contract_address or len(contract_address) < 10:
         return False, "PASS"
+    if _GECKO_REQUESTS_HALTED:
+        return True, "UNVERIFIED_GECKOTERMINAL_REQUESTS_HALTED: %s" % _GECKO_REQUESTS_HALTED
 
     url = GECKOTERMINAL_TOKEN_API.format(network=network, address=contract_address.strip())
     headers = {"Accept": "application/json;version=20230203"}
-    data = _http_get_json(url, headers_extra=headers, timeout=5.0, retries=2)
+    data = _http_get_json(url, headers_extra=headers, timeout=5.0, retries=0)
+    if _GECKO_REQUESTS_HALTED:
+        return True, "UNVERIFIED_GECKOTERMINAL_REQUESTS_HALTED: %s" % _GECKO_REQUESTS_HALTED
     if not isinstance(data, dict):
         return False, "PASS"
 
