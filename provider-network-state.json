@@ -1,8 +1,8 @@
 {
   "coverage_boundary": "Provider registries use provider-specific identifiers and scopes. Counts must not be summed as unique real-world blockchains without a verified cross-provider chain-ID mapping. A registry is not proof that every pool or token has been crawled.",
   "discovery_sources_version": "4.23.0",
-  "last_run_id": "43857192490",
-  "last_updated_utc": "2026-11-16T12:42:24Z",
+  "last_run_id": "44530332279",
+  "last_updated_utc": "2026-11-19T14:14:28Z",
   "providers": {},
   "schema": "crypto-prebreakout.provider-network-coverage.v1"
 }
