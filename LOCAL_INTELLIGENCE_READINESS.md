@@ -2,6 +2,10 @@
 
 **Overall: NOT READY.** The latest finalized collector, `collection-20261110T114557Z-97504db8811b`, reached its 8-request limit with 8 observed records across active candidates in 85.0 seconds under 12-second pacing (`REQUEST_LIMIT_REACHED`). Across 20 collection sessions (18 finalized, plus 2 pending unfinalized sessions excluded from analysis), there are **2,709 valid completed hourly bars**, **81 loaded observations**, and 60 exact-identity joins, with **6 complete 24-hour windows**. Latest finalized-input candle analysis is `candle-outcomes-v4-9aacdbccedbedc9301ff324c`. Intrahour order, execution fills, and slip remain unsupported. The 6 complete windows do not establish broad coverage, effectiveness, or readiness.
 
+## v4.30.2 software update (2026-11-19)
+
+The watchlist renderer now recomputes single-TP potential from the displayed reference price and target instead of trusting a cached percentage. Default local/full scans are DEX-only, expand the bounded GeckoTerminal network sweep to up to 128 live networks, and retain the existing hard maximum of 180 minutes. These are code changes only: no scan, collector, or provider request was run for this update, no research data or reports were rewritten, and the measured counts above remain the last recorded evidence. Readiness remains **NOT READY**.
+
 ## Roadmap status
 
 | Roadmap item | Status | Evidence and remaining gap |

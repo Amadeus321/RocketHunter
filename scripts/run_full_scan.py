@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Preflight network access, then run the configured DEX-first/CEX-second scan.
+"""Preflight network access, then run a bounded DEX-first scan.
 
 Can run locally or from a hosted runner. It uses public/read-only market
 endpoints and never submits orders. It stops early when every source is
@@ -31,7 +31,7 @@ def any_market_source_available(preflight):
 
 
 def build_scan_command(args, outdir):
-    venues = args.venue or list(DEFAULT_VENUES)
+    venues = args.venue or []
     cmd = [sys.executable, str(SCRIPTS / "rocket_hunt.py"),
            "--out", str(outdir / "rocket-hunt.json"),
            "--md", str(outdir / "rocket-hunt.md"),
@@ -80,7 +80,7 @@ def gecko_pacing_budget_minutes(pages, network_limit, request_interval, registry
     """Upper bound scheduled Gecko requests, including global and registry pages."""
     page_count = max(1, min(10, int(pages)))
     network_count = max(0, int(network_limit))
-    planned_calls = page_count * (4 + network_count * 3) + max(0, int(registry_page_cap))
+    planned_calls = page_count * 4 + network_count * 3 + max(0, int(registry_page_cap))
     return max(0, planned_calls - 1) * max(0.0, float(request_interval)) / 60.0
 
 
@@ -123,13 +123,15 @@ def _mark_scan_state(outdir, status, started_utc, started_mono, run_id=None):
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--outdir", default="rocket-run", help="directory for preflight, JSON/Markdown, logs and checkpoints")
-    p.add_argument("--venue", action="append", choices=DEFAULT_VENUES, help="CEX spot venue; repeatable (default: all seven)")
+    p.add_argument("--venue", action="append", choices=DEFAULT_VENUES,
+                   help="optional CEX spot venue; repeatable (default: DEX-only)")
     p.add_argument("--preflight-timeout", type=float, default=5.0, help="hard-bounded preflight timeout per endpoint")
     p.add_argument("--preflight-workers", type=int, default=16)
     p.add_argument("--timeout", type=int, default=8, help="per-request timeout for the full scan")
     p.add_argument("--workers", type=int, default=8)
     p.add_argument("--gecko-pages", type=int, default=3)
-    p.add_argument("--network-sweep-limit", type=int, default=24)
+    p.add_argument("--network-sweep-limit", type=int, default=128,
+                   help="maximum live GeckoTerminal networks to sweep (default: up to 128)")
     p.add_argument("--gecko-request-interval", type=float, default=12.0)
     p.add_argument("--retries", type=int, default=2, help="transient HTTP retry attempts (0-5)")
     p.add_argument("--dex-search-limit", type=int, default=12)
@@ -183,13 +185,13 @@ def main(argv=None):
     if not 1 <= args.gecko_pages <= 10:
         p.error("--gecko-pages must be between 1 and 10")
     from scripts.unified_network_registry import CANONICAL_NETWORKS
-    max_network_limit = max(64, len(CANONICAL_NETWORKS))
+    max_network_limit = max(128, len(CANONICAL_NETWORKS))
     if not 0 <= args.network_sweep_limit <= max_network_limit:
         p.error(f"--network-sweep-limit must be between 0 and {max_network_limit}")
     if args.preflight_timeout <= 0 or args.timeout <= 0 or args.workers <= 0 or args.preflight_workers <= 0:
         p.error("timeouts and worker counts must be positive")
-    if args.gecko_request_interval < 0:
-        p.error("--gecko-request-interval must be non-negative")
+    if args.gecko_request_interval < 12.0:
+        p.error("--gecko-request-interval must be at least 12 seconds")
     if not 0 <= args.retries <= 5:
         p.error("--retries must be between 0 and 5")
     if not 1 <= args.dex_search_limit <= 12 or args.dex_lookup_limit < 0:
@@ -204,7 +206,7 @@ def main(argv=None):
               "--timeout", str(args.preflight_timeout),
               "--workers", str(args.preflight_workers),
               "--json", "--out", str(preflight_path)]
-    for venue in (args.venue or DEFAULT_VENUES):
+    for venue in (args.venue or []):
         pf_cmd += ["--venue", venue]
 
     print("[1/2] Checking market-source network access (read-only probes)...", flush=True)
@@ -231,7 +233,7 @@ def main(argv=None):
     pacing_minutes = gecko_pacing_budget_minutes(
         args.gecko_pages, args.network_sweep_limit, args.gecko_request_interval,
     )
-    print("[2/2] Running configured DEX-first discovery and seven-venue CEX pass. "
+    print("[2/2] Running DEX discovery (CEX discovery is opt-in with --venue). "
           "The maximum GeckoTerminal pacing budget is about %.1f minutes before network/processing overhead." %
           pacing_minutes,
           flush=True)
@@ -255,7 +257,7 @@ def main(argv=None):
         audit_cmd = [sys.executable, str(SCRIPTS / "post_scan_audit.py"),
                      "--report", str(report_path), "--markdown", str(outdir / "rocket-hunt.md"),
                      "--timeout", str(args.timeout)]
-        print("[post-scan] Auditing top candidates for CEX order-book depth, contract risk and optional router quotes.",
+        print("[post-scan] Auditing top candidates for contract risk and optional router quotes.",
               flush=True)
         audit_result = _run_bounded(audit_cmd, ROOT, deadline)
         if audit_result.returncode == 124:

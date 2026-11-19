@@ -25,7 +25,7 @@ class LocalRunMemoryTests(unittest.TestCase):
     def test_local_scan_defaults_keep_gecko_discovery_bounded(self):
         args = run_local_scan.build_arg_parser().parse_args(["--outdir", "run-test"])
         self.assertEqual(args.gecko_pages, 1)
-        self.assertEqual(args.network_sweep_limit, 12)
+        self.assertEqual(args.network_sweep_limit, 128)
         self.assertEqual(args.workers, 4)
         self.assertEqual(args.preflight_workers, 4)
 

@@ -128,9 +128,7 @@ def _candidate_opportunity_fields(candidate: dict[str, Any]) -> tuple[float | No
     if target is None:
         target = _number(candidate.get("target_price"))
 
-    potential = _number(candidate.get("tp_upside_pct"))
-    if potential is None and entry is not None and target is not None and entry > 0:
-        potential = canonical_tp_upside(entry, target)
+    potential = canonical_tp_upside(entry, target)
 
     market_type = str(candidate.get("market_type") or "").lower()
     venue = str(candidate.get("venue") or candidate.get("chain") or "").strip()
@@ -439,7 +437,7 @@ def render_report(document: dict[str, Any]) -> str:
         for candidate in actionable:
             plan = candidate.get("trade_plan") if isinstance(candidate.get("trade_plan"), dict) else {}
             entry, target, potential, pool, token = _candidate_opportunity_fields(candidate)
-            pot_val = _number(candidate.get("tp_upside_pct")) or potential or 0.0
+            pot_val = potential or 0.0
             lines.append("| %s | %s | %s | %s | %+.2f%% | `%s` | `%s` | %s | %s | %s |" % (
                 candidate.get("pair") or candidate.get("asset") or "—",
                 candidate.get("chain") or "—",
@@ -794,7 +792,7 @@ def render_html(document: dict[str, Any]) -> str:
         for c in actionable:
             plan = c.get("trade_plan") if isinstance(c.get("trade_plan"), dict) else {}
             entry, target, potential, pool, token = _candidate_opportunity_fields(c)
-            pot_val = _number(c.get("tp_upside_pct")) or potential or 0.0
+            pot_val = potential or 0.0
             act_rows.append(
                 f"<tr>"
                 f"<td><strong>{_esc(c.get('pair') or c.get('asset') or '—')}</strong></td>"
@@ -914,7 +912,7 @@ def render_html(document: dict[str, Any]) -> str:
             # Enforce user requirement: to "24-Hour Reference-Position Monitoring" add only "Verified Actionable Opportunities"
             for item in actionable:
                 entry, target, potential, pool, token = _candidate_opportunity_fields(item)
-                pot_val = _number(item.get("tp_upside_pct")) or potential or 0.0
+                pot_val = potential or 0.0
                 pair_name = item.get("pair") or item.get("asset") or "Unknown"
                 market = item.get("chain") or "solana"
                 target_str = f"${_price(target)}" if target is not None else "unavailable"

@@ -355,6 +355,7 @@ class RocketHunter:
         # around 5 requests/minute, leaving headroom for dynamic registry reads.
         self.gecko_request_interval = 12.0
         self._gecko_last_request = 0.0
+        self._gecko_halt_reason = None
         self._gecko_lock = threading.Lock()
         self._checkpoint_lock = threading.RLock()
         self.checkpoint_dir = Path(checkpoint_dir) if checkpoint_dir else None
@@ -432,13 +433,18 @@ class RocketHunter:
                                       separators=(",", ":")), encoding="utf-8")
             os.replace(str(tmp), str(path))
 
-    def _fetch_json(self, source, url):
+    def _fetch_json(self, source, url, stop_on_rate_limit=False):
         hit, cached_payload = self._fetch_cached(source, url)
         if hit:
             return cached_payload
-        payload = self.fx.get(url)
+        fx = self.fx
+        if stop_on_rate_limit:
+            fx = venues.Fetcher(timeout=self.fx.timeout, retries=0, pause=0)
+        payload = fx.get(url)
         ok = payload is not None
-        log_row = next((x for x in reversed(self.fx.log) if x.get("url") == url), {})
+        log_row = next((x for x in reversed(fx.log) if x.get("url") == url), {})
+        if fx is not self.fx:
+            self.fx.log.extend(fx.log)
         retrieved = log_row.get("retrieved_utc", utc_iso())
         row = {"source": source, "url": url, "status": "OK" if ok else "FAILED",
                "row_count": len(_items(payload)) if ok else 0,
@@ -454,15 +460,24 @@ class RocketHunter:
         Successful cached responses on --resume bypass pacing; only live calls
         consume the public API request budget.
         """
-        hit, cached_payload = self._fetch_cached(source, url)
-        if hit:
-            return cached_payload
         with self._gecko_lock:
+            if self._gecko_halt_reason:
+                self._record_source({"source": source, "url": url, "status": "SKIPPED",
+                                     "row_count": 0, "retrieved_utc": utc_iso(),
+                                     "error": "GeckoTerminal requests stopped after %s" % self._gecko_halt_reason})
+                return None
+            hit, cached_payload = self._fetch_cached(source, url)
+            if hit:
+                return cached_payload
             wait = self.gecko_request_interval - (time.monotonic() - self._gecko_last_request)
             if self._gecko_last_request and wait > 0:
                 time.sleep(wait)
             self._gecko_last_request = time.monotonic()
-            return self._fetch_json(source, url)
+            payload = self._fetch_json(source, url, stop_on_rate_limit=True)
+            log_row = next((x for x in reversed(self.fx.log) if x.get("url") == url), {})
+            if log_row.get("status") in (403, 418, 429):
+                self._gecko_halt_reason = "HTTP %s" % log_row["status"]
+            return payload
 
     def cex_boards(self, venue_names):
         def one(name):
@@ -927,15 +942,16 @@ class RocketHunter:
             self.add_optional_birdeye(os.environ.get("BIRDEYE_API_KEY"))
             dex_first_sources.append("birdeye_solana")
 
-        # Secondary pass: CEX listings are discovered only after DEX discovery.
-        self.cex_boards(venues_to_scan)
+        # CEX listings are an explicit opt-in; normal scans stay DEX-only.
+        if venues_to_scan:
+            self.cex_boards(venues_to_scan)
         if include_coingecko:
             self.coingecko_trending()
             self.coingecko_markets(pages=coingecko_pages)
         if include_coinpaprika:
             self.coinpaprika_markets()
         data = self.build_output()
-        data["coverage"]["scan_order"] = dex_first_sources + ["cex_spot"] + (
+        data["coverage"]["scan_order"] = dex_first_sources + (["cex_spot"] if venues_to_scan else []) + (
             ["coingecko"] if include_coingecko else []) + (["coinpaprika"] if include_coinpaprika else [])
         data["coverage"]["dex_first_enforced"] = True
         data["coverage"]["discovery_config"] = getattr(self, "discovery_config", {})
@@ -1150,7 +1166,8 @@ def render_markdown(data, limit=30):
 
 def main(argv=None):
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("--venue", action="append", choices=tuple(venues.VENUES), help="CEX spot venue; repeatable (default: all supported)")
+    p.add_argument("--venue", action="append", choices=tuple(venues.VENUES),
+                   help="optional CEX spot venue; repeatable (default: DEX-only)")
     p.add_argument("--out", default="rocket-run/rocket-hunt.json")
     p.add_argument("--md", default="rocket-run/rocket-hunt.md")
     p.add_argument("--limit", type=int, default=30, help="rows per Markdown leaderboard")
@@ -1172,7 +1189,8 @@ def main(argv=None):
     p.add_argument("--no-gecko", action="store_true")
     p.add_argument("--birdeye", action="store_true", help="use optional BIRDEYE_API_KEY for Solana trending")
     p.add_argument("--network", action="append", default=[], help="extra GeckoTerminal network to sweep")
-    p.add_argument("--network-sweep-limit", type=int, default=len(DEFAULT_NETWORKS), help="request trending/new/top-volume pools for the first N configured chains (default: all %d configured networks; set 0 to skip per-network sweep)" % len(DEFAULT_NETWORKS))
+    p.add_argument("--network-sweep-limit", type=int, default=128,
+                   help="maximum live GeckoTerminal networks to sweep (default: up to 128; set 0 to skip per-network sweep)")
     p.add_argument("--gecko-pages", type=int, default=3, help="global GeckoTerminal pages per timeframe/list (1-10)")
     p.add_argument("--gecko-request-interval", type=float, default=12.0,
                    help="seconds between public GeckoTerminal calls (default 12; increase if 429 responses persist)")
@@ -1180,10 +1198,12 @@ def main(argv=None):
     a = p.parse_args(argv)
     if a.retries < 0 or a.retries > 5:
         p.error("--retries must be between 0 and 5")
+    if a.gecko_request_interval < 12.0:
+        p.error("--gecko-request-interval must be at least 12 seconds")
     hunter = RocketHunter(timeout=a.timeout, retries=a.retries, workers=max(1, a.workers),
                           checkpoint_dir=a.checkpoint_dir, resume=a.resume,
                           resume_max_age_seconds=a.resume_max_age_seconds)
-    hunter.gecko_request_interval = max(0.0, a.gecko_request_interval)
+    hunter.gecko_request_interval = a.gecko_request_interval
     if not 1 <= a.dex_search_limit <= len(DEFAULT_DEX_SEARCH_QUERIES):
         p.error("--dex-search-limit must be between 1 and %d" % len(DEFAULT_DEX_SEARCH_QUERIES))
     total_q = len(DEFAULT_DEX_SEARCH_QUERIES)
@@ -1210,14 +1230,14 @@ def main(argv=None):
         networks = []
     network_sweep_count = len(networks)
     hunter.dex_search_queries = search_queries
-    data = hunter.run(a.venue or list(DEFAULT_VENUES), include_coinpaprika=not a.no_coinpaprika,
+    data = hunter.run(a.venue or [], include_coinpaprika=not a.no_coinpaprika,
                       include_coingecko=not a.no_coingecko, include_dex=not a.no_dex,
                       include_gecko=not a.no_gecko, networks=networks,
                       gecko_network_sweep=network_sweep_count,
                       dex_lookup_limit=max(0, a.dex_lookup_limit),
                       coingecko_pages=max(1, min(5, a.coingecko_pages)), include_birdeye=a.birdeye,
                       gecko_pages=max(1, min(10, a.gecko_pages)))
-    data["coverage"]["cex_venues_requested"] = a.venue or list(DEFAULT_VENUES)
+    data["coverage"]["cex_venues_requested"] = a.venue or []
     Path(a.out).parent.mkdir(parents=True, exist_ok=True)
     Path(a.out).write_text(json.dumps(data, indent=2, sort_keys=True), encoding="utf-8")
     Path(a.md).parent.mkdir(parents=True, exist_ok=True)

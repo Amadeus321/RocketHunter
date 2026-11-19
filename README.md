@@ -1,8 +1,14 @@
-# Crypto Pre-Breakout — v4.29.0 strict qualification and bounded local scan
+# Crypto Pre-Breakout — v4.30.2 strict qualification and bounded local scan
 
-**9-Engine Imminent Breakout & 24h Probabilistic Returns:** v4.29.0  
-**AURA Machine-Learning Feature-Attribution Upgrade:** v4.29.0  
-**Unified multi-provider discovery & 180m budget manager:** v4.29.0  
+- **9-Engine Imminent Breakout & 24h Probabilistic Returns:** v4.30.2
+- **AURA Machine-Learning Feature-Attribution Upgrade:** v4.30.2
+- **Unified multi-provider discovery & 180m budget manager:** v4.30.2
+
+### v4.30.2 — TP report integrity and DEX-only discovery
+
+- Watchlist TP potential is recomputed from the displayed reference price and the single take-profit; stale cached percentages cannot override the arithmetic.
+- Local discovery defaults to DEX sources, sweeps up to 128 live GeckoTerminal networks, enforces 12-second request pacing and halts GeckoTerminal requests on 403/418/429, and keeps the total run deadline at or below 180 minutes. Market coverage remains provider- and time-bounded, not exhaustive.
+- This release does not establish predictive effectiveness or change the project's `NOT READY` status.
 **DexPaprika all-network early-breakout discovery / 24h MFE monitor:** v4.25.0  
 **Birdeye free multichain rotation:** v4.24.0  
 **Multi-provider discovery / coverage ledger:** v4.23.0  

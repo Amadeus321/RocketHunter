@@ -82,7 +82,7 @@ def get_journal() -> dict[str, Any]:
             "ai_learning_stats": {
                 "ai_name": "AURA",
                 "ai_full_name": "AURA (Adaptive Universal Rocket Algorithm)",
-                "model_version": "AURA-v4.29.0",
+                "model_version": "AURA-v4.30.2",
                 "total_taken_positions": 0,
                 "open_positions": 0,
                 "closed_positions": 0,

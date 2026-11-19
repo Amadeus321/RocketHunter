@@ -76,7 +76,12 @@ class Fetcher:
             wait = max(0.0, self.host_backoff_until.get(host, 0.0) - time.monotonic())
             if wait:
                 time.sleep(wait)
-            headers = {"User-Agent": USER_AGENT, "Accept": "application/json"}
+            accept = (
+                "application/json;version=20230203"
+                if host == "api.geckoterminal.com"
+                else "application/json"
+            )
+            headers = {"User-Agent": USER_AGENT, "Accept": accept}
             body = None
             if payload is not None:
                 headers["Content-Type"] = "application/json"
