@@ -3,15 +3,15 @@
   "core_runtime_version": "4.15.3",
   "coverage_boundary": "Only detailed rows exported into the core collector's report lanes are snapshotted; internal-only aggregate counts are not full row exports.",
   "forecast_partitions": 10,
-  "historical_forecasts": 54407,
-  "historical_outcomes": 232392,
-  "idempotency_key": "44988985325",
+  "historical_forecasts": 56515,
+  "historical_outcomes": 243403,
+  "idempotency_key": "45031145710",
   "last_fast_refresh": {
-    "new_forecast_snapshots": 2102,
-    "new_outcomes": 10161,
+    "new_forecast_snapshots": 2108,
+    "new_outcomes": 11011,
     "pipeline_version": "4.18.1",
-    "recorded_utc": "2026-11-22T05:20:47Z",
-    "run_id": "44988985325"
+    "recorded_utc": "2026-11-22T14:08:22Z",
+    "run_id": "45031145710"
   },
   "last_full_scan": {
     "forecast_count": 233,
@@ -24,8 +24,8 @@
   "last_snapshot_utc": "2026-11-19T13:08:51Z",
   "latest_writer": "FAST_REFRESH",
   "memory_manifest_version": "4.20.0",
-  "new_forecast_snapshots": 2102,
-  "new_outcomes": 10161,
+  "new_forecast_snapshots": 2108,
+  "new_outcomes": 11011,
   "outcome_partitions": 10,
   "pipeline_version": "4.20.0",
   "schema": "crypto-prebreakout.memory-manifest.v1"
